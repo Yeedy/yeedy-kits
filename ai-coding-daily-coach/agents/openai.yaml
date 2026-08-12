@@ -1,0 +1,6 @@
+interface:
+  display_name: "AI Coding 每日教练"
+  short_description: "结合当前项目复习、出概念与场景题并评分"
+  default_prompt: "Use $ai-coding-daily-coach to give me today’s AI coding practice question."
+policy:
+  allow_implicit_invocation: true
