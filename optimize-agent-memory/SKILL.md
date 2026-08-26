@@ -20,7 +20,7 @@ Optimize agent memory without treating remembered content as authoritative. Defa
 
 Select the current project or user-requested scope. Do not inspect unrelated workspaces, sessions, personal files, credentials, or private messages.
 
-Run the bundled `scripts/memory_baseline.py --runtime omp|codex|both` before proposing changes and again after the runtime refreshes. Use `--omp-dir` or `--codex-dir` only for a non-default profile or test fixture. Treat its artifact sizes and job states as operational metrics, not memory-quality judgments.
+Run the bundled `scripts/memory_baseline.py --runtime omp|codex|both` before proposing changes and again after the runtime refreshes. Use `--omp-dir` or `--codex-dir` only for a non-default profile or test fixture. If multiple Codex memory databases exist, inspect their provenance and pass the intended one with `--codex-db`; do not guess from location or modification time. Treat artifact sizes and job states as operational metrics, not memory-quality judgments.
 
 Classify every material item as:
 

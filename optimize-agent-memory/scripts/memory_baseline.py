@@ -9,12 +9,18 @@ import json
 import sqlite3
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 
-ARTIFACT_NAMES = (
+OMP_ARTIFACT_NAMES = (
     "MEMORY.md",
     "memory_summary.md",
     "learned.md",
+    "raw_memories.md",
+)
+CODEX_ARTIFACT_NAMES = (
+    "MEMORY.md",
+    "memory_summary.md",
     "raw_memories.md",
 )
 
@@ -31,16 +37,23 @@ def file_stats(path: Path) -> dict[str, Any]:
 
 
 def read_jobs(db_path: Path) -> dict[str, Any]:
+    empty_state = {
+        "database": str(db_path),
+        "exists": db_path.is_file(),
+        "job_count": 0,
+        "status_counts": {},
+        "attention_jobs": [],
+    }
     if not db_path.is_file():
-        return {"database": str(db_path), "exists": False, "jobs": []}
+        return empty_state
 
-    uri = f"file:{db_path}?mode=ro"
+    uri = f"file:{quote(str(db_path), safe='/')}?mode=ro"
     with sqlite3.connect(uri, uri=True) as db:
         table = db.execute(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'jobs'"
         ).fetchone()
         if table is None:
-            return {"database": str(db_path), "exists": True, "jobs": []}
+            return empty_state
         rows = db.execute(
             """
             SELECT kind, job_key, status, retry_remaining, last_error,
@@ -75,8 +88,8 @@ def read_jobs(db_path: Path) -> dict[str, Any]:
     }
 
 
-def scope_stats(root: Path) -> dict[str, Any]:
-    artifacts = {name: file_stats(root / name) for name in ARTIFACT_NAMES}
+def scope_stats(root: Path, artifact_names: tuple[str, ...]) -> dict[str, Any]:
+    artifacts = {name: file_stats(root / name) for name in artifact_names}
     rollouts_dir = root / "rollout_summaries"
     rollout_count = (
         sum(1 for path in rollouts_dir.iterdir() if path.is_file() and path.suffix == ".md")
@@ -98,7 +111,11 @@ def collect_omp(agent_dir: Path) -> dict[str, Any]:
     if not agent_dir.is_dir():
         raise FileNotFoundError(f"OMP agent directory not found: {agent_dir}")
     scopes = (
-        [scope_stats(path) for path in sorted(memories_dir.iterdir()) if path.is_dir()]
+        [
+            scope_stats(path, OMP_ARTIFACT_NAMES)
+            for path in sorted(memories_dir.iterdir())
+            if path.is_dir()
+        ]
         if memories_dir.is_dir()
         else []
     )
@@ -111,21 +128,42 @@ def collect_omp(agent_dir: Path) -> dict[str, Any]:
     }
 
 
-def collect_codex(codex_dir: Path) -> dict[str, Any]:
+def resolve_codex_db(codex_dir: Path, requested_db: Path | None) -> Path:
+    if requested_db is not None:
+        db_path = requested_db.expanduser().resolve()
+        if not db_path.is_file():
+            raise FileNotFoundError(f"Codex memory database not found: {db_path}")
+        return db_path
+
+    candidates = (
+        codex_dir / "memories_1.sqlite",
+        codex_dir / "sqlite" / "memories_1.sqlite",
+    )
+    existing = [path for path in candidates if path.is_file()]
+    if len(existing) > 1:
+        paths = ", ".join(str(path) for path in existing)
+        raise RuntimeError(
+            "Multiple Codex memory databases found; select one with --codex-db: "
+            f"{paths}"
+        )
+    return existing[0] if existing else candidates[0]
+
+
+def collect_codex(codex_dir: Path, requested_db: Path | None = None) -> dict[str, Any]:
     memories_dir = codex_dir / "memories"
     if not codex_dir.is_dir():
         raise FileNotFoundError(f"Codex directory not found: {codex_dir}")
     if not memories_dir.is_dir():
         raise FileNotFoundError(f"Codex memories directory not found: {memories_dir}")
-    db_path = codex_dir / "memories_1.sqlite"
-    if not db_path.is_file():
-        db_path = codex_dir / "sqlite" / "memories_1.sqlite"
-    result = scope_stats(memories_dir)
+    db_path = resolve_codex_db(codex_dir, requested_db)
+    result = scope_stats(memories_dir, CODEX_ARTIFACT_NAMES)
     result.update(
         {
             "runtime": "codex",
             "codex_dir": str(codex_dir),
-            "ad_hoc_note_count": len(list((memories_dir / "extensions" / "ad_hoc" / "notes").glob("*.md"))),
+            "ad_hoc_note_count": len(
+                list((memories_dir / "extensions" / "ad_hoc" / "notes").glob("*.md"))
+            ),
             "git_repository": (memories_dir / ".git").is_dir(),
             "job_state": read_jobs(db_path),
         }
@@ -139,6 +177,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--runtime", choices=("omp", "codex", "both"), required=True)
     parser.add_argument("--omp-dir", type=Path, default=home / ".omp" / "agent")
     parser.add_argument("--codex-dir", type=Path, default=home / ".codex")
+    parser.add_argument("--codex-db", type=Path)
     return parser.parse_args()
 
 
@@ -148,7 +187,9 @@ def main() -> None:
     if args.runtime in ("omp", "both"):
         results.append(collect_omp(args.omp_dir.expanduser().resolve()))
     if args.runtime in ("codex", "both"):
-        results.append(collect_codex(args.codex_dir.expanduser().resolve()))
+        results.append(
+            collect_codex(args.codex_dir.expanduser().resolve(), args.codex_db)
+        )
     print(json.dumps(results[0] if len(results) == 1 else results, ensure_ascii=False, indent=2))
 
 
