@@ -18,6 +18,12 @@
 
 详见 [ai-coding-daily-coach/SKILL.md](ai-coding-daily-coach/SKILL.md)。
 
+### optimize-agent-memory
+
+审计和精炼 Oh My Pi project-scoped local memory 或 Codex 跨 workspace memory，识别过时、重复、低价值或过度膨胀的记忆，并通过各自受支持的持久化入口安全修正。
+
+详见 [optimize-agent-memory/SKILL.md](optimize-agent-memory/SKILL.md)。
+
 ## Repository Layout
 
 ```text

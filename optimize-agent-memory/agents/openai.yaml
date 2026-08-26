@@ -1,0 +1,4 @@
+interface:
+  display_name: "Optimize Agent Memory"
+  short_description: "Audit and refine OMP or Codex memory safely"
+  default_prompt: "Use $optimize-agent-memory to audit this project memory and propose safe, runtime-specific cleanup."
