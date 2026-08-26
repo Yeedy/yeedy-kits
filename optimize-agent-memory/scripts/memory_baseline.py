@@ -287,7 +287,7 @@ def parse_args() -> argparse.Namespace:
         try:
             omp_agent_dir = resolve_omp_agent_dir(home)
         except ValueError:
-            if codex_priority > 0:
+            if codex_priority == 2:
                 args.runtime = "codex"
             else:
                 raise
