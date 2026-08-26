@@ -209,7 +209,9 @@ def collect_codex(codex_dir: Path, requested_db: Path | None = None) -> dict[str
 
 
 def resolve_codex_dir(home: Path) -> Path:
-    return Path(os.environ.get("CODEX_HOME", home / ".codex")).expanduser().resolve()
+    configured_codex_dir = os.environ.get("CODEX_HOME")
+    codex_dir = Path(configured_codex_dir) if configured_codex_dir else home / ".codex"
+    return codex_dir.expanduser().resolve()
 
 
 def resolve_omp_agent_dir(home: Path) -> Path:
@@ -217,9 +219,15 @@ def resolve_omp_agent_dir(home: Path) -> Path:
     if configured_agent_dir:
         return Path(configured_agent_dir).expanduser().resolve()
 
-    config_dir = Path(os.environ.get("PI_CONFIG_DIR", ".omp")).expanduser()
+    configured_config_dir = os.environ.get("PI_CONFIG_DIR")
+    config_dir = Path(configured_config_dir or ".omp").expanduser()
     config_root = config_dir if config_dir.is_absolute() else home / config_dir
-    profile = os.environ.get("OMP_PROFILE", os.environ.get("PI_PROFILE"))
+    raw_profile = (
+        os.environ["OMP_PROFILE"]
+        if "OMP_PROFILE" in os.environ
+        else os.environ.get("PI_PROFILE")
+    )
+    profile = raw_profile.strip() if raw_profile is not None else None
     if profile and profile != "default":
         if (
             OMP_PROFILE_PATTERN.fullmatch(profile) is None
