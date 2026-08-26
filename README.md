@@ -20,7 +20,7 @@
 
 ### optimize-agent-memory
 
-审计和精炼 Oh My Pi project-scoped local memory 或 Codex 跨 workspace memory，识别过时、重复、低价值或过度膨胀的记忆，并通过各自受支持的持久化入口安全修正。
+审计和精炼 Codex 或 Oh My Pi memory。默认覆盖当前 agent 的全部 memory；也可以明确指定 OMP、Codex、两者，或进一步缩小到某个项目、workspace 或类别。识别过时、重复、低价值或过度膨胀的记忆，并通过对应 agent 支持的持久化入口安全修正。
 
 详见 [optimize-agent-memory/SKILL.md](optimize-agent-memory/SKILL.md)。
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Collect read-only OMP and Codex memory health metrics."""
+"""Collect read-only memory health metrics for selected agent runtimes."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ import argparse
 from collections import Counter
 from contextlib import closing
 import json
+import os
 import shutil
 import sqlite3
 import tempfile
@@ -15,6 +16,7 @@ from typing import Any
 from urllib.parse import quote
 
 
+SKILL_NAME = "optimize-agent-memory"
 OMP_ARTIFACT_NAMES = (
     "MEMORY.md",
     "memory_summary.md",
@@ -201,14 +203,37 @@ def collect_codex(codex_dir: Path, requested_db: Path | None = None) -> dict[str
     return result
 
 
+def detect_installed_runtime(script_path: Path, home: Path) -> str | None:
+    codex_home = Path(os.environ.get("CODEX_HOME", home / ".codex")).expanduser()
+    install_roots = {
+        "codex": codex_home / "skills" / SKILL_NAME,
+        "omp": home / ".omp" / "agent" / "skills" / SKILL_NAME,
+    }
+    matches = [
+        runtime
+        for runtime, root in install_roots.items()
+        if root.absolute() in script_path.absolute().parents
+    ]
+    if len(matches) > 1:
+        raise RuntimeError(f"Ambiguous installed runtime for script: {script_path}")
+    return matches[0] if matches else None
+
+
 def parse_args() -> argparse.Namespace:
     home = Path.home()
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--runtime", choices=("omp", "codex", "both"), required=True)
+    parser.add_argument("--runtime", choices=("omp", "codex", "both"))
     parser.add_argument("--omp-dir", type=Path, default=home / ".omp" / "agent")
     parser.add_argument("--codex-dir", type=Path, default=home / ".codex")
     parser.add_argument("--codex-db", type=Path)
-    return parser.parse_args()
+    args = parser.parse_args()
+
+    installed_runtime = detect_installed_runtime(Path(__file__), home)
+    if args.runtime is None and installed_runtime is not None:
+        args.runtime = installed_runtime
+    if args.runtime is None:
+        parser.error("--runtime is required outside a recognized Codex or OMP installation")
+    return args
 
 
 def main() -> None:

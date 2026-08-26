@@ -6,18 +6,20 @@ Use this route when Codex memories are enabled. Treat behavior not established b
 
 1. Search and fetch current official OpenAI documentation for Codex memory before making current product claims. If no official memory documentation is available, say so and use only locally verified surfaces.
 2. Check only the relevant keys in `~/.codex/config.toml`: `features.memories`, `memories.generate_memories`, and `memories.use_memories`. Do not print neighboring configuration because it may contain credentials.
-3. Confirm whether the user wants the current workspace, selected workspaces, user preferences, or the entire memory store audited.
-4. Treat `~/.codex/memories/` as a cross-workspace store. Select sections by their recorded cwd or applicability instead of assuming the whole file belongs to the current repository.
+3. Default to the entire `~/.codex/memories/` store, including every recorded workspace and the global user profile. Narrow to selected workspaces, preferences, or categories only when the user explicitly requests it.
+4. Treat the store as cross-workspace. Preserve each section's recorded cwd and applicability instead of assuming the whole file belongs to the current repository.
+
+For an explicit project scope, match its normalized absolute path against the recorded cwd and applicability in the summary index. If the project name maps to multiple paths, report the ambiguity and ask for an exact path instead of guessing. Include global profile items only when they apply to the selected project.
 
 ## Read
 
-Inspect the narrowest useful set:
+Cover the whole generated store without exhaustively reading raw evidence:
 
-1. Read `memory_summary.md` for the compact index and user profile.
-2. Read matching sections of `MEMORY.md` for full consolidated knowledge.
+1. Read `memory_summary.md` for the compact index and user profile. For an explicit project, use it to route the audit and avoid unrelated workspace sections.
+2. Read every section of `MEMORY.md` by default; when the user explicitly narrows scope, read only matching sections.
 3. Read cited `rollout_summaries/` files when a claim's source, success state, or boundary must be checked.
 4. Read matching parts of `raw_memories.md` only when consolidated text cannot be validated from rollout summaries.
-5. Inspect `extensions/ad_hoc/instructions.md` and relevant notes before proposing a manual correction.
+5. Inspect `extensions/ad_hoc/instructions.md` and all notes relevant to proposed corrections.
 6. Use `git -C ~/.codex/memories status --short`, `diff`, and `log` for provenance and concurrent-change detection.
 7. Run `scripts/memory_baseline.py --runtime codex` for artifact, source-count, and read-only job metrics.
 

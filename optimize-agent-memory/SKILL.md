@@ -1,26 +1,27 @@
 ---
 name: optimize-agent-memory
-description: "Audit, diagnose, and safely refine local agent memory for Oh My Pi (OMP) with `memory.backend: local` or Codex with memories enabled. Use when the user wants to inspect memory quality, remove stale or duplicated knowledge, reduce injected context bloat, troubleshoot memory generation, curate learned preferences, or compare OMP and Codex memory behavior. Do not use for OMP Hindsight or Mnemopi stores."
+description: "Audit, diagnose, and safely refine local Codex or Oh My Pi (OMP) memory. Default to all memory owned by the current agent host. Target another installed agent, both agents, or a specific project, workspace, or category only when the user explicitly requests it. Use when the user wants to inspect memory quality, remove stale or duplicated knowledge, reduce injected context bloat, troubleshoot memory generation, or curate learned preferences. Do not use for OMP Hindsight or Mnemopi stores."
 ---
 
-# Optimize Agent Memory
+# Optimize Current Agent Memory
 
 Optimize agent memory without treating remembered content as authoritative. Default to a read-only audit. Apply only the exact changes the user approves.
 
-## Select The Runtime
+## Resolve Target And Scope
 
-1. Use the runtime named by the user.
-2. If the user does not name one, identify it from the current environment and memory surfaces.
-3. If both OMP and Codex are in scope, audit them separately. Do not copy or merge memories across runtimes unless the user explicitly requests it.
-4. For OMP local memory, read [references/omp-local.md](references/omp-local.md) completely before inspecting memory.
-5. For Codex memory, read [references/codex-local.md](references/codex-local.md) completely before inspecting memory.
-6. Stop and explain the mismatch if OMP uses `hindsight` or `mnemopi`; their storage and mutation tools require a different workflow.
+1. Treat the agent currently executing this skill as the default target. Use the installed skill path only as a confirming signal.
+2. If the user explicitly names `Codex`, `OMP`, or both, use exactly those target agents instead. Confirm each requested agent is installed; do not silently omit an unavailable target.
+3. Default to all memory owned by each selected agent. Narrow to a project, workspace, or category only when the user explicitly requests that scope.
+4. For Codex, read [references/codex-local.md](references/codex-local.md) completely before inspection. For OMP, read [references/omp-local.md](references/omp-local.md) completely before inspection.
+5. When both agents are selected, audit and report them separately. Never copy or merge memory across agents unless the user separately approves that exact operation.
+6. Stop if the default host cannot be determined and the user did not name a target. Do not infer the target from whichever memory directory happens to exist.
+7. In OMP, stop and explain the mismatch if the backend is `hindsight` or `mnemopi`; their storage and mutation tools require a different workflow.
 
 ## Shared Audit
 
-Select the current project or user-requested scope. Do not inspect unrelated workspaces, sessions, personal files, credentials, or private messages.
+Audit the entire memory store owned by every selected agent by default. When the user specifies a project, workspace, or category, restrict content inspection and recommendations to that scope. A host-wide baseline may still read artifact metadata and job health needed to locate or diagnose the requested scope; identify those metrics as host-wide. Do not inspect unrelated sessions, personal files, credentials, private messages, or files outside the selected memory stores merely to make the audit exhaustive.
 
-Run the bundled `scripts/memory_baseline.py --runtime omp|codex|both` before proposing changes and again after the runtime refreshes. Use `--omp-dir` or `--codex-dir` only for a non-default profile or test fixture. If multiple Codex memory databases exist, inspect their provenance and pass the intended one with `--codex-db`; do not guess from location or modification time. Treat artifact sizes and job states as operational metrics, not memory-quality judgments.
+Run the bundled `scripts/memory_baseline.py` before proposing changes and again after the runtime refreshes. An installed copy defaults to its current host. Pass `--runtime omp`, `--runtime codex`, or `--runtime both` only when the user explicitly selects a target; repository-source usage always requires this option. Use the matching `--omp-dir` or `--codex-dir` only for a non-default profile or test fixture. If multiple Codex memory databases exist, inspect their provenance and pass the intended one with `--codex-db`; do not guess from location or modification time. Treat artifact sizes and job states as operational metrics, not memory-quality judgments.
 
 Classify every material item as:
 
@@ -49,8 +50,8 @@ Return a compact audit before mutation:
 ```markdown
 ## Memory audit
 
-Runtime: <OMP or Codex>
-Scope: <project, workspace, or global>
+Target: <OMP, Codex, or separate reports for both>
+Scope: <all memory for the target by default, or the explicit subset>
 Health: <healthy, incomplete, or failing with evidence>
 Injection: <approximate size and useful-signal assessment>
 
@@ -62,12 +63,12 @@ Config changes: <none, or exact key/value proposals with evidence>
 Refresh needed: <yes/no/unknown and why>
 ```
 
-Show exact replacement text for every rewrite or merge and identify every deletion. Ask the user to approve the listed IDs. A general request to "optimize" authorizes the audit, not deletion, overwrite, config mutation, or a destructive reset.
+Prefix stable IDs with `O` for OMP and `C` for Codex. Show exact replacement text for every rewrite or merge and identify every deletion. Ask the user to approve the listed IDs. A general request to "optimize" authorizes the audit, not deletion, overwrite, config mutation, or a destructive reset.
 
 ## Apply Approved Changes
 
 1. Re-read affected artifacts immediately before editing; abort if they changed after the preview.
-2. Follow the runtime-specific mutation path. Do not substitute one runtime's commands, files, or tools for the other's.
+2. Follow each selected agent's mutation path. Do not substitute one agent's commands, files, or tools for the other's.
 3. Preserve unapproved content, formatting, ordering, provenance, and final newlines.
 4. Request the minimum required approval for writes outside the current workspace.
 5. Treat whole-store reset, clear, or deletion as destructive and require explicit approval naming the runtime and scope.
@@ -83,4 +84,4 @@ Show exact replacement text for every rewrite or merge and identify every deleti
 5. Verify injection in a new task or session only after the runtime has refreshed its memory.
 6. Report applied IDs, skipped IDs, before/after metrics, verification results, and any refresh still required.
 
-Stop after approved changes are verified. Do not polish unrelated agent configuration, generated skills, or memory from another scope.
+Stop after approved changes are verified. Do not polish unrelated agent configuration, generated skills, or memory outside the selected agents and scope.
