@@ -5,8 +5,11 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
+from contextlib import closing
 import json
+import shutil
 import sqlite3
+import tempfile
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -48,20 +51,47 @@ def read_jobs(db_path: Path) -> dict[str, Any]:
         return empty_state
 
     uri = f"file:{quote(str(db_path), safe='/')}?mode=ro"
-    with sqlite3.connect(uri, uri=True) as db:
-        table = db.execute(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'jobs'"
-        ).fetchone()
-        if table is None:
-            return empty_state
-        rows = db.execute(
-            """
-            SELECT kind, job_key, status, retry_remaining, last_error,
-                   input_watermark, last_success_watermark
-            FROM jobs
-            ORDER BY kind, job_key
-            """
-        ).fetchall()
+    try:
+        return _read_jobs_from_database(uri, db_path, uri=True)
+    except sqlite3.OperationalError:
+        with tempfile.TemporaryDirectory(prefix="memory-baseline-") as directory:
+            temporary_db = Path(directory) / "memory.sqlite"
+            shutil.copy2(db_path, temporary_db)
+            for suffix in ("-wal", "-shm"):
+                sidecar = Path(f"{db_path}{suffix}")
+                if sidecar.is_file():
+                    shutil.copy2(sidecar, Path(f"{temporary_db}{suffix}"))
+            return _read_jobs_from_database(str(temporary_db), db_path)
+
+
+def _read_jobs_from_database(
+    target: str, report_path: Path, *, uri: bool = False
+) -> dict[str, Any]:
+    with closing(sqlite3.connect(target, uri=uri)) as db:
+        return _read_job_rows(db, report_path)
+
+
+def _read_job_rows(db: sqlite3.Connection, db_path: Path) -> dict[str, Any]:
+    empty_state = {
+        "database": str(db_path),
+        "exists": True,
+        "job_count": 0,
+        "status_counts": {},
+        "attention_jobs": [],
+    }
+    table = db.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'jobs'"
+    ).fetchone()
+    if table is None:
+        return empty_state
+    rows = db.execute(
+        """
+        SELECT kind, job_key, status, retry_remaining, last_error,
+               input_watermark, last_success_watermark
+        FROM jobs
+        ORDER BY kind, job_key
+        """
+    ).fetchall()
 
     jobs = [
         {
