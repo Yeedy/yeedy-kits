@@ -239,42 +239,38 @@ def resolve_omp_agent_dir(home: Path) -> Path:
     return (config_root / "agent").resolve()
 
 
-def detect_installed_runtime(
-    script_path: Path, codex_dir: Path, omp_agent_dir: Path
-) -> str | None:
-    install_roots = {
-        "codex": codex_dir / "skills" / SKILL_NAME,
-        "omp": omp_agent_dir / "skills" / SKILL_NAME,
-    }
-    resolved_script = script_path.resolve()
-    matches = [
-        runtime
-        for runtime, root in install_roots.items()
-        if root.resolve() in resolved_script.parents
-    ]
-    if len(matches) > 1:
-        raise RuntimeError(f"Ambiguous installed runtime for script: {script_path}")
-    return matches[0] if matches else None
+def is_installed_copy(script_path: Path, agent_root: Path) -> bool:
+    install_root = agent_root / "skills" / SKILL_NAME
+    return install_root.resolve() in script_path.resolve().parents
 
 
 def parse_args() -> argparse.Namespace:
     home = Path.home()
-    codex_dir = resolve_codex_dir(home)
-    omp_agent_dir = resolve_omp_agent_dir(home)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--runtime", choices=("omp", "codex", "both"))
-    parser.add_argument("--omp-dir", type=Path, default=omp_agent_dir)
-    parser.add_argument("--codex-dir", type=Path, default=codex_dir)
+    parser.add_argument("--omp-dir", type=Path)
+    parser.add_argument("--codex-dir", type=Path)
     parser.add_argument("--codex-db", type=Path)
     args = parser.parse_args()
 
-    installed_runtime = detect_installed_runtime(
-        Path(__file__), codex_dir, omp_agent_dir
-    )
-    if args.runtime is None and installed_runtime is not None:
-        args.runtime = installed_runtime
     if args.runtime is None:
-        parser.error("--runtime is required outside a recognized Codex or OMP installation")
+        script_path = Path(__file__)
+        codex_dir = resolve_codex_dir(home)
+        if is_installed_copy(script_path, codex_dir):
+            args.runtime = "codex"
+        else:
+            omp_agent_dir = resolve_omp_agent_dir(home)
+            if is_installed_copy(script_path, omp_agent_dir):
+                args.runtime = "omp"
+            else:
+                parser.error(
+                    "--runtime is required outside a recognized Codex or OMP installation"
+                )
+
+    if args.runtime in ("omp", "both") and args.omp_dir is None:
+        args.omp_dir = resolve_omp_agent_dir(home)
+    if args.runtime in ("codex", "both") and args.codex_dir is None:
+        args.codex_dir = resolve_codex_dir(home)
     return args
 
 
