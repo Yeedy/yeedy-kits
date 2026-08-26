@@ -4,7 +4,7 @@ Use this route only when Oh My Pi has `memory.backend: local`.
 
 ## Establish Scope
 
-1. Confirm the active OMP version and profile.
+1. Confirm the active OMP version, profile, and agent root. Resolve the root from `PI_CODING_AGENT_DIR` when set; otherwise use the named `OMP_PROFILE` or `PI_PROFILE` under `PI_CONFIG_DIR` (default `~/.omp`), falling back to `~/.omp/agent`.
 2. Default to every project scope stored under the active profile. Narrow to a named project or scope only when the user explicitly requests it.
 3. Confirm `memory.backend: local`; confirm `autolearn.enabled: true` when lesson capture is in scope.
 4. Treat `local` as local storage, not necessarily local inference. Phase 1 normally uses the `default` model role and Phase 2 uses `smol` unless an explicitly supported memory-model setting overrides them.

@@ -8,6 +8,7 @@ from collections import Counter
 from contextlib import closing
 import json
 import os
+import re
 import shutil
 import sqlite3
 import tempfile
@@ -17,6 +18,10 @@ from urllib.parse import quote
 
 
 SKILL_NAME = "optimize-agent-memory"
+OMP_PROFILE_PATTERN = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
+OMP_RESERVED_PROFILE_PATTERN = re.compile(
+    r"^(?:con|prn|aux|nul|com[0-9]|lpt[0-9])(?:\.|$)", re.IGNORECASE
+)
 OMP_ARTIFACT_NAMES = (
     "MEMORY.md",
     "memory_summary.md",
@@ -203,16 +208,41 @@ def collect_codex(codex_dir: Path, requested_db: Path | None = None) -> dict[str
     return result
 
 
-def detect_installed_runtime(script_path: Path, home: Path) -> str | None:
-    codex_home = Path(os.environ.get("CODEX_HOME", home / ".codex")).expanduser()
+def resolve_codex_dir(home: Path) -> Path:
+    return Path(os.environ.get("CODEX_HOME", home / ".codex")).expanduser().resolve()
+
+
+def resolve_omp_agent_dir(home: Path) -> Path:
+    configured_agent_dir = os.environ.get("PI_CODING_AGENT_DIR")
+    if configured_agent_dir:
+        return Path(configured_agent_dir).expanduser().resolve()
+
+    config_dir = Path(os.environ.get("PI_CONFIG_DIR", ".omp")).expanduser()
+    config_root = config_dir if config_dir.is_absolute() else home / config_dir
+    profile = os.environ.get("OMP_PROFILE", os.environ.get("PI_PROFILE"))
+    if profile and profile != "default":
+        if (
+            OMP_PROFILE_PATTERN.fullmatch(profile) is None
+            or profile.endswith(".")
+            or OMP_RESERVED_PROFILE_PATTERN.match(profile) is not None
+        ):
+            raise ValueError(f"Invalid OMP profile name: {profile}")
+        return (config_root / "profiles" / profile / "agent").resolve()
+    return (config_root / "agent").resolve()
+
+
+def detect_installed_runtime(
+    script_path: Path, codex_dir: Path, omp_agent_dir: Path
+) -> str | None:
     install_roots = {
-        "codex": codex_home / "skills" / SKILL_NAME,
-        "omp": home / ".omp" / "agent" / "skills" / SKILL_NAME,
+        "codex": codex_dir / "skills" / SKILL_NAME,
+        "omp": omp_agent_dir / "skills" / SKILL_NAME,
     }
+    resolved_script = script_path.resolve()
     matches = [
         runtime
         for runtime, root in install_roots.items()
-        if root.absolute() in script_path.absolute().parents
+        if root.resolve() in resolved_script.parents
     ]
     if len(matches) > 1:
         raise RuntimeError(f"Ambiguous installed runtime for script: {script_path}")
@@ -221,14 +251,18 @@ def detect_installed_runtime(script_path: Path, home: Path) -> str | None:
 
 def parse_args() -> argparse.Namespace:
     home = Path.home()
+    codex_dir = resolve_codex_dir(home)
+    omp_agent_dir = resolve_omp_agent_dir(home)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--runtime", choices=("omp", "codex", "both"))
-    parser.add_argument("--omp-dir", type=Path, default=home / ".omp" / "agent")
-    parser.add_argument("--codex-dir", type=Path, default=home / ".codex")
+    parser.add_argument("--omp-dir", type=Path, default=omp_agent_dir)
+    parser.add_argument("--codex-dir", type=Path, default=codex_dir)
     parser.add_argument("--codex-db", type=Path)
     args = parser.parse_args()
 
-    installed_runtime = detect_installed_runtime(Path(__file__), home)
+    installed_runtime = detect_installed_runtime(
+        Path(__file__), codex_dir, omp_agent_dir
+    )
     if args.runtime is None and installed_runtime is not None:
         args.runtime = installed_runtime
     if args.runtime is None:

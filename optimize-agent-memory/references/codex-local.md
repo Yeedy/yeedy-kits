@@ -5,8 +5,8 @@ Use this route when Codex memories are enabled. Treat behavior not established b
 ## Establish Scope
 
 1. Search and fetch current official OpenAI documentation for Codex memory before making current product claims. If no official memory documentation is available, say so and use only locally verified surfaces.
-2. Check only the relevant keys in `~/.codex/config.toml`: `features.memories`, `memories.generate_memories`, and `memories.use_memories`. Do not print neighboring configuration because it may contain credentials.
-3. Default to the entire `~/.codex/memories/` store, including every recorded workspace and the global user profile. Narrow to selected workspaces, preferences, or categories only when the user explicitly requests it.
+2. Resolve the Codex root from `CODEX_HOME` when set, otherwise `~/.codex`. Check only `features.memories`, `memories.generate_memories`, and `memories.use_memories` in that root's `config.toml`. Do not print neighboring configuration because it may contain credentials.
+3. Default to the entire `memories/` store under the resolved Codex root, including every recorded workspace and the global user profile. Narrow to selected workspaces, preferences, or categories only when the user explicitly requests it.
 4. Treat the store as cross-workspace. Preserve each section's recorded cwd and applicability instead of assuming the whole file belongs to the current repository.
 
 For an explicit project scope, match its normalized absolute path against the recorded cwd and applicability in the summary index. If the project name maps to multiple paths, report the ambiguity and ask for an exact path instead of guessing. Include global profile items only when they apply to the selected project.
@@ -20,7 +20,7 @@ Cover the whole generated store without exhaustively reading raw evidence:
 3. Read cited `rollout_summaries/` files when a claim's source, success state, or boundary must be checked.
 4. Read matching parts of `raw_memories.md` only when consolidated text cannot be validated from rollout summaries.
 5. Inspect `extensions/ad_hoc/instructions.md` and all notes relevant to proposed corrections.
-6. Use `git -C ~/.codex/memories status --short`, `diff`, and `log` for provenance and concurrent-change detection.
+6. Use Git `status --short`, `diff`, and `log` in the resolved Codex `memories/` store for provenance and concurrent-change detection.
 7. Run `scripts/memory_baseline.py --runtime codex` for artifact, source-count, and read-only job metrics.
 
 Do not read unrelated rollout summaries or session JSONL files merely to make an audit exhaustive. Do not treat memory as a source for current web facts.
