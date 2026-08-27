@@ -23,7 +23,7 @@ Audit the entire memory store owned by every selected agent by default. When the
 
 Run the bundled `scripts/memory_baseline.py` before proposing changes and again after the runtime refreshes. An installed copy defaults to its current host and honors `CODEX_HOME`, `PI_CODING_AGENT_DIR`, and the active OMP profile. Pass `--runtime omp`, `--runtime codex`, or `--runtime both` only when the user explicitly selects a target; repository-source usage always requires this option. Use the matching `--omp-dir` or `--codex-dir` only for an explicitly selected alternate root or test fixture. If multiple Codex memory databases exist, the baseline fails and names every candidate; inspect their provenance and pass the intended one with `--codex-db`. Do not guess from location or modification time. Treat artifact sizes and job states as operational metrics, not memory-quality judgments.
 
-The baseline treats empty or whitespace-only runtime path variables as unset. Its output is an object for one runtime and an array in `omp`, then `codex` order for `--runtime both`. Artifact `bytes` and `lines` are available size proxies; they are not token counts. Estimate injected tokens from the runtime's actual memory surface and label that estimate approximate.
+The baseline trims configured runtime paths before use and treats empty or whitespace-only values as unset. Its output is an object for one runtime and an array in `omp`, then `codex` order for `--runtime both`. Artifact `bytes` and `lines` are available size proxies; they are not token counts. Estimate injected tokens from the runtime's actual memory surface and label that estimate approximate.
 
 Classify every material item as:
 

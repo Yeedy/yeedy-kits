@@ -76,6 +76,25 @@ class MemoryBaselineTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(json.loads(result.stdout)["runtime"], "codex")
 
+    def test_installed_copy_defaults_to_omp_lexical_host(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_directory:
+            directory = Path(raw_directory)
+            _, omp_dir = self.make_roots(directory)
+            script = (
+                omp_dir
+                / "skills"
+                / memory_baseline.SKILL_NAME
+                / "scripts"
+                / "memory_baseline.py"
+            )
+            env = self.clean_env(directory)
+            env["PI_CODING_AGENT_DIR"] = str(omp_dir)
+
+            result = self.run_script(script, env)
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(result.stdout)["runtime"], "omp")
+
     def test_repository_copy_requires_explicit_runtime(self) -> None:
         with tempfile.TemporaryDirectory() as raw_directory:
             env = self.clean_env(Path(raw_directory))
@@ -189,6 +208,21 @@ class MemoryBaselineTests(unittest.TestCase):
                 memory_baseline.resolve_omp_agent_dir(home), home / ".omp" / "agent"
             )
 
+        with mock.patch.dict(
+            os.environ,
+            {
+                "CODEX_HOME": " /real/codex ",
+                "PI_CODING_AGENT_DIR": " /real/omp/agent ",
+            },
+            clear=False,
+        ):
+            self.assertEqual(
+                memory_baseline.resolve_codex_dir(home), Path("/real/codex")
+            )
+            self.assertEqual(
+                memory_baseline.resolve_omp_agent_dir(home), Path("/real/omp/agent")
+            )
+
     def test_query_error_does_not_trigger_copy_fallback(self) -> None:
         with tempfile.TemporaryDirectory() as raw_directory:
             db_path = Path(raw_directory) / "jobs.sqlite"
@@ -202,7 +236,7 @@ class MemoryBaselineTests(unittest.TestCase):
                     memory_baseline.read_jobs(db_path)
             tempdir.assert_not_called()
 
-    def test_encoded_path_reads_jobs_via_read_only_fallback(self) -> None:
+    def test_encoded_path_uses_read_only_fallback_when_uri_connect_fails(self) -> None:
         with tempfile.TemporaryDirectory() as raw_directory:
             db_path = Path(raw_directory) / "path #? with spaces" / "jobs.sqlite"
             db_path.parent.mkdir()
@@ -221,10 +255,22 @@ class MemoryBaselineTests(unittest.TestCase):
                     ("memory", "global", "done", 0, None, 2, 2),
                 )
 
-            result = memory_baseline.read_jobs(db_path)
+            real_connect = memory_baseline.sqlite3.connect
+
+            def fail_uri_connect(target: str, **kwargs: object) -> sqlite3.Connection:
+                if kwargs.get("uri"):
+                    raise sqlite3.OperationalError("forced URI failure")
+                return real_connect(target, **kwargs)
+
+            with mock.patch.object(
+                memory_baseline.sqlite3, "connect", side_effect=fail_uri_connect
+            ) as connect:
+                result = memory_baseline.read_jobs(db_path)
 
             self.assertEqual(result["job_count"], 1)
             self.assertEqual(result["status_counts"], {"done": 1})
+            self.assertEqual(connect.call_count, 2)
+            self.assertTrue(connect.call_args_list[0].kwargs["uri"])
 
 
 if __name__ == "__main__":

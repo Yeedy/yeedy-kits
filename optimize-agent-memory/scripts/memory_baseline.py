@@ -247,7 +247,7 @@ def resolve_omp_agent_dir(home: Path) -> Path:
 
 def _nonblank_env(name: str) -> str | None:
     value = os.environ.get(name)
-    return value if value is not None and value.strip() else None
+    return value.strip() if value is not None and value.strip() else None
 
 
 def installation_match_priority(script_path: Path, agent_root: Path) -> int:
