@@ -21,7 +21,8 @@ Cover the whole generated store without exhaustively reading raw evidence:
 4. Read matching parts of `raw_memories.md` only when consolidated text cannot be validated from rollout summaries.
 5. Inspect `extensions/ad_hoc/instructions.md` and all notes relevant to proposed corrections.
 6. Use Git `status --short`, `diff`, and `log` in the resolved Codex `memories/` store for provenance and concurrent-change detection.
-7. Run `scripts/memory_baseline.py --runtime codex` for artifact, source-count, and read-only job metrics.
+7. Before the baseline, check both supported database candidates: `<CODEX_HOME>/memories_1.sqlite` and `<CODEX_HOME>/sqlite/memories_1.sqlite`. If both exist, the baseline intentionally fails with both paths; inspect their provenance and pass the selected database explicitly with `--codex-db`. Never select one from location or modification time alone.
+8. Run `scripts/memory_baseline.py --runtime codex` for artifact, source-count, and read-only job metrics. Its artifact `bytes` and `lines` fields are size proxies, not token counts; estimate injection size from the runtime payload and label it approximate.
 
 Do not read unrelated rollout summaries or session JSONL files merely to make an audit exhaustive. Do not treat memory as a source for current web facts.
 

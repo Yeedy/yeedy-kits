@@ -59,16 +59,22 @@ def read_jobs(db_path: Path) -> dict[str, Any]:
 
     uri = f"file:{quote(str(db_path), safe='/')}?mode=ro"
     try:
-        return _read_jobs_from_database(uri, db_path, uri=True)
+        db = sqlite3.connect(uri, uri=True)
     except sqlite3.OperationalError:
-        with tempfile.TemporaryDirectory(prefix="memory-baseline-") as directory:
-            temporary_db = Path(directory) / "memory.sqlite"
-            shutil.copy2(db_path, temporary_db)
-            for suffix in ("-wal", "-shm"):
-                sidecar = Path(f"{db_path}{suffix}")
-                if sidecar.is_file():
-                    shutil.copy2(sidecar, Path(f"{temporary_db}{suffix}"))
-            return _read_jobs_from_database(str(temporary_db), db_path)
+        return _read_jobs_from_copy(db_path)
+    with closing(db):
+        return _read_job_rows(db, db_path)
+
+
+def _read_jobs_from_copy(db_path: Path) -> dict[str, Any]:
+    with tempfile.TemporaryDirectory(prefix="memory-baseline-") as directory:
+        temporary_db = Path(directory) / "memory.sqlite"
+        shutil.copy2(db_path, temporary_db)
+        for suffix in ("-wal", "-shm"):
+            sidecar = Path(f"{db_path}{suffix}")
+            if sidecar.is_file():
+                shutil.copy2(sidecar, Path(f"{temporary_db}{suffix}"))
+        return _read_jobs_from_database(str(temporary_db), db_path)
 
 
 def _read_jobs_from_database(
@@ -209,17 +215,17 @@ def collect_codex(codex_dir: Path, requested_db: Path | None = None) -> dict[str
 
 
 def resolve_codex_dir(home: Path) -> Path:
-    configured_codex_dir = os.environ.get("CODEX_HOME")
+    configured_codex_dir = _nonblank_env("CODEX_HOME")
     codex_dir = Path(configured_codex_dir) if configured_codex_dir else home / ".codex"
     return codex_dir.expanduser().absolute()
 
 
 def resolve_omp_agent_dir(home: Path) -> Path:
-    configured_agent_dir = os.environ.get("PI_CODING_AGENT_DIR")
+    configured_agent_dir = _nonblank_env("PI_CODING_AGENT_DIR")
     if configured_agent_dir:
         return Path(configured_agent_dir).expanduser().absolute()
 
-    configured_config_dir = os.environ.get("PI_CONFIG_DIR")
+    configured_config_dir = _nonblank_env("PI_CONFIG_DIR")
     config_dir = Path(configured_config_dir or ".omp").expanduser()
     config_root = config_dir if config_dir.is_absolute() else home / config_dir
     raw_profile = (
@@ -237,6 +243,11 @@ def resolve_omp_agent_dir(home: Path) -> Path:
             raise ValueError(f"Invalid OMP profile name: {profile}")
         return (config_root / "profiles" / profile / "agent").absolute()
     return (config_root / "agent").absolute()
+
+
+def _nonblank_env(name: str) -> str | None:
+    value = os.environ.get(name)
+    return value if value is not None and value.strip() else None
 
 
 def installation_match_priority(script_path: Path, agent_root: Path) -> int:

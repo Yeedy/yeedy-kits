@@ -39,7 +39,7 @@ Check scope quality before content quality for every stored scope. A broad worki
 
 ## Audit Efficiency
 
-Estimate injected size from `memory://root` and label it approximate. Check whether low-value lessons crowd out useful summary content under `memories.summaryInjectionTokenLimit`.
+Estimate injected size from `memory://root` and label it approximate. The baseline reports artifact `bytes` and `lines` as size proxies, not token counts; use the actual `memory://root` payload for the estimate. Check whether low-value lessons crowd out useful summary content under `memories.summaryInjectionTokenLimit`.
 
 Recommend tuning only for observed evidence:
 
