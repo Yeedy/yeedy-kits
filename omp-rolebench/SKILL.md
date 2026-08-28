@@ -52,7 +52,7 @@ The command also enforces the gate: `--execute` without `--confirm` writes the m
 }
 ```
 
-The estimate is a preflight budget, not a promise about tool-heavy context growth. During execution, provider-reported costs are accumulated and later requests stop when the cap is reached. If a provider call returns no cost, a capped run stops after that call with `budget_status: unverifiable`; a single in-flight request can still overshoot the cap.
+The estimate is a preflight budget, not a promise about tool-heavy context growth. During execution, provider-reported costs are accumulated and later requests stop when the cap is reached. If an attempted provider call returns no cost, including a timeout, a capped run stops after that call with `budget_status: unverifiable`; a single in-flight request can still overshoot the cap.
 
 ## Candidate and role selection
 
@@ -64,6 +64,8 @@ Candidate sources are mutually exclusive in intent:
 - `--roles all` reads the `modelRoles` keys from `--config-file` (default `~/.omp/agent/config.yml`). A comma-separated list selects roles explicitly.
 
 Model selectors may include a thinking suffix such as `provider/model:high`; the suffix is recorded separately from model identity. Unknown or malformed explicit selectors fail early.
+
+Thinking variants of the same model are separate benchmark candidates. In `role-isolated` mode, the configured `modelRoles` file is required so non-target selected roles keep their baseline assignment; with an explicit role list, `all-same` and `explicit` modes can run with an assignment file and no baseline config.
 
 ## Assignment modes
 
@@ -79,7 +81,7 @@ For task-subagent experiments, see [observed-task-role-ab.md](references/observe
 
 `--tasks-file` accepts JSON or JSONL task fixtures with `id`, `role`, `prompt`, and optional `workspace`, `expected`, and `max_output_tokens`. Without it, the built-in `core` suite provides small role-contract prompts for `tiny`, `smol`, `commit`, `task`, `slow`, `plan`, `vision`, `designer`, and `advisor`.
 
-`--execute` invokes `omp -p --mode json --no-session` and writes one result per task/run to `results.jsonl`. Each cell gets a temporary config overlay and workspace; the user's normal config is never changed. Without `--execute`, `manifest.json` and the cost estimate are still produced so the experiment can be reviewed before making provider calls.
+`--execute` invokes `omp -p --mode json --no-session` and appends each result immediately to `results.jsonl`. Each cell gets a temporary config overlay and workspace; the user's normal config is never changed. Reusing an output directory rotates an existing `results.jsonl` to a timestamped `results.jsonl.previous-*` file before writing the new manifest. Without `--execute`, `manifest.json` and the cost estimate are still produced so the experiment can be reviewed before making provider calls.
 
 The default `direct` executor calls the selected model with a role contract prompt. Use `--executor delegated` for the closer-to-production subagent path: it creates a temporary project agent with the candidate model and asks an OMP controller to invoke that agent through the `task` tool. Delegated runs add controller overhead to latency, so compare like with like.
 
@@ -93,7 +95,7 @@ python3 omp-rolebench/scripts/rolebench.py report \
   --format markdown
 ```
 
-Reports show assignment counts, pass/error rates, latency, output size, and per-role/per-model rows. Treat cost as unknown unless the provider returns usage/cost data; unknown cost is reported as unknown rather than inferred.
+Reports show assignment counts, pass/error rates, latency, output size, thinking variants, and per-role/per-model rows. Treat cost as unknown unless the provider returns usage/cost data; unknown cost is reported as unknown rather than inferred.
 
 ## Guardrails
 

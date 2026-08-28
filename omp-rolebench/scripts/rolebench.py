@@ -97,6 +97,19 @@ def parse_selector(value: str) -> dict[str, Any]:
     return result
 
 
+def candidate_identity(candidate: dict[str, Any]) -> str:
+    thinking = candidate.get("thinking")
+    return f"{candidate['selector']}:{thinking}" if thinking else candidate["selector"]
+
+
+def decode_subprocess_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", "replace")
+    return str(value)
+
+
 def load_json_document(path: Path) -> Any:
     try:
         return json.loads(path.read_text(encoding="utf-8"))
@@ -170,6 +183,7 @@ def discover_catalog(omp_bin: str, catalog_file: Path | None) -> list[dict[str, 
             check=False,
             capture_output=True,
             text=True,
+            errors="replace",
             timeout=60,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
@@ -211,7 +225,7 @@ def parse_model_roles(config_file: Path) -> dict[str, str]:
     return roles
 
 
-def resolve_roles(value: str, config_file: Path) -> tuple[list[str], dict[str, str]]:
+def resolve_roles(value: str, config_file: Path, require_config: bool = False) -> tuple[list[str], dict[str, str]]:
     baseline = parse_model_roles(config_file) if value == "all" else {}
     roles = list(baseline) if value == "all" else split_csv(value)
     if not roles:
@@ -219,6 +233,8 @@ def resolve_roles(value: str, config_file: Path) -> tuple[list[str], dict[str, s
     if len(set(roles)) != len(roles):
         raise RoleBenchError("duplicate role selector")
     if value != "all":
+        if require_config and not config_file.exists():
+            raise RoleBenchError(f"OMP config does not exist: {config_file}")
         known = parse_model_roles(config_file) if config_file.exists() else {}
         unknown = [role for role in roles if known and role not in known]
         if unknown:
@@ -237,13 +253,13 @@ def resolve_candidates(args: argparse.Namespace) -> tuple[list[dict[str, Any]], 
         seen: dict[str, dict[str, Any]] = {}
         for selector in raw.values():
             candidate = parse_selector(selector)
-            seen[candidate["selector"]] = candidate
+            seen[candidate_identity(candidate)] = candidate
         return [seen[key] for key in sorted(seen)], {"source": "assignment", "file": args.assignment_file}
     if explicit:
         seen: dict[str, dict[str, Any]] = {}
         for selector in explicit:
             candidate = parse_selector(selector)
-            seen[candidate["selector"]] = candidate
+            seen[candidate_identity(candidate)] = candidate
         return [seen[key] for key in sorted(seen)], {"source": "explicit", "selectors": explicit}
     catalog = discover_catalog(args.omp_bin, Path(args.catalog_file) if args.catalog_file else None)
     if providers and providers != ["all"]:
@@ -332,6 +348,7 @@ def build_assignments(mode: str, roles: list[str], baseline: dict[str, str], can
             "mode": mode,
             "role": None,
             "candidate": None,
+            "candidate_variant": None,
             "mapping": {role: item["selector"] for role, item in parsed.items()},
             "thinking": {role: item.get("thinking") for role, item in parsed.items()},
         }]
@@ -343,6 +360,7 @@ def build_assignments(mode: str, roles: list[str], baseline: dict[str, str], can
                 "mode": mode,
                 "role": None,
                 "candidate": candidate["selector"],
+                "candidate_variant": candidate_identity(candidate),
                 "mapping": {role: candidate["selector"] for role in roles},
                 "thinking": {role: candidate.get("thinking") for role in roles},
             })
@@ -356,6 +374,7 @@ def build_assignments(mode: str, roles: list[str], baseline: dict[str, str], can
                 "mode": mode,
                 "role": role,
                 "candidate": candidate["selector"],
+                "candidate_variant": candidate_identity(candidate),
                 "mapping": mapping,
                 "thinking": {name: (candidate.get("thinking") if name == role else None) for name in roles},
             })
@@ -484,6 +503,7 @@ def estimate_benchmark(roles: list[str], assignments: list[dict[str, Any]], task
                 "assignment_id": assignment["id"],
                 "role": task["role"],
                 "model": model,
+                "thinking": assignment.get("thinking", {}).get(task["role"]),
                 "calls": calls,
                 "input_tokens": estimated_input * calls,
                 "output_tokens": estimated_output * calls,
@@ -553,7 +573,9 @@ def run_one(omp_bin: str, assignment: dict[str, Any], task: dict[str, Any], repl
         "task_id": task["id"],
         "replicate": replicate,
         "model": assignment["mapping"].get(task["role"], ""),
+        "thinking": assignment.get("thinking", {}).get(task["role"]),
         "executor": executor,
+        "provider_call_started": False,
         "status": "error",
     }
     if task.get("requires_image") and not task.get("image"):
@@ -650,17 +672,20 @@ def run_one(omp_bin: str, assignment: dict[str, Any], task: dict[str, Any], repl
             command.extend(["--thinking", thinking])
         command.append(prompt)
         command.extend(image_args)
-        completed = subprocess.run(command, check=False, capture_output=True, text=True, timeout=timeout)
+        result["provider_call_started"] = True
+        completed = subprocess.run(command, check=False, capture_output=True, text=True, errors="replace", timeout=timeout)
         result["exit_code"] = completed.returncode
-        result["stdout"] = completed.stdout
-        result["stderr"] = completed.stderr
+        stdout = decode_subprocess_text(completed.stdout)
+        stderr = decode_subprocess_text(completed.stderr)
+        result["stdout"] = stdout
+        result["stderr"] = stderr
         result["command"] = command[:-(1 + len(image_args))]
         if completed.returncode != 0:
             result["error_type"] = "omp_exit"
-            result["error"] = completed.stderr.strip() or f"OMP exited with {completed.returncode}"
+            result["error"] = stderr.strip() or f"OMP exited with {completed.returncode}"
         else:
             try:
-                payload = parse_json_output(completed.stdout)
+                payload = parse_json_output(stdout)
                 result["output"] = extract_output(payload)
                 usage = extract_usage(payload)
                 if usage is not None:
@@ -677,8 +702,8 @@ def run_one(omp_bin: str, assignment: dict[str, Any], task: dict[str, Any], repl
     except subprocess.TimeoutExpired as exc:
         result["error_type"] = "timeout"
         result["error"] = f"OMP exceeded {timeout}s"
-        result["stdout"] = exc.stdout or ""
-        result["stderr"] = exc.stderr or ""
+        result["stdout"] = decode_subprocess_text(exc.stdout)
+        result["stderr"] = decode_subprocess_text(exc.stderr)
     except (OSError, RoleBenchError) as exc:
         result["error_type"] = "executor_setup"
         result["error"] = str(exc)
@@ -688,14 +713,27 @@ def run_one(omp_bin: str, assignment: dict[str, Any], task: dict[str, Any], repl
     return result
 
 
-def write_results(path: Path, rows: Iterable[dict[str, Any]]) -> None:
-    with path.open("w", encoding="utf-8") as handle:
-        for row in rows:
-            handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+def rotate_stale_results(path: Path) -> str | None:
+    if not path.exists():
+        return None
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    rotated = path.with_name(f"{path.name}.previous-{stamp}")
+    try:
+        path.replace(rotated)
+    except OSError as exc:
+        raise RoleBenchError(f"cannot rotate existing results file {path}: {exc}") from exc
+    return str(rotated)
+
+
+def append_result(path: Path, row: dict[str, Any]) -> None:
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+        handle.flush()
 
 
 def run_command(args: argparse.Namespace) -> int:
-    roles, baseline = resolve_roles(args.roles, Path(args.config_file).expanduser())
+    config_path = Path(args.config_file).expanduser()
+    roles, baseline = resolve_roles(args.roles, config_path, require_config=args.mode == "role-isolated")
     candidates, source = resolve_candidates(args)
     tasks = load_tasks(args)
     validate_task_coverage(tasks, roles)
@@ -705,6 +743,8 @@ def run_command(args: argparse.Namespace) -> int:
     estimate = estimate_benchmark(roles, assignments, tasks, args.runs, pricing)
     output_dir = Path(args.output).expanduser()
     output_dir.mkdir(parents=True, exist_ok=True)
+    results_path = output_dir / "results.jsonl"
+    previous_results = rotate_stale_results(results_path)
     manifest = {
         "schema_version": 1,
         "generated_at": now_iso(),
@@ -719,6 +759,7 @@ def run_command(args: argparse.Namespace) -> int:
         "controller_model": args.controller_model,
         "pricing_file": args.pricing_file,
         "max_cost_usd": args.max_cost_usd,
+        "previous_results": previous_results,
         "estimate": estimate,
         "consent": {
             "required": bool(args.execute),
@@ -750,7 +791,7 @@ def run_command(args: argparse.Namespace) -> int:
         write_json(output_dir / "summary.json", summary)
         print("Execution blocked: obtain user consent, then rerun with --execute --confirm.", file=sys.stderr)
         return 3
-    rows = []
+    result_rows = 0
     actual_cost = 0.0
     actual_cost_seen = False
     budget_status = "not-set" if args.max_cost_usd is None else "running"
@@ -763,23 +804,24 @@ def run_command(args: argparse.Namespace) -> int:
             applicable = [task for task in tasks if task_for_assignment(task, assignment)]
             for replicate in range(1, args.runs + 1):
                 for task in applicable:
-                    rows.append(run_one(
+                    row = run_one(
                         args.omp_bin,
                         assignment,
                         task,
                         replicate,
                         output_dir,
                         args.timeout,
-                        Path(args.config_file).expanduser(),
+                        config_path,
                         args.executor,
                         args.controller_model,
-                    ))
-                    row = rows[-1]
+                    )
+                    append_result(results_path, row)
+                    result_rows += 1
                     cost = extract_cost(row.get("usage"))
                     if cost is not None:
                         actual_cost += cost
                         actual_cost_seen = True
-                    if args.max_cost_usd is not None and "exit_code" in row:
+                    if args.max_cost_usd is not None and row.get("provider_call_started"):
                         if cost is None:
                             budget_status = "unverifiable"
                             stopped_reason = "provider_did_not_return_cost"
@@ -794,13 +836,12 @@ def run_command(args: argparse.Namespace) -> int:
                     break
             if stop:
                 break
-        write_results(output_dir / "results.jsonl", rows)
     summary = {
         "run_dir": str(output_dir),
         "status": "completed" if args.execute else "preview",
         "assignments": len(assignments),
         "tasks": len(tasks),
-        "result_rows": len(rows),
+        "result_rows": result_rows,
         "executed": bool(args.execute),
         "estimated_cost_usd": estimate["cost_usd"],
         "actual_cost_usd": round(actual_cost, 8) if args.execute and actual_cost_seen else None,
@@ -827,9 +868,9 @@ def report_command(args: argparse.Namespace) -> int:
                 rows.append(json.loads(line))
             except json.JSONDecodeError as exc:
                 raise RoleBenchError(f"malformed results.jsonl line {number}: {exc}") from exc
-    groups: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+    groups: dict[tuple[str, str, str], list[dict[str, Any]]] = defaultdict(list)
     for row in rows:
-        groups[(row.get("role", ""), row.get("model", ""))].append(row)
+        groups[(row.get("role", ""), row.get("model", ""), row.get("thinking") or "")].append(row)
     lines = [
         "# OMP RoleBench Report",
         "",
@@ -839,10 +880,10 @@ def report_command(args: argparse.Namespace) -> int:
         f"- Assignments: {len(manifest.get('assignments', []))}",
         f"- Result rows: {len(rows)}",
         "",
-        "| Role | Model | Runs | Pass | Error | Pass rate | P50 latency (ms) | P95 latency (ms) | Avg output chars | Cost |",
-        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "| Role | Model | Thinking | Runs | Pass | Error | Pass rate | P50 latency (ms) | P95 latency (ms) | Avg output chars | Cost |",
+        "|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
-    for (role, model), values in sorted(groups.items()):
+    for (role, model, thinking), values in sorted(groups.items()):
         passes = sum(value.get("status") == "pass" for value in values)
         errors = len(values) - passes
         latency = [float(value["latency_ms"]) for value in values if isinstance(value.get("latency_ms"), (int, float))]
@@ -855,15 +896,23 @@ def report_command(args: argparse.Namespace) -> int:
         avg_output = f"{sum(output_size) / len(output_size):.1f}" if output_size else "0"
         rate = f"{passes / len(values):.1%}" if values else "0.0%"
         total_cost = f"${sum(costs):.6f}" if costs else "unknown"
-        lines.append(f"| `{role}` | `{model}` | {len(values)} | {passes} | {errors} | {rate} | {p50_text} | {p95_text} | {avg_output} | {total_cost} |")
+        lines.append(f"| `{role}` | `{model}` | `{thinking or '-'} | {len(values)} | {passes} | {errors} | {rate} | {p50_text} | {p95_text} | {avg_output} | {total_cost} |")
     if not rows:
         lines.extend(["", "No executed results found. This run contains a matrix preview only."])
     report = "\n".join(lines) + "\n"
     if args.format == "json":
         serializable_groups = {
-            f"{role}/{model}": values for (role, model), values in groups.items()
+            f"{role}/{model}:{thinking}" if thinking else f"{role}/{model}": values
+            for (role, model, thinking), values in groups.items()
         }
-        print(json.dumps({"manifest": manifest, "groups": serializable_groups}, ensure_ascii=False, indent=2))
+        rendered = json.dumps({"manifest": manifest, "groups": serializable_groups}, ensure_ascii=False, indent=2) + "\n"
+        if args.output:
+            output = Path(args.output).expanduser()
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_text(rendered, encoding="utf-8")
+            print(output)
+        else:
+            print(rendered, end="")
     elif args.output:
         output = Path(args.output).expanduser()
         output.parent.mkdir(parents=True, exist_ok=True)
