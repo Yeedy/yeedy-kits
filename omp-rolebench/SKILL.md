@@ -103,7 +103,7 @@ If `--tasks-file` is provided, it takes precedence over `--task-source`.
 
 The default `direct` executor calls the selected model with a role contract prompt. Use `--executor delegated` for the closer-to-production subagent path: it creates a temporary project agent with the candidate model and asks an OMP controller to invoke that agent through the `task` tool. Delegated runs add controller overhead to latency, so compare like with like.
 
-The V1 evaluator deterministically checks declared output contracts, file state, changed-path scope, failure-output patterns, and explicitly approved command results. Execution status, task outcome, dimension status, and hard gates remain separate. Unsupported or subjective dimensions are `unknown`; there is no composite score and V1 does not automatically recommend a model. A fixed judge or blind human review can later supplement deterministic evidence, but must not overwrite raw results.
+The V1 evaluator deterministically checks declared output contracts, file state, changed-path scope, failure-output patterns, and explicitly approved command results. Execution status, task outcome, dimension status, and hard gates remain separate. Incomplete execution, evaluator limits, missing evidence, and dimensions without applicable checks are `unknown` with a `null` score; no hard gate passes without evidence. Snapshot, artifact, or evaluator failures are recorded without overwriting a completed raw provider result. There is no composite score and V1 does not automatically recommend a model. A fixed judge or blind human review can later supplement deterministic evidence, but must not overwrite raw results.
 
 ## Reports
 

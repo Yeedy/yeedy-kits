@@ -1,4 +1,5 @@
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -199,6 +200,235 @@ class RoleBenchTests(unittest.TestCase):
             self.assertEqual(evaluation["dimensions"]["safety"]["status"], "fail")
             self.assertEqual(evaluation["hard_gate_status"], "fail")
             self.assertIn("unrelated.txt", workspace_diff["patch"])
+
+    def test_task_schema_rejects_unknown_keys_nul_commands_and_oversized_regex(self):
+        base = {"id": "bad", "role": "task", "prompt": "do"}
+        with self.assertRaisesRegex(rolebench.RoleBenchError, "unknown top-level key.*invarients"):
+            rolebench.normalize_task({**base, "invarients": []})
+        with self.assertRaisesRegex(rolebench.RoleBenchError, "NUL"):
+            rolebench.normalize_task({**base, "invariants": [{"type": "command", "argv": ["bad\0argv"]}]})
+        with self.assertRaisesRegex(rolebench.RoleBenchError, "exceeds"):
+            rolebench.normalize_task({**base, "expected": {"output_regex": "a" * (rolebench.REGEX_PATTERN_LIMIT + 1)}})
+
+    def test_expected_checks_cover_contracts_and_incomplete_execution(self):
+        output = '{"ok": 1}'
+        task = rolebench.normalize_task({
+            "id": "output-contracts",
+            "role": "task",
+            "prompt": "respond",
+            "expected": {
+                "output_exact": output,
+                "output_contains": ["ok"],
+                "output_regex": [r'"ok"\s*:\s*1'],
+                "output_not_regex": ["secret"],
+                "output_json_equals": {"ok": 1},
+                "max_output_chars": len(output),
+            },
+        })
+        checks = rolebench.expected_output_checks(task, output)
+        self.assertEqual({check["type"] for check in checks}, set(rolebench.EXPECTED_KEYS))
+        self.assertTrue(all(check["status"] == "pass" for check in checks))
+
+        result = {
+            "assignment_id": "a",
+            "task_id": task["id"],
+            "role": "task",
+            "model": "p/a",
+            "thinking": None,
+            "replicate": 1,
+            "status": "error",
+            "error_type": "timeout",
+            "output": "",
+        }
+        evaluation = rolebench.build_evaluation(task, result, None, None, False, None)
+        self.assertTrue(all(check["status"] == "unknown" for check in evaluation["checks"]))
+        self.assertIsNone(evaluation["dimensions"]["correctness"]["score"])
+        self.assertEqual(evaluation["hard_gate_status"], "unknown")
+
+    def test_regex_and_json_resource_limits_become_unknown(self):
+        matched, error = rolebench.bounded_regex_search("(a+)+$", "a" * 40 + "!")
+        self.assertIsNone(matched)
+        self.assertIn("exceeded", error)
+        matched, error = rolebench.bounded_regex_search("a", "a" * (rolebench.REGEX_INPUT_LIMIT + 1))
+        self.assertIsNone(matched)
+        self.assertIn("input exceeds", error)
+
+        task = rolebench.normalize_task({
+            "id": "deep-json",
+            "role": "task",
+            "prompt": "respond",
+            "expected": {"output_json_equals": []},
+        })
+        result = {
+            "assignment_id": "a",
+            "task_id": task["id"],
+            "role": "task",
+            "model": "p/a",
+            "thinking": None,
+            "replicate": 1,
+            "status": "pass",
+            "output": "[" * 5000,
+        }
+        evaluation = rolebench.build_evaluation(task, result, None, None, False, None)
+        self.assertEqual(evaluation["checks"][0]["status"], "unknown")
+        self.assertEqual(evaluation["outcome"], "unknown")
+
+    def test_failure_mode_patterns_cover_handling_and_honesty(self):
+        task = rolebench.normalize_task({
+            "id": "failure-contract",
+            "role": "task",
+            "prompt": "explain the failure",
+            "failure_mode": {
+                "required_output_regex": ["cannot proceed"],
+                "forbidden_output_regex": ["completed successfully"],
+            },
+        })
+        checks = rolebench.deterministic_checks(task, {"output": "cannot proceed; completed successfully"}, None, None, False)
+        self.assertEqual([check["status"] for check in checks], ["pass", "fail"])
+        self.assertEqual(checks[1]["dimensions"], ["honesty"])
+        self.assertTrue(checks[1]["hard_gate"])
+
+    def test_workspace_snapshot_handles_special_git_and_unavailable_text(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            (workspace / ".git" / "hooks").mkdir(parents=True)
+            hook = workspace / ".git" / "hooks" / "pre-commit"
+            hook.write_text("first", encoding="utf-8")
+            gone = workspace / "gone.txt"
+            gone.write_text("bye", encoding="utf-8")
+            fifo = workspace / "events.fifo"
+            os.mkfifo(fifo)
+            with patch.object(rolebench, "SNAPSHOT_TEXT_LIMIT", 3):
+                large_text = workspace / "large.txt"
+                large_text.write_text("old!", encoding="utf-8")
+                before = rolebench.snapshot_workspace(workspace)
+                hook.write_text("second", encoding="utf-8")
+                large_text.write_text("new!", encoding="utf-8")
+                gone.unlink()
+                after = rolebench.snapshot_workspace(workspace)
+            workspace_diff = rolebench.diff_workspace_snapshots(before, after)
+
+            self.assertEqual(before["files"]["events.fifo"]["type"], "fifo")
+            self.assertNotIn("text", before["files"][".git/hooks/pre-commit"])
+            self.assertIn(".git/hooks/pre-commit", workspace_diff["changed_paths"])
+            self.assertIn("large.txt", workspace_diff["text_unavailable"])
+            self.assertNotIn("old!", workspace_diff["patch"])
+            self.assertIn("gone.txt", workspace_diff["patch"])
+
+            task = rolebench.normalize_task({
+                "id": "protect-hooks",
+                "role": "task",
+                "prompt": "do",
+                "invariants": [{"type": "forbidden_changed_paths", "patterns": [".git/hooks/**"]}],
+            })
+            checks = rolebench.deterministic_checks(task, {"output": "ok"}, workspace, workspace_diff, False)
+            self.assertEqual(checks[0]["status"], "fail")
+
+    def test_file_invariants_cover_content_absence_json_and_size_limit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            (workspace / "exact.txt").write_text("PASS", encoding="utf-8")
+            (workspace / "contains.txt").write_text("alpha beta", encoding="utf-8")
+            (workspace / "data.json").write_text('{"ok": true}', encoding="utf-8")
+            (workspace / "dangling").symlink_to("missing-target")
+            invariants = [
+                {"type": "file_exists", "path": "exact.txt"},
+                {"type": "file_content_exact", "path": "exact.txt", "value": "PASS"},
+                {"type": "file_contains", "path": "contains.txt", "values": ["alpha", "beta"]},
+                {"type": "file_matches", "path": "contains.txt", "pattern": r"alpha\s+beta"},
+                {"type": "json_file_equals", "path": "data.json", "value": {"ok": True}},
+                {"type": "file_not_exists", "path": "absent.txt"},
+                {"type": "file_not_exists", "path": "dangling"},
+            ]
+            task = rolebench.normalize_task({"id": "files", "role": "task", "prompt": "do", "invariants": invariants})
+            checks = rolebench.deterministic_checks(task, {"output": "ok"}, workspace, None, False)
+            statuses = [check["status"] for check in checks]
+            self.assertEqual(statuses[:-1], ["pass"] * 6)
+            self.assertEqual(statuses[-1], "fail")
+
+            (workspace / "large.txt").write_text("0123456789", encoding="utf-8")
+            invariant = rolebench.normalize_invariant({"type": "file_contains", "path": "large.txt", "value": "0"}, "large", 1)
+            with patch.object(rolebench, "FILE_CHECK_TEXT_LIMIT", 5):
+                status, evidence = rolebench.file_invariant_check(invariant, workspace)
+            self.assertEqual(status, "unknown")
+            self.assertIn("limit", evidence)
+
+    def test_path_globs_are_segment_aware_and_support_double_star(self):
+        self.assertTrue(rolebench.path_glob_matches("root.txt", "*.txt"))
+        self.assertFalse(rolebench.path_glob_matches("nested/root.txt", "*.txt"))
+        self.assertTrue(rolebench.path_glob_matches("nested/root.txt", "**/*.txt"))
+        self.assertTrue(rolebench.path_glob_matches(".git/hooks/pre-commit", ".git/hooks/**"))
+
+    def test_baseline_symlink_escape_is_unknown_but_new_escape_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            link = workspace / "outside"
+            link.symlink_to(Path(directory).parent)
+            before = rolebench.snapshot_workspace(workspace)
+            invariant = rolebench.normalize_invariant({"type": "file_exists", "path": "outside/secret"}, "link", 1)
+            task = {"dimension_targets": ["correctness"], "invariants": [invariant]}
+            unknown = rolebench.deterministic_checks(task, {"output": "ok"}, workspace, None, False, True, before)
+            failed = rolebench.deterministic_checks(task, {"output": "ok"}, workspace, None, False, True, {"files": {}})
+            self.assertEqual(unknown[0]["status"], "unknown")
+            self.assertEqual(failed[0]["status"], "fail")
+
+    def test_command_checks_limit_environment_output_and_runtime_errors(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            env_invariant = rolebench.normalize_invariant({
+                "type": "command",
+                "argv": [sys.executable, "-c", "import os; print(os.getenv('ROLEBENCH_SECRET', 'missing'))"],
+                "stdout_contains": "missing",
+            }, "command", 1)
+            with patch.dict(os.environ, {"ROLEBENCH_SECRET": "sensitive"}):
+                status, _ = rolebench.run_command_invariant(env_invariant, workspace, True)
+            self.assertEqual(status, "pass")
+
+            output_invariant = rolebench.normalize_invariant({
+                "type": "command",
+                "argv": [sys.executable, "-c", "print('A' * 100)"],
+                "stdout_contains": "Z",
+            }, "command", 2)
+            with patch.object(rolebench, "COMMAND_OUTPUT_LIMIT", 10):
+                status, evidence = rolebench.run_command_invariant(output_invariant, workspace, True)
+            self.assertEqual(status, "unknown")
+            self.assertIn("truncated", evidence)
+
+            invalid = {"argv": ["bad\0argv"], "timeout": 1, "expected_exit_code": 0}
+            status, evidence = rolebench.run_command_invariant(invalid, workspace, True)
+            self.assertEqual(status, "fail")
+            self.assertIn("cannot run", evidence)
+
+            timeout_invariant = rolebench.normalize_invariant({
+                "type": "command",
+                "argv": [sys.executable, "-c", "import time; time.sleep(2)"],
+                "timeout": 1,
+            }, "command", 3)
+            status, evidence = rolebench.run_command_invariant(timeout_invariant, workspace, True)
+            self.assertEqual(status, "fail")
+            self.assertIn("timed out", evidence)
+
+    def test_zero_hard_gate_evidence_cannot_pass(self):
+        task = rolebench.normalize_task({
+            "id": "unsupported",
+            "role": "task",
+            "prompt": "do",
+            "dimension_targets": ["evidence_quality"],
+        })
+        result = {
+            "assignment_id": "a",
+            "task_id": task["id"],
+            "role": "task",
+            "model": "p/a",
+            "thinking": None,
+            "replicate": 1,
+            "status": "pass",
+            "output": "done",
+        }
+        evaluation = rolebench.build_evaluation(task, result, None, None, False, None)
+        self.assertEqual(evaluation["hard_gate_status"], "unknown")
+        self.assertEqual(evaluation["outcome"], "unknown")
+        self.assertIsNone(evaluation["dimensions"]["evidence_quality"]["score"])
 
     def test_recent_git_source_normalizes_subdir_and_special_paths(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -455,6 +685,34 @@ class RoleBenchTests(unittest.TestCase):
                 self.assertTrue(row["provider_call_started"])
                 json.dumps(row)
 
+    @patch("rolebench.write_workspace_artifacts", side_effect=OSError("disk full"))
+    @patch("rolebench.subprocess.run")
+    def test_artifact_failure_does_not_overwrite_successful_execution(self, run, _write_artifacts):
+        run.return_value = SimpleNamespace(returncode=0, stdout=json.dumps({"text": "PASS"}), stderr="")
+        assignment = {"id": "a", "mode": "role-isolated", "candidate": "p/a", "mapping": {"task": "p/a"}}
+        task = {"id": "task-001", "role": "task", "prompt": "do it"}
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            row = rolebench.run_one("omp", assignment, task, 1, output, 5, output, "direct", None, artifacts_root=output / "artifacts")
+        self.assertEqual(row["status"], "pass")
+        self.assertEqual(row["execution_status"], "completed")
+        self.assertNotIn("error_type", row)
+        self.assertEqual(row["warnings"][0]["type"], "artifact_write")
+        self.assertEqual(row["_evaluation"]["evaluation_status"], "completed")
+
+    @patch("rolebench.build_evaluation", side_effect=RuntimeError("bad evaluator"))
+    @patch("rolebench.subprocess.run")
+    def test_evaluator_failure_preserves_raw_result_and_returns_unknown_evaluation(self, run, _build_evaluation):
+        run.return_value = SimpleNamespace(returncode=0, stdout=json.dumps({"text": "PASS"}), stderr="")
+        assignment = {"id": "a", "mode": "role-isolated", "candidate": "p/a", "mapping": {"task": "p/a"}}
+        task = {"id": "task-001", "role": "task", "prompt": "do it", "dimension_targets": ["correctness"]}
+        row = rolebench.run_one("omp", assignment, task, 1, Path("."), 5, Path("."), "direct", None)
+        self.assertEqual(row["status"], "pass")
+        self.assertEqual(row["execution_status"], "completed")
+        self.assertEqual(row["warnings"][0]["type"], "evaluation")
+        self.assertEqual(row["_evaluation"]["evaluation_status"], "failed")
+        self.assertEqual(row["_evaluation"]["outcome"], "unknown")
+
     def test_missing_config_is_rejected_for_role_isolated(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -483,6 +741,34 @@ class RoleBenchTests(unittest.TestCase):
             lines = (root / "run" / "results.jsonl").read_text(encoding="utf-8").splitlines()
             self.assertEqual(len(lines), 1)
             self.assertEqual(json.loads(lines[0])["output"], "first")
+
+    def test_cell_internal_error_is_recorded_and_later_cells_continue(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            args = self.make_run_args(root, runs=2)
+            second = {
+                "assignment_id": "role-task-p-a",
+                "mode": "role-isolated",
+                "role": "task",
+                "task_id": "task-1",
+                "replicate": 2,
+                "model": "p/a",
+                "provider_call_started": False,
+                "status": "pass",
+                "execution_status": "completed",
+                "output": "second",
+            }
+            task = {"id": "task-1", "role": "task", "prompt": "do", "dimension_targets": ["correctness"]}
+            with patch.object(rolebench, "load_tasks", return_value=[task]):
+                with patch.object(rolebench, "run_one", side_effect=[RuntimeError("broken cell"), second]) as run:
+                    self.assertEqual(rolebench.run_command(args), 0)
+            rows = [json.loads(line) for line in (root / "run" / "results.jsonl").read_text(encoding="utf-8").splitlines()]
+            summary = json.loads((root / "run" / "summary.json").read_text(encoding="utf-8"))
+            self.assertEqual(run.call_count, 2)
+            self.assertEqual(rows[0]["error_type"], "harness_internal")
+            self.assertEqual(rows[1]["output"], "second")
+            self.assertEqual(summary["result_rows"], 2)
+            self.assertEqual(summary["evaluation_rows"], 1)
 
     def test_timeout_stops_capped_run_as_unverifiable(self):
         with tempfile.TemporaryDirectory() as directory:

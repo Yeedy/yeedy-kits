@@ -4,7 +4,7 @@ RoleBench V1 keeps provider execution data separate from quality evaluation. It 
 
 ## Task schema
 
-Use task schema version 1. A JSON document may wrap tasks as `{"schema_version": 1, "tasks": [...]}`; JSONL contains one task object per line. Every task requires `id`, `role`, and `prompt`.
+Use task schema version 1. A JSON document may wrap tasks as `{"schema_version": 1, "tasks": [...]}`; JSONL contains one task object per line. Every task requires `id`, `role`, and `prompt`. Unknown task, expected-output, difficulty, failure-mode, or invariant keys are rejected before any model call so fixture typos cannot silently remove checks.
 
 ```json
 {
@@ -58,9 +58,11 @@ Supported dimensions are:
 | `output_json_equals` | JSON value compared structurally |
 | `max_output_chars` | Non-negative integer |
 
+Regular-expression patterns are capped at 4,096 characters. Matching runs in an isolated helper process with a 1 second timeout and a 256 KiB input limit. A timeout or evaluator limit produces `unknown`, not a model failure. Structural JSON checks are capped at 1 MiB; excessive nesting or size also produces `unknown`.
+
 ## Workspace invariants
 
-All fixture paths are workspace-relative. Absolute paths and `..` are rejected before execution.
+All fixture paths are workspace-relative. Absolute paths and `..` are rejected before execution. Changed-path patterns are segment-aware: `*.txt` matches only files at the workspace root, while `**/*.txt` also matches nested paths.
 
 | Type | Required fields | Purpose |
 |---|---|---|
@@ -74,7 +76,9 @@ All fixture paths are workspace-relative. Absolute paths and `..` are rejected b
 | `forbidden_changed_paths` | `patterns` | Fail changes matching glob patterns |
 | `command` | `argv` | Run a reviewed hidden check without a shell |
 
-Every invariant may override `dimensions` and `hard_gate`. Otherwise RoleBench derives them from the check type. Command checks also accept `expected_exit_code`, `stdout_contains`, `stderr_contains`, and `timeout` from 1 to 600 seconds.
+Every invariant may override `dimensions` and `hard_gate`. Otherwise RoleBench derives them from the check type. UTF-8 file-content and JSON checks read at most 1 MiB; larger or concurrently growing files produce `unknown`. A dangling symlink counts as an existing path for `file_not_exists`. A fixture symlink that already escaped the workspace at the baseline produces `unknown`; a newly created escaping symlink fails the check.
+
+Command checks also accept `expected_exit_code`, `stdout_contains`, `stderr_contains`, and `timeout` from 1 to 600 seconds. NUL bytes in argv are rejected during fixture validation. Commands receive only a small allowlist of process variables and a temporary workspace `HOME`; each stdout/stderr stream is capped at 1 MiB. If required text may exist beyond a truncated stream, the check is `unknown`.
 
 Command checks are trusted local code, not a sandbox. The plan prints every exact argv. An executing run containing them is blocked unless the user has reviewed the commands and the CLI includes `--allow-check-command`. Commands run after the final workspace snapshot, so their side effects do not appear as model changes.
 
@@ -86,10 +90,12 @@ Each executed cell produces:
 
 - `results.jsonl`: raw OMP execution, usage, latency, stdout/stderr, and `execution_status` (`completed`, `timeout`, or `failed`).
 - `evaluations.jsonl`: independent deterministic checks, per-dimension evidence, `outcome`, and `hard_gate_status`.
-- `artifacts/<run-id>/<cell>/workspace-before.json`: hashes, modes, symlinks, and directory metadata before OMP runs.
-- `workspace-after.json`, `workspace-diff.json`, and `workspace.patch`: final hashes, changed paths, and UTF-8 text diffs for files up to 64 KiB. The combined patch is capped at 5 MiB and records when it was truncated.
+- `artifacts/<run-id>/<cell>/workspace-before.json`: hashes, modes, symlinks, special-file types, and directory metadata before OMP runs. `.git` entries are hashed so hook or config changes remain visible, but their text is never retained. Files over 64 MiB use bounded samples and mark the snapshot incomplete, so changed-path checks become `unknown` instead of overstating coverage.
+- `workspace-after.json`, `workspace-diff.json`, and `workspace.patch`: final hashes, changed paths, and UTF-8 text diffs for files up to 64 KiB. The combined patch is capped at 5 MiB and records when it was truncated. `text_unavailable` records changed regular files whose content could not be included rather than rendering a misleading deletion.
 
-An outcome is `fail` when execution fails or a deterministic check fails, `unknown` when evidence is missing, and `pass` only when every applicable check passes. Dimension rows retain `status`, score `0..2` or `null`, evidence, evaluator type, and hard-gate metadata. There is no composite score. Correctness, honesty, and safety are hard-gate dimensions.
+An outcome is `fail` when execution fails or a deterministic check fails, `unknown` when evidence is missing, and `pass` only when every applicable check passes. When execution times out or fails, output-contract checks are `unknown` because empty or partial stdout is not correctness evidence. Dimension rows retain `status`, score `0` or `2` for deterministic fail/pass, or `null` for `unknown`, plus evidence, evaluator type, and hard-gate metadata. There is no composite score. Correctness, honesty, and safety are hard-gate dimensions, and `hard_gate_status` cannot be `pass` when no hard-gate evidence was evaluated.
+
+Snapshot, artifact, or evaluator failures are recorded as warnings or failed evaluations without changing a completed raw provider result. A last-resort per-cell boundary records unexpected harness failures and continues uncapped runs; capped runs still stop as unverifiable when a provider call may have occurred without returned cost. Evaluation JSONL write errors are counted in `summary.json`.
 
 ## V1 limits
 

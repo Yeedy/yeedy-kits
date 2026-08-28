@@ -17,6 +17,7 @@ import os
 import random
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -168,6 +169,23 @@ EVALUATION_DIMENSIONS = (
 HARD_GATE_DIMENSIONS = {"correctness", "honesty", "safety"}
 DIFFICULTY_AXES = {"scope", "reasoning", "tool_depth", "context", "uncertainty", "risk", "adversarial"}
 EXPECTED_KEYS = {"output_exact", "output_contains", "output_regex", "output_not_regex", "output_json_equals", "max_output_chars"}
+TASK_KEYS = {
+    "schema_version",
+    "id",
+    "role",
+    "prompt",
+    "pair_id",
+    "variant",
+    "workspace",
+    "max_output_tokens",
+    "requires_image",
+    "image",
+    "difficulty",
+    "expected",
+    "failure_mode",
+    "invariants",
+    "dimension_targets",
+}
 INVARIANT_TYPES = {
     "file_exists",
     "file_not_exists",
@@ -191,8 +209,17 @@ DEFAULT_CHECK_DIMENSIONS = {
     "command": ["correctness"],
 }
 SNAPSHOT_TEXT_LIMIT = 64 * 1024
+SNAPSHOT_HASH_LIMIT = 64 * 1024 * 1024
 WORKSPACE_PATCH_LIMIT = 5 * 1024 * 1024
+FILE_CHECK_TEXT_LIMIT = 1024 * 1024
+JSON_CHECK_TEXT_LIMIT = 1024 * 1024
+REGEX_PATTERN_LIMIT = 4096
+REGEX_INPUT_LIMIT = 256 * 1024
+REGEX_TIMEOUT_SECONDS = 1.0
+COMMAND_OUTPUT_LIMIT = 1024 * 1024
 EVIDENCE_TEXT_LIMIT = 1000
+SAFE_COMMAND_ENV_KEYS = ("PATH", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "TMPDIR", "SYSTEMROOT", "PATHEXT")
+REGEX_WORKER = "import json,re,sys; pattern,text=json.load(sys.stdin); sys.exit(0 if re.search(pattern,text) else 1)"
 
 
 class RoleBenchError(Exception):
@@ -652,11 +679,46 @@ def fixture_patterns(value: Any, label: str) -> list[str]:
 
 
 def validate_fixture_regex(pattern: str, label: str) -> str:
+    if len(pattern) > REGEX_PATTERN_LIMIT:
+        raise RoleBenchError(f"{label} exceeds {REGEX_PATTERN_LIMIT} characters")
     try:
         re.compile(pattern)
     except re.error as exc:
         raise RoleBenchError(f"invalid regex in {label}: {exc}") from exc
     return pattern
+
+
+def minimal_command_environment(workspace: Path | None = None) -> dict[str, str]:
+    environment = {key: os.environ[key] for key in SAFE_COMMAND_ENV_KEYS if key in os.environ}
+    if workspace is not None:
+        environment["HOME"] = str(workspace)
+    return environment
+
+
+def bounded_regex_search(pattern: str, text: str) -> tuple[bool | None, str | None]:
+    if len(text) > REGEX_INPUT_LIMIT:
+        return None, f"regex input exceeds {REGEX_INPUT_LIMIT} characters"
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-I", "-c", REGEX_WORKER],
+            input=json.dumps([pattern, text]),
+            check=False,
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=REGEX_TIMEOUT_SECONDS,
+            env=minimal_command_environment(),
+        )
+    except subprocess.TimeoutExpired:
+        return None, f"regex evaluation exceeded {REGEX_TIMEOUT_SECONDS:.1f}s"
+    except (OSError, ValueError) as exc:
+        return None, f"regex evaluator failed: {exc}"
+    if completed.returncode == 0:
+        return True, None
+    if completed.returncode == 1:
+        return False, None
+    detail = " ".join((completed.stderr or completed.stdout).split())[:300]
+    return None, f"regex evaluator exited {completed.returncode}: {detail or 'unknown error'}"
 
 
 def normalize_expected(value: Any, task_id: str) -> dict[str, Any]:
@@ -760,6 +822,8 @@ def normalize_invariant(value: Any, task_id: str, index: int) -> dict[str, Any]:
         argv = result.get("argv")
         if not isinstance(argv, list) or not argv or any(not isinstance(item, str) or not item for item in argv):
             raise RoleBenchError(f"{label}.argv must be a non-empty argv list")
+        if any("\0" in item for item in argv):
+            raise RoleBenchError(f"{label}.argv must not contain NUL bytes")
         exit_code = result.get("expected_exit_code", 0)
         if not isinstance(exit_code, int) or isinstance(exit_code, bool):
             raise RoleBenchError(f"{label}.expected_exit_code must be an integer")
@@ -777,6 +841,9 @@ def normalize_invariant(value: Any, task_id: str, index: int) -> dict[str, Any]:
 def normalize_task(task: dict[str, Any]) -> dict[str, Any]:
     task_id = task["id"]
     normalized = dict(task)
+    unknown_keys = sorted(set(normalized) - TASK_KEYS)
+    if unknown_keys:
+        raise RoleBenchError(f"task {task_id} contains unknown top-level key(s): {', '.join(unknown_keys)}")
     for key in ("id", "role", "prompt"):
         if not isinstance(normalized[key], str) or not normalized[key]:
             raise RoleBenchError(f"task {task_id!r} {key} must be a non-empty string")
@@ -977,9 +1044,22 @@ def write_json(path: Path, value: Any) -> None:
     path.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
+def filesystem_entry_type(mode: int) -> str:
+    if stat.S_ISFIFO(mode):
+        return "fifo"
+    if stat.S_ISSOCK(mode):
+        return "socket"
+    if stat.S_ISCHR(mode):
+        return "character_device"
+    if stat.S_ISBLK(mode):
+        return "block_device"
+    return "other"
+
+
 def snapshot_workspace(workspace: Path) -> dict[str, Any]:
     files: dict[str, dict[str, Any]] = {}
     errors: list[str] = []
+    incomplete: list[str] = []
 
     def record_walk_error(exc: OSError) -> None:
         errors.append(f"{exc.filename or workspace}: {exc}")
@@ -990,8 +1070,6 @@ def snapshot_workspace(workspace: Path) -> dict[str, Any]:
         for name in sorted(directories):
             path = root / name
             relative = path.relative_to(workspace).as_posix()
-            if name == ".git":
-                continue
             if path.is_symlink():
                 try:
                     files[relative] = {"type": "symlink", "target": os.readlink(path), "mode": path.lstat().st_mode & 0o7777}
@@ -1008,23 +1086,51 @@ def snapshot_workspace(workspace: Path) -> dict[str, Any]:
             path = root / name
             relative = path.relative_to(workspace).as_posix()
             try:
-                if path.is_symlink():
-                    files[relative] = {"type": "symlink", "target": os.readlink(path), "mode": path.lstat().st_mode & 0o7777}
+                path_stat = path.lstat()
+                if stat.S_ISLNK(path_stat.st_mode):
+                    files[relative] = {"type": "symlink", "target": os.readlink(path), "mode": path_stat.st_mode & 0o7777}
                     continue
+                if not stat.S_ISREG(path_stat.st_mode):
+                    files[relative] = {"type": filesystem_entry_type(path_stat.st_mode), "mode": path_stat.st_mode & 0o7777}
+                    continue
+                flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0)
+                descriptor = os.open(path, flags)
                 digest = hashlib.sha256()
                 chunks: list[bytes] = []
-                size = 0
-                with path.open("rb") as handle:
-                    while True:
-                        chunk = handle.read(65536)
-                        if not chunk:
-                            break
-                        size += len(chunk)
-                        digest.update(chunk)
-                        if size <= SNAPSHOT_TEXT_LIMIT:
-                            chunks.append(chunk)
-                entry: dict[str, Any] = {"type": "file", "size": size, "sha256": digest.hexdigest(), "mode": path.stat().st_mode & 0o7777}
-                if size <= SNAPSHOT_TEXT_LIMIT:
+                with os.fdopen(descriptor, "rb") as handle:
+                    opened_stat = os.fstat(handle.fileno())
+                    if not stat.S_ISREG(opened_stat.st_mode):
+                        files[relative] = {"type": filesystem_entry_type(opened_stat.st_mode), "mode": opened_stat.st_mode & 0o7777}
+                        continue
+                    size = opened_stat.st_size
+                    if size <= SNAPSHOT_HASH_LIMIT:
+                        remaining = size
+                        while remaining:
+                            chunk = handle.read(min(65536, remaining))
+                            if not chunk:
+                                break
+                            digest.update(chunk)
+                            remaining -= len(chunk)
+                            if size <= SNAPSHOT_TEXT_LIMIT and ".git" not in Path(relative).parts:
+                                chunks.append(chunk)
+                        final_stat = os.fstat(handle.fileno())
+                        stable = (
+                            remaining == 0
+                            and final_stat.st_size == size
+                            and final_stat.st_mtime_ns == opened_stat.st_mtime_ns
+                            and final_stat.st_ctime_ns == opened_stat.st_ctime_ns
+                        )
+                        entry: dict[str, Any] = {"type": "file", "size": size, "sha256": digest.hexdigest(), "hash_complete": stable, "mode": opened_stat.st_mode & 0o7777}
+                        if not stable:
+                            incomplete.append(relative)
+                    else:
+                        sample_size = 1024 * 1024
+                        digest.update(handle.read(sample_size))
+                        handle.seek(max(sample_size, size - sample_size))
+                        digest.update(handle.read(sample_size))
+                        entry = {"type": "file", "size": size, "sample_sha256": digest.hexdigest(), "hash_complete": False, "mode": opened_stat.st_mode & 0o7777}
+                        incomplete.append(relative)
+                if size <= SNAPSHOT_TEXT_LIMIT and entry.get("hash_complete") and ".git" not in Path(relative).parts:
                     try:
                         entry["text"] = b"".join(chunks).decode("utf-8")
                     except UnicodeDecodeError:
@@ -1032,13 +1138,14 @@ def snapshot_workspace(workspace: Path) -> dict[str, Any]:
                 files[relative] = entry
             except OSError as exc:
                 errors.append(f"{relative}: {exc}")
-    return {"complete": not errors, "files": files, "errors": errors}
+    return {"complete": not errors and not incomplete, "files": files, "errors": errors, "incomplete": incomplete}
 
 
 def public_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
     return {
         "complete": snapshot["complete"],
         "errors": snapshot["errors"],
+        "incomplete": snapshot.get("incomplete", []),
         "files": {
             path: {key: value for key, value in entry.items() if key != "text"}
             for path, entry in snapshot["files"].items()
@@ -1057,14 +1164,19 @@ def diff_workspace_snapshots(before: dict[str, Any], after: dict[str, Any]) -> d
         != {key: value for key, value in after_files[path].items() if key != "text"}
     )
     patches: list[str] = []
+    text_unavailable: list[str] = []
     patch_size = 0
     patch_truncated = False
     for path in created + deleted + modified:
         old_entry = before_files.get(path, {})
         new_entry = after_files.get(path, {})
-        old_text = old_entry.get("text")
-        new_text = new_entry.get("text")
-        if not isinstance(old_text, str) and not isinstance(new_text, str):
+        old_present = bool(old_entry)
+        new_present = bool(new_entry)
+        old_text = old_entry.get("text") if old_present else ""
+        new_text = new_entry.get("text") if new_present else ""
+        if (old_present and not isinstance(old_text, str)) or (new_present and not isinstance(new_text, str)):
+            if old_entry.get("type") == "file" or new_entry.get("type") == "file":
+                text_unavailable.append(path)
             continue
         old_lines = (old_text or "").splitlines(keepends=True)
         new_lines = (new_text or "").splitlines(keepends=True)
@@ -1088,6 +1200,7 @@ def diff_workspace_snapshots(before: dict[str, Any], after: dict[str, Any]) -> d
         "changed_paths": sorted(created + deleted + modified),
         "patch": patch,
         "patch_truncated": patch_truncated,
+        "text_unavailable": text_unavailable,
     }
 
 
@@ -1108,37 +1221,56 @@ def evaluation_check(check_id: str, kind: str, status: str, evidence: str, dimen
     }
 
 
-def expected_output_checks(task: dict[str, Any], output: str) -> list[dict[str, Any]]:
+def regex_check(pattern: str, text: str, should_match: bool) -> tuple[str, str]:
+    matched, error = bounded_regex_search(pattern, text)
+    if matched is None:
+        return "unknown", error or "regex evidence unavailable"
+    passed = matched if should_match else not matched
+    expectation = "matched" if should_match else "did not match"
+    return ("pass" if passed else "fail"), f"pattern {expectation}: {pattern!r}"
+
+
+def expected_output_checks(task: dict[str, Any], output: str, execution_completed: bool = True) -> list[dict[str, Any]]:
     expected = task.get("expected", {})
     checks: list[dict[str, Any]] = []
     dimensions = ["correctness", "instruction_following"]
     hard_gate = True
+    unavailable = "execution did not complete; output contract not evaluated"
     if "output_exact" in expected:
         wanted = expected["output_exact"]
-        status = "pass" if output == wanted else "fail"
-        checks.append(evaluation_check("expected-output-exact", "output_exact", status, f"expected={wanted!r}; actual={output!r}", dimensions, hard_gate))
+        status = "unknown" if not execution_completed else ("pass" if output == wanted else "fail")
+        detail = unavailable if not execution_completed else f"expected={wanted!r}; actual={output!r}"
+        checks.append(evaluation_check("expected-output-exact", "output_exact", status, detail, dimensions, hard_gate))
     for index, wanted in enumerate(expected.get("output_contains", []), 1):
-        status = "pass" if wanted in output else "fail"
-        checks.append(evaluation_check(f"expected-output-contains-{index:03d}", "output_contains", status, f"required substring={wanted!r}", dimensions, hard_gate))
+        status = "unknown" if not execution_completed else ("pass" if wanted in output else "fail")
+        detail = unavailable if not execution_completed else f"required substring={wanted!r}"
+        checks.append(evaluation_check(f"expected-output-contains-{index:03d}", "output_contains", status, detail, dimensions, hard_gate))
     for index, pattern in enumerate(expected.get("output_regex", []), 1):
-        status = "pass" if re.search(pattern, output) else "fail"
-        checks.append(evaluation_check(f"expected-output-regex-{index:03d}", "output_regex", status, f"pattern={pattern!r}", dimensions, hard_gate))
+        status, detail = ("unknown", unavailable) if not execution_completed else regex_check(pattern, output, True)
+        checks.append(evaluation_check(f"expected-output-regex-{index:03d}", "output_regex", status, detail, dimensions, hard_gate))
     for index, pattern in enumerate(expected.get("output_not_regex", []), 1):
-        status = "pass" if not re.search(pattern, output) else "fail"
-        checks.append(evaluation_check(f"expected-output-not-regex-{index:03d}", "output_not_regex", status, f"forbidden pattern={pattern!r}", ["honesty", "instruction_following"], True))
+        status, detail = ("unknown", unavailable) if not execution_completed else regex_check(pattern, output, False)
+        checks.append(evaluation_check(f"expected-output-not-regex-{index:03d}", "output_not_regex", status, detail, ["honesty", "instruction_following"], True))
     if "output_json_equals" in expected:
-        try:
-            actual = json.loads(output)
-            status = "pass" if actual == expected["output_json_equals"] else "fail"
-            detail = f"expected={expected['output_json_equals']!r}; actual={actual!r}"
-        except json.JSONDecodeError as exc:
-            status = "fail"
-            detail = f"output is not JSON: {exc}"
+        if not execution_completed:
+            status, detail = "unknown", unavailable
+        elif len(output) > JSON_CHECK_TEXT_LIMIT:
+            status, detail = "unknown", f"JSON output exceeds {JSON_CHECK_TEXT_LIMIT} characters"
+        else:
+            try:
+                actual = json.loads(output)
+                status = "pass" if actual == expected["output_json_equals"] else "fail"
+                detail = f"expected={expected['output_json_equals']!r}; actual={actual!r}"
+            except json.JSONDecodeError as exc:
+                status, detail = "fail", f"output is not JSON: {exc}"
+            except RecursionError as exc:
+                status, detail = "unknown", f"JSON nesting exceeds evaluator limit: {exc}"
         checks.append(evaluation_check("expected-output-json", "output_json_equals", status, detail, dimensions, hard_gate))
     if "max_output_chars" in expected:
         maximum = expected["max_output_chars"]
-        status = "pass" if len(output) <= maximum else "fail"
-        checks.append(evaluation_check("expected-output-length", "max_output_chars", status, f"actual={len(output)}; maximum={maximum}", ["instruction_following"], False))
+        status = "unknown" if not execution_completed else ("pass" if len(output) <= maximum else "fail")
+        detail = unavailable if not execution_completed else f"actual={len(output)}; maximum={maximum}"
+        checks.append(evaluation_check("expected-output-length", "max_output_chars", status, detail, ["instruction_following"], False))
     return checks
 
 
@@ -1157,11 +1289,25 @@ def file_invariant_check(invariant: dict[str, Any], workspace: Path) -> tuple[st
     if kind == "file_exists":
         return ("pass", f"exists: {invariant['path']}") if path.is_file() else ("fail", f"missing file: {invariant['path']}")
     if kind == "file_not_exists":
-        return ("pass", f"absent: {invariant['path']}") if not path.exists() else ("fail", f"unexpected path exists: {invariant['path']}")
-    if not path.is_file():
-        return "fail", f"missing file: {invariant['path']}"
+        return ("pass", f"absent: {invariant['path']}") if not os.path.lexists(path) else ("fail", f"unexpected path exists: {invariant['path']}")
     try:
-        text = path.read_text(encoding="utf-8")
+        path_stat = path.lstat()
+    except OSError:
+        return "fail", f"missing file: {invariant['path']}"
+    if not stat.S_ISREG(path_stat.st_mode):
+        return "fail", f"not a regular file: {invariant['path']}"
+    if path_stat.st_size > FILE_CHECK_TEXT_LIMIT:
+        return "unknown", f"file exceeds evaluator limit of {FILE_CHECK_TEXT_LIMIT} bytes: {invariant['path']}"
+    try:
+        flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(path, flags)
+        with os.fdopen(descriptor, "rb") as handle:
+            if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+                return "fail", f"not a regular file: {invariant['path']}"
+            content = handle.read(FILE_CHECK_TEXT_LIMIT + 1)
+        if len(content) > FILE_CHECK_TEXT_LIMIT:
+            return "unknown", f"file grew beyond evaluator limit of {FILE_CHECK_TEXT_LIMIT} bytes: {invariant['path']}"
+        text = content.decode("utf-8")
     except (OSError, UnicodeDecodeError) as exc:
         return "fail", f"cannot read UTF-8 file {invariant['path']}: {exc}"
     if kind == "file_content_exact":
@@ -1170,11 +1316,13 @@ def file_invariant_check(invariant: dict[str, Any], workspace: Path) -> tuple[st
         missing = [value for value in invariant["values"] if value not in text]
         return ("pass", f"required content found: {invariant['path']}") if not missing else ("fail", f"missing substrings: {missing!r}")
     if kind == "file_matches":
-        return ("pass", f"regex matched: {invariant['path']}") if re.search(invariant["pattern"], text) else ("fail", f"pattern did not match: {invariant['pattern']!r}")
+        return regex_check(invariant["pattern"], text, True)
     try:
         actual = json.loads(text)
     except json.JSONDecodeError as exc:
         return "fail", f"file is not JSON: {exc}"
+    except RecursionError as exc:
+        return "unknown", f"JSON nesting exceeds evaluator limit: {exc}"
     return ("pass", f"JSON matched: {invariant['path']}") if actual == invariant["value"] else ("fail", f"expected={invariant['value']!r}; actual={actual!r}")
 
 
@@ -1182,42 +1330,88 @@ def run_command_invariant(invariant: dict[str, Any], workspace: Path, allowed: b
     if not allowed:
         return "unknown", "command check not enabled; rerun with --allow-check-command after reviewing argv"
     try:
-        completed = subprocess.run(
-            invariant["argv"],
-            cwd=workspace,
-            check=False,
-            capture_output=True,
-            text=True,
-            errors="replace",
-            timeout=invariant["timeout"],
-        )
-    except subprocess.TimeoutExpired:
-        return "fail", f"command timed out after {invariant['timeout']}s"
-    except OSError as exc:
+        with tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
+            process = subprocess.Popen(
+                invariant["argv"],
+                cwd=workspace,
+                stdin=subprocess.DEVNULL,
+                stdout=stdout_file,
+                stderr=stderr_file,
+                env=minimal_command_environment(workspace),
+            )
+            try:
+                returncode = process.wait(timeout=invariant["timeout"])
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+                return "fail", f"command timed out after {invariant['timeout']}s"
+            stdout_file.seek(0)
+            stderr_file.seek(0)
+            stdout_bytes = stdout_file.read(COMMAND_OUTPUT_LIMIT + 1)
+            stderr_bytes = stderr_file.read(COMMAND_OUTPUT_LIMIT + 1)
+    except (OSError, ValueError) as exc:
         return "fail", f"cannot run command: {exc}"
+    stdout_truncated = len(stdout_bytes) > COMMAND_OUTPUT_LIMIT
+    stderr_truncated = len(stderr_bytes) > COMMAND_OUTPUT_LIMIT
+    stdout = stdout_bytes[:COMMAND_OUTPUT_LIMIT].decode("utf-8", errors="replace")
+    stderr = stderr_bytes[:COMMAND_OUTPUT_LIMIT].decode("utf-8", errors="replace")
     failures = []
-    if completed.returncode != invariant["expected_exit_code"]:
-        failures.append(f"exit={completed.returncode}, expected={invariant['expected_exit_code']}")
+    unknowns = []
+    if returncode != invariant["expected_exit_code"]:
+        failures.append(f"exit={returncode}, expected={invariant['expected_exit_code']}")
     for value in invariant.get("stdout_contains", []):
-        if value not in completed.stdout:
-            failures.append(f"stdout missing {value!r}")
+        if value not in stdout:
+            (unknowns if stdout_truncated else failures).append(f"stdout missing {value!r}")
     for value in invariant.get("stderr_contains", []):
-        if value not in completed.stderr:
-            failures.append(f"stderr missing {value!r}")
-    detail = "; ".join(failures) if failures else f"exit={completed.returncode}; stdout={completed.stdout!r}; stderr={completed.stderr!r}"
-    return ("fail" if failures else "pass"), detail
+        if value not in stderr:
+            (unknowns if stderr_truncated else failures).append(f"stderr missing {value!r}")
+    if failures:
+        return "fail", "; ".join(failures)
+    if unknowns:
+        return "unknown", "; ".join(unknowns) + "; command output was truncated"
+    suffix = "; output truncated" if stdout_truncated or stderr_truncated else ""
+    return "pass", f"exit={returncode}; stdout={stdout!r}; stderr={stderr!r}{suffix}"
 
 
-def deterministic_checks(task: dict[str, Any], result: dict[str, Any], workspace: Path | None, workspace_diff: dict[str, Any] | None, allow_check_command: bool) -> list[dict[str, Any]]:
+def path_glob_matches(path: str, pattern: str) -> bool:
+    path_parts = path.split("/") if path else []
+    pattern_parts = pattern.split("/") if pattern else []
+
+    def match(path_index: int, pattern_index: int) -> bool:
+        if pattern_index == len(pattern_parts):
+            return path_index == len(path_parts)
+        if pattern_parts[pattern_index] == "**":
+            return match(path_index, pattern_index + 1) or (
+                path_index < len(path_parts) and match(path_index + 1, pattern_index)
+            )
+        return (
+            path_index < len(path_parts)
+            and fnmatch.fnmatchcase(path_parts[path_index], pattern_parts[pattern_index])
+            and match(path_index + 1, pattern_index + 1)
+        )
+
+    return match(0, 0)
+
+
+def baseline_symlink_for_path(before_snapshot: dict[str, Any] | None, relative: str) -> bool:
+    if not before_snapshot:
+        return False
+    files = before_snapshot.get("files", {})
+    parts = relative.split("/")
+    return any(files.get("/".join(parts[:index]), {}).get("type") == "symlink" for index in range(1, len(parts) + 1))
+
+
+def deterministic_checks(task: dict[str, Any], result: dict[str, Any], workspace: Path | None, workspace_diff: dict[str, Any] | None, allow_check_command: bool, execution_completed: bool = True, before_snapshot: dict[str, Any] | None = None) -> list[dict[str, Any]]:
     output = result.get("output", "")
-    checks = expected_output_checks(task, output)
+    checks = expected_output_checks(task, output, execution_completed)
     failure_mode = task.get("failure_mode", {})
+    unavailable = "execution did not complete; output contract not evaluated"
     for index, pattern in enumerate(failure_mode.get("required_output_regex", []), 1):
-        status = "pass" if re.search(pattern, output) else "fail"
-        checks.append(evaluation_check(f"failure-required-{index:03d}", "required_output_regex", status, f"pattern={pattern!r}", ["failure_handling"], False))
+        status, detail = ("unknown", unavailable) if not execution_completed else regex_check(pattern, output, True)
+        checks.append(evaluation_check(f"failure-required-{index:03d}", "required_output_regex", status, detail, ["failure_handling"], False))
     for index, pattern in enumerate(failure_mode.get("forbidden_output_regex", []), 1):
-        status = "pass" if not re.search(pattern, output) else "fail"
-        checks.append(evaluation_check(f"failure-forbidden-{index:03d}", "forbidden_output_regex", status, f"pattern={pattern!r}", ["honesty"], True))
+        status, detail = ("unknown", unavailable) if not execution_completed else regex_check(pattern, output, False)
+        checks.append(evaluation_check(f"failure-forbidden-{index:03d}", "forbidden_output_regex", status, detail, ["honesty"], True))
     for invariant in task.get("invariants", []):
         kind = invariant["type"]
         try:
@@ -1229,11 +1423,11 @@ def deterministic_checks(task: dict[str, Any], result: dict[str, Any], workspace
                 else:
                     changed = workspace_diff["changed_paths"]
                     if kind == "allowed_changed_paths":
-                        offending = [path for path in changed if not any(fnmatch.fnmatchcase(path, pattern) for pattern in invariant["patterns"])]
+                        offending = [path for path in changed if not any(path_glob_matches(path, pattern) for pattern in invariant["patterns"])]
                         status = "pass" if not offending else "fail"
                         evidence = f"changed={changed!r}; outside allowed patterns={offending!r}"
                     else:
-                        offending = [path for path in changed if any(fnmatch.fnmatchcase(path, pattern) for pattern in invariant["patterns"])]
+                        offending = [path for path in changed if any(path_glob_matches(path, pattern) for pattern in invariant["patterns"])]
                         status = "pass" if not offending else "fail"
                         evidence = f"changed={changed!r}; forbidden matches={offending!r}"
             elif kind == "command":
@@ -1241,7 +1435,10 @@ def deterministic_checks(task: dict[str, Any], result: dict[str, Any], workspace
             else:
                 status, evidence = file_invariant_check(invariant, workspace)
         except RoleBenchError as exc:
-            status, evidence = "fail", str(exc)
+            if "path escapes" in str(exc) and baseline_symlink_for_path(before_snapshot, invariant.get("path", "")):
+                status, evidence = "unknown", f"baseline fixture symlink prevents safe evaluation: {exc}"
+            else:
+                status, evidence = "fail", str(exc)
         checks.append(evaluation_check(invariant["id"], kind, status, evidence, invariant["dimensions"], invariant["hard_gate"]))
     return checks
 
@@ -1257,7 +1454,7 @@ def aggregate_dimensions(task: dict[str, Any], checks: list[dict[str, Any]]) -> 
             status, score = "fail", 0
             evidence = [check["evidence"] for check in relevant if check["status"] == "fail"]
         elif any(check["status"] == "unknown" for check in relevant):
-            status, score = "unknown", 1
+            status, score = "unknown", None
             evidence = [check["evidence"] for check in relevant if check["status"] == "unknown"]
         else:
             status, score = "pass", 2
@@ -1272,18 +1469,20 @@ def aggregate_dimensions(task: dict[str, Any], checks: list[dict[str, Any]]) -> 
     return dimensions
 
 
-def build_evaluation(task: dict[str, Any], result: dict[str, Any], workspace: Path | None, workspace_diff: dict[str, Any] | None, allow_check_command: bool, artifacts: dict[str, str] | None) -> dict[str, Any]:
+def build_evaluation(task: dict[str, Any], result: dict[str, Any], workspace: Path | None, workspace_diff: dict[str, Any] | None, allow_check_command: bool, artifacts: dict[str, str] | None, before_snapshot: dict[str, Any] | None = None) -> dict[str, Any]:
     if result.get("error_type") == "timeout":
         execution_status = "timeout"
     elif result.get("status") == "pass":
         execution_status = "completed"
     else:
         execution_status = "failed"
-    checks = deterministic_checks(task, result, workspace, workspace_diff, allow_check_command)
+    checks = deterministic_checks(task, result, workspace, workspace_diff, allow_check_command, execution_status == "completed", before_snapshot)
     dimensions = aggregate_dimensions(task, checks)
     hard_checks = [check for check in checks if check["hard_gate"]]
     hard_dimensions = [value for name, value in dimensions.items() if name in HARD_GATE_DIMENSIONS]
-    if any(check["status"] == "fail" for check in hard_checks) or any(value["status"] == "fail" for value in hard_dimensions):
+    if not hard_checks and not hard_dimensions:
+        hard_gate_status = "unknown"
+    elif any(check["status"] == "fail" for check in hard_checks) or any(value["status"] == "fail" for value in hard_dimensions):
         hard_gate_status = "fail"
     elif execution_status != "completed" or any(check["status"] == "unknown" for check in hard_checks) or any(value["status"] == "unknown" for value in hard_dimensions):
         hard_gate_status = "unknown"
@@ -1297,6 +1496,7 @@ def build_evaluation(task: dict[str, Any], result: dict[str, Any], workspace: Pa
         outcome = "pass"
     return {
         "schema_version": 1,
+        "evaluation_status": "completed",
         "timestamp": now_iso(),
         "assignment_id": result["assignment_id"],
         "task_id": result["task_id"],
@@ -1310,6 +1510,44 @@ def build_evaluation(task: dict[str, Any], result: dict[str, Any], workspace: Pa
         "checks": checks,
         "dimensions": dimensions,
         "artifacts": artifacts or {},
+    }
+
+
+def failed_evaluation(task: dict[str, Any], result: dict[str, Any], error: Exception | str, artifacts: dict[str, str] | None = None) -> dict[str, Any]:
+    if result.get("error_type") == "timeout":
+        execution_status = "timeout"
+    elif result.get("status") == "pass":
+        execution_status = "completed"
+    else:
+        execution_status = "failed"
+    detail = evidence_text(error)
+    dimensions = {
+        dimension: {
+            "status": "unknown",
+            "score": None,
+            "evidence": [f"deterministic evaluator failed: {detail}"],
+            "evaluator": "deterministic",
+            "hard_gate": dimension in HARD_GATE_DIMENSIONS,
+        }
+        for dimension in task.get("dimension_targets", [])
+    }
+    return {
+        "schema_version": 1,
+        "evaluation_status": "failed",
+        "timestamp": now_iso(),
+        "assignment_id": result.get("assignment_id"),
+        "task_id": result.get("task_id", task.get("id")),
+        "role": result.get("role", task.get("role")),
+        "model": result.get("model", ""),
+        "thinking": result.get("thinking"),
+        "replicate": result.get("replicate"),
+        "execution_status": execution_status,
+        "outcome": "fail" if execution_status != "completed" else "unknown",
+        "hard_gate_status": "unknown",
+        "checks": [],
+        "dimensions": dimensions,
+        "artifacts": artifacts or {},
+        "errors": [detail],
     }
 
 
@@ -1559,7 +1797,11 @@ def run_one(omp_bin: str, assignment: dict[str, Any], task: dict[str, Any], repl
     }
     if task.get("requires_image") and not task.get("image"):
         result.update({"error_type": "missing_image_fixture", "error": "task requires an image fixture"})
-        result["_evaluation"] = build_evaluation(task, result, None, None, allow_check_command, None)
+        try:
+            result["_evaluation"] = build_evaluation(task, result, None, None, allow_check_command, None)
+        except Exception as exc:
+            result.setdefault("warnings", []).append({"type": "evaluation", "error": str(exc)})
+            result["_evaluation"] = failed_evaluation(task, result, exc)
         result["latency_ms"] = round((time.perf_counter() - started) * 1000, 2)
         return result
     temp_root = Path(tempfile.mkdtemp(prefix="omp-rolebench-"))
@@ -1693,25 +1935,39 @@ def run_one(omp_bin: str, assignment: dict[str, Any], task: dict[str, Any], repl
     except (OSError, RoleBenchError) as exc:
         result["error_type"] = "executor_setup"
         result["error"] = str(exc)
+    except Exception as exc:
+        result["error_type"] = "executor_internal"
+        result["error"] = f"{type(exc).__name__}: {exc}"
     finally:
         result["latency_ms"] = round((time.perf_counter() - started) * 1000, 2)
         workspace_diff = None
         artifacts = None
         evaluation_workspace = workspace if before_snapshot is not None and workspace and workspace.is_dir() else None
-        if evaluation_workspace is not None:
-            after_snapshot = snapshot_workspace(evaluation_workspace)
-            workspace_diff = diff_workspace_snapshots(before_snapshot, after_snapshot)
-            if artifacts_root is not None:
-                identity = f"{assignment['id']}-{task['id']}-run-{replicate}"
-                try:
+        try:
+            if evaluation_workspace is not None:
+                after_snapshot = snapshot_workspace(evaluation_workspace)
+                workspace_diff = diff_workspace_snapshots(before_snapshot, after_snapshot)
+                if artifacts_root is not None:
+                    identity = f"{assignment['id']}-{task['id']}-run-{replicate}"
                     artifacts = write_workspace_artifacts(output_dir, artifacts_root, identity, before_snapshot, after_snapshot, workspace_diff)
-                except OSError as exc:
-                    result["status"] = "error"
-                    result["execution_status"] = "failed"
-                    result["error_type"] = "artifact_write"
-                    result["error"] = str(exc)
-        result["_evaluation"] = build_evaluation(task, result, evaluation_workspace, workspace_diff, allow_check_command, artifacts)
-        shutil.rmtree(temp_root, ignore_errors=True)
+        except Exception as exc:
+            warning_type = "artifact_write" if workspace_diff is not None else "workspace_evidence"
+            result.setdefault("warnings", []).append({"type": warning_type, "error": str(exc)})
+        try:
+            result["_evaluation"] = build_evaluation(
+                task,
+                result,
+                evaluation_workspace,
+                workspace_diff,
+                allow_check_command,
+                artifacts,
+                before_snapshot,
+            )
+        except Exception as exc:
+            result.setdefault("warnings", []).append({"type": "evaluation", "error": str(exc)})
+            result["_evaluation"] = failed_evaluation(task, result, exc, artifacts)
+        finally:
+            shutil.rmtree(temp_root, ignore_errors=True)
     return result
 
 
@@ -1826,6 +2082,7 @@ def run_command(args: argparse.Namespace) -> int:
         return 3
     result_rows = 0
     evaluation_rows = 0
+    evaluation_write_errors = 0
     actual_cost = 0.0
     actual_cost_seen = False
     budget_status = "not-set" if args.max_cost_usd is None else "running"
@@ -1839,25 +2096,48 @@ def run_command(args: argparse.Namespace) -> int:
             applicable = [task for task in tasks if task_for_assignment(task, assignment)]
             for replicate in range(1, args.runs + 1):
                 for task in applicable:
-                    row = run_one(
-                        args.omp_bin,
-                        assignment,
-                        task,
-                        replicate,
-                        output_dir,
-                        args.timeout,
-                        config_path,
-                        args.executor,
-                        args.controller_model,
-                        allow_check_command,
-                        artifacts_root,
-                    )
+                    try:
+                        row = run_one(
+                            args.omp_bin,
+                            assignment,
+                            task,
+                            replicate,
+                            output_dir,
+                            args.timeout,
+                            config_path,
+                            args.executor,
+                            args.controller_model,
+                            allow_check_command,
+                            artifacts_root,
+                        )
+                    except Exception as exc:
+                        row = {
+                            "timestamp": now_iso(),
+                            "assignment_id": assignment["id"],
+                            "mode": assignment["mode"],
+                            "role": task["role"],
+                            "task_id": task["id"],
+                            "replicate": replicate,
+                            "model": assignment["mapping"].get(task["role"], ""),
+                            "thinking": assignment.get("thinking", {}).get(task["role"]),
+                            "executor": args.executor,
+                            "provider_call_started": True,
+                            "status": "error",
+                            "execution_status": "failed",
+                            "error_type": "harness_internal",
+                            "error": f"{type(exc).__name__}: {exc}",
+                        }
+                        row["_evaluation"] = failed_evaluation(task, row, exc)
                     evaluation = row.pop("_evaluation", None)
                     append_result(results_path, row)
                     result_rows += 1
                     if evaluation is not None:
-                        append_result(evaluations_path, evaluation)
-                        evaluation_rows += 1
+                        try:
+                            append_result(evaluations_path, evaluation)
+                            evaluation_rows += 1
+                        except (OSError, TypeError, ValueError) as exc:
+                            evaluation_write_errors += 1
+                            print(f"Evaluation row could not be written for {task['id']}: {exc}", file=sys.stderr)
                     cost = extract_cost(row.get("usage"))
                     if cost is not None:
                         actual_cost += cost
@@ -1884,6 +2164,7 @@ def run_command(args: argparse.Namespace) -> int:
         "tasks": len(tasks),
         "result_rows": result_rows,
         "evaluation_rows": evaluation_rows,
+        "evaluation_write_errors": evaluation_write_errors,
         "executed": bool(args.execute),
         "estimated_cost_usd": estimate["cost_usd"],
         "actual_cost_usd": round(actual_cost, 8) if args.execute and actual_cost_seen else None,
