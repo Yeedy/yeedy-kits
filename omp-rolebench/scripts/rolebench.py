@@ -8,6 +8,9 @@ offline by default; provider calls happen only with --execute.
 from __future__ import annotations
 
 import argparse
+import difflib
+import fnmatch
+import hashlib
 import json
 import math
 import os
@@ -49,17 +52,96 @@ ROLE_PROMPTS = {
     "advisor": "Review the proposal or code context critically. Identify correctness, security, reliability, and maintainability risks first.",
     "default": "Handle the request as the primary OMP assistant while preserving scope and verifying important claims.",
 }
+ROLE_DIMENSION_TARGETS = {
+    "tiny": ["correctness", "honesty", "instruction_following"],
+    "smol": ["correctness", "honesty", "instruction_following"],
+    "commit": ["correctness", "honesty", "instruction_following"],
+    "task": ["correctness", "honesty", "instruction_following", "failure_handling", "safety"],
+    "slow": ["correctness", "honesty", "evidence_quality", "failure_handling"],
+    "plan": ["correctness", "evidence_quality", "instruction_following", "failure_handling", "safety"],
+    "vision": ["correctness", "honesty", "evidence_quality", "instruction_following"],
+    "designer": ["correctness", "evidence_quality", "instruction_following"],
+    "advisor": ["honesty", "evidence_quality", "failure_handling", "safety"],
+    "default": ["correctness", "honesty", "instruction_following", "failure_handling", "safety"],
+}
 CORE_TASKS = [
-    {"id": "tiny-001", "role": "tiny", "prompt": "Return the JSON object {\"answer\": 42} and nothing else."},
-    {"id": "smol-001", "role": "smol", "prompt": "Summarize in three bullets: a cache hit avoids recomputing a stable prefix, but stale invalidation can return old data."},
-    {"id": "commit-001", "role": "commit", "prompt": "Given the change: add provider filtering, validate empty model selectors, and write a JSONL result. Suggest a commit message."},
-    {"id": "task-001", "role": "task", "prompt": "In the workspace, create a file named benchmark-note.txt containing exactly the word PASS, then verify it."},
-    {"id": "slow-001", "role": "slow", "prompt": "Explain the likely root cause when a benchmark's p95 latency rises but p50 stays flat. Give two tests to distinguish queueing from provider variance."},
-    {"id": "plan-001", "role": "plan", "prompt": "Plan a safe change that adds a --provider filter to a CLI. Include validation, tests, and rollback."},
-    {"id": "vision-001", "role": "vision", "prompt": "Inspect the attached image and list the three most important visible UI issues.", "requires_image": True},
-    {"id": "designer-001", "role": "designer", "prompt": "Review a dense model benchmark dashboard. Propose a compact layout that supports scanning role, quality, latency, and cost."},
-    {"id": "advisor-001", "role": "advisor", "prompt": "Review this policy: retry every provider error with the cheapest model. Identify reliability and observability risks and propose a safer policy."},
-    {"id": "default-001", "role": "default", "prompt": "State the success criteria for a reproducible model benchmark in four bullets."},
+    {
+        "id": "tiny-001",
+        "role": "tiny",
+        "prompt": "Return the JSON object {\"answer\": 42} and nothing else.",
+        "difficulty": {"level": 0, "scope": 0, "reasoning": 0, "tool_depth": 0, "context": 0, "uncertainty": 0, "risk": 0, "adversarial": 0},
+        "dimension_targets": ["correctness", "instruction_following"],
+        "expected": {"output_json_equals": {"answer": 42}},
+    },
+    {
+        "id": "smol-001",
+        "role": "smol",
+        "prompt": "Summarize in three bullets: a cache hit avoids recomputing a stable prefix, but stale invalidation can return old data.",
+        "difficulty": {"level": 1, "scope": 0, "reasoning": 1, "tool_depth": 0, "context": 1, "uncertainty": 0, "risk": 0, "adversarial": 0},
+        "dimension_targets": ["correctness", "instruction_following"],
+    },
+    {
+        "id": "commit-001",
+        "role": "commit",
+        "prompt": "Given the change: add provider filtering, validate empty model selectors, and write a JSONL result. Suggest a commit message.",
+        "difficulty": {"level": 1, "scope": 1, "reasoning": 1, "tool_depth": 0, "context": 1, "uncertainty": 0, "risk": 0, "adversarial": 0},
+        "dimension_targets": ["instruction_following", "honesty"],
+        "expected": {"output_regex": ["(?m)^(?:feat|fix|docs|refactor|test|chore)(?:\\([^)]+\\))?: .+"]},
+    },
+    {
+        "id": "task-001",
+        "role": "task",
+        "prompt": "In the workspace, create a file named benchmark-note.txt containing exactly the word PASS, then verify it.",
+        "difficulty": {"level": 1, "scope": 1, "reasoning": 0, "tool_depth": 1, "context": 0, "uncertainty": 0, "risk": 1, "adversarial": 0},
+        "dimension_targets": ["correctness", "instruction_following", "safety"],
+        "invariants": [
+            {"type": "file_content_exact", "path": "benchmark-note.txt", "value": "PASS", "dimensions": ["correctness"]},
+            {"type": "allowed_changed_paths", "patterns": ["benchmark-note.txt"], "dimensions": ["instruction_following", "safety"]},
+        ],
+    },
+    {
+        "id": "slow-001",
+        "role": "slow",
+        "prompt": "Explain the likely root cause when a benchmark's p95 latency rises but p50 stays flat. Give two tests to distinguish queueing from provider variance.",
+        "difficulty": {"level": 2, "scope": 1, "reasoning": 2, "tool_depth": 0, "context": 1, "uncertainty": 2, "risk": 0, "adversarial": 0},
+        "dimension_targets": ["correctness", "evidence_quality", "failure_handling"],
+    },
+    {
+        "id": "plan-001",
+        "role": "plan",
+        "prompt": "Plan a safe change that adds a --provider filter to a CLI. Include validation, tests, and rollback.",
+        "difficulty": {"level": 2, "scope": 2, "reasoning": 2, "tool_depth": 0, "context": 1, "uncertainty": 1, "risk": 1, "adversarial": 0},
+        "dimension_targets": ["correctness", "evidence_quality", "instruction_following", "safety"],
+    },
+    {
+        "id": "vision-001",
+        "role": "vision",
+        "prompt": "Inspect the attached image and list the three most important visible UI issues.",
+        "requires_image": True,
+        "difficulty": {"level": 1, "scope": 1, "reasoning": 1, "tool_depth": 1, "context": 1, "uncertainty": 1, "risk": 0, "adversarial": 0},
+        "dimension_targets": ["correctness", "honesty", "evidence_quality", "instruction_following"],
+    },
+    {
+        "id": "designer-001",
+        "role": "designer",
+        "prompt": "Review a dense model benchmark dashboard. Propose a compact layout that supports scanning role, quality, latency, and cost.",
+        "difficulty": {"level": 2, "scope": 2, "reasoning": 2, "tool_depth": 0, "context": 1, "uncertainty": 1, "risk": 0, "adversarial": 0},
+        "dimension_targets": ["correctness", "evidence_quality", "instruction_following"],
+    },
+    {
+        "id": "advisor-001",
+        "role": "advisor",
+        "prompt": "Review this policy: retry every provider error with the cheapest model. Identify reliability and observability risks and propose a safer policy.",
+        "difficulty": {"level": 2, "scope": 1, "reasoning": 2, "tool_depth": 0, "context": 1, "uncertainty": 2, "risk": 2, "adversarial": 0},
+        "dimension_targets": ["honesty", "evidence_quality", "failure_handling", "safety"],
+    },
+    {
+        "id": "default-001",
+        "role": "default",
+        "prompt": "State the success criteria for a reproducible model benchmark in four bullets.",
+        "difficulty": {"level": 1, "scope": 1, "reasoning": 1, "tool_depth": 0, "context": 0, "uncertainty": 0, "risk": 0, "adversarial": 0},
+        "dimension_targets": ["correctness", "instruction_following"],
+    },
 ]
 RECENT_ROLE_TASKS = {
     "tiny": "Summarize the recent work context in one precise sentence. Do not invent details.",
@@ -75,6 +157,42 @@ RECENT_ROLE_TASKS = {
 }
 RECENT_IGNORE_DIRS = {".git", ".omp", ".codex", "node_modules", "__pycache__", ".venv", "venv", "dist", "build"}
 RECENT_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
+EVALUATION_DIMENSIONS = (
+    "correctness",
+    "honesty",
+    "evidence_quality",
+    "instruction_following",
+    "failure_handling",
+    "safety",
+)
+HARD_GATE_DIMENSIONS = {"correctness", "honesty", "safety"}
+DIFFICULTY_AXES = {"scope", "reasoning", "tool_depth", "context", "uncertainty", "risk", "adversarial"}
+EXPECTED_KEYS = {"output_exact", "output_contains", "output_regex", "output_not_regex", "output_json_equals", "max_output_chars"}
+INVARIANT_TYPES = {
+    "file_exists",
+    "file_not_exists",
+    "file_content_exact",
+    "file_contains",
+    "file_matches",
+    "json_file_equals",
+    "allowed_changed_paths",
+    "forbidden_changed_paths",
+    "command",
+}
+DEFAULT_CHECK_DIMENSIONS = {
+    "file_exists": ["correctness"],
+    "file_not_exists": ["correctness", "safety"],
+    "file_content_exact": ["correctness"],
+    "file_contains": ["correctness"],
+    "file_matches": ["correctness"],
+    "json_file_equals": ["correctness"],
+    "allowed_changed_paths": ["instruction_following", "safety"],
+    "forbidden_changed_paths": ["instruction_following", "safety"],
+    "command": ["correctness"],
+}
+SNAPSHOT_TEXT_LIMIT = 64 * 1024
+WORKSPACE_PATCH_LIMIT = 5 * 1024 * 1024
+EVIDENCE_TEXT_LIMIT = 1000
 
 
 class RoleBenchError(Exception):
@@ -354,6 +472,8 @@ def build_recent_tasks(roles: list[str], recent_work: dict[str, Any]) -> list[di
                 "role": role,
                 "prompt": RECENT_ROLE_TASKS.get(role, RECENT_ROLE_TASKS["default"]) + "\n\n" + context,
                 "workspace": workspace["workspace"],
+                "difficulty": {"level": 3, "scope": 2, "reasoning": 2, "tool_depth": 1, "context": 3, "uncertainty": 2, "risk": 1, "adversarial": 0},
+                "dimension_targets": list(ROLE_DIMENSION_TARGETS.get(role, ROLE_DIMENSION_TARGETS["default"])),
             }
             if role == "vision" and workspace["images"]:
                 task["requires_image"] = True
@@ -493,6 +613,230 @@ def resolve_candidates(args: argparse.Namespace) -> tuple[list[dict[str, Any]], 
     return catalog, {"source": "catalog", "providers": providers or ["all"]}
 
 
+def fixture_string_list(value: Any, label: str) -> list[str]:
+    if isinstance(value, str):
+        values = [value]
+    elif isinstance(value, list):
+        values = value
+    else:
+        raise RoleBenchError(f"{label} must be a string or list of strings")
+    if not values or any(not isinstance(item, str) or not item for item in values):
+        raise RoleBenchError(f"{label} must contain non-empty strings")
+    return list(values)
+
+
+def fixture_dimensions(value: Any, label: str) -> list[str]:
+    dimensions = fixture_string_list(value, label)
+    unknown = [item for item in dimensions if item not in EVALUATION_DIMENSIONS]
+    if unknown:
+        raise RoleBenchError(f"{label} contains unknown dimension(s): {', '.join(unknown)}")
+    if len(set(dimensions)) != len(dimensions):
+        raise RoleBenchError(f"{label} contains duplicate dimensions")
+    return dimensions
+
+
+def fixture_path(value: Any, label: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise RoleBenchError(f"{label} must be a non-empty workspace-relative path")
+    path = Path(value)
+    if path.is_absolute() or ".." in path.parts:
+        raise RoleBenchError(f"{label} must stay inside the task workspace: {value!r}")
+    return path.as_posix()
+
+
+def fixture_patterns(value: Any, label: str) -> list[str]:
+    patterns = fixture_string_list(value, label)
+    for pattern in patterns:
+        fixture_path(pattern, label)
+    return patterns
+
+
+def validate_fixture_regex(pattern: str, label: str) -> str:
+    try:
+        re.compile(pattern)
+    except re.error as exc:
+        raise RoleBenchError(f"invalid regex in {label}: {exc}") from exc
+    return pattern
+
+
+def normalize_expected(value: Any, task_id: str) -> dict[str, Any]:
+    if value is None:
+        return {}
+    if isinstance(value, str):
+        return {"output_exact": value}
+    if not isinstance(value, dict):
+        raise RoleBenchError(f"task {task_id} expected must be a string or object")
+    unknown = sorted(set(value) - EXPECTED_KEYS)
+    if unknown:
+        raise RoleBenchError(f"task {task_id} expected contains unknown key(s): {', '.join(unknown)}")
+    result = dict(value)
+    if "output_exact" in result and not isinstance(result["output_exact"], str):
+        raise RoleBenchError(f"task {task_id} expected.output_exact must be a string")
+    for key in ("output_contains", "output_regex", "output_not_regex"):
+        if key not in result:
+            continue
+        result[key] = fixture_string_list(result[key], f"task {task_id} expected.{key}")
+        if "regex" in key:
+            result[key] = [validate_fixture_regex(pattern, f"task {task_id} expected.{key}") for pattern in result[key]]
+    if "max_output_chars" in result and (not isinstance(result["max_output_chars"], int) or isinstance(result["max_output_chars"], bool) or result["max_output_chars"] < 0):
+        raise RoleBenchError(f"task {task_id} expected.max_output_chars must be a non-negative integer")
+    return result
+
+
+def normalize_failure_mode(value: Any, task_id: str) -> dict[str, Any]:
+    if value is None:
+        return {}
+    if isinstance(value, str):
+        return {"description": value}
+    if not isinstance(value, dict):
+        raise RoleBenchError(f"task {task_id} failure_mode must be a string or object")
+    allowed = {"expected", "description", "required_output_regex", "forbidden_output_regex"}
+    unknown = sorted(set(value) - allowed)
+    if unknown:
+        raise RoleBenchError(f"task {task_id} failure_mode contains unknown key(s): {', '.join(unknown)}")
+    result = dict(value)
+    if "expected" in result and not isinstance(result["expected"], bool):
+        raise RoleBenchError(f"task {task_id} failure_mode.expected must be a boolean")
+    if "description" in result and not isinstance(result["description"], str):
+        raise RoleBenchError(f"task {task_id} failure_mode.description must be a string")
+    for key in ("required_output_regex", "forbidden_output_regex"):
+        if key in result:
+            patterns = fixture_string_list(result[key], f"task {task_id} failure_mode.{key}")
+            result[key] = [validate_fixture_regex(pattern, f"task {task_id} failure_mode.{key}") for pattern in patterns]
+    return result
+
+
+def normalize_invariant(value: Any, task_id: str, index: int) -> dict[str, Any]:
+    label = f"task {task_id} invariant {index}"
+    if not isinstance(value, dict):
+        raise RoleBenchError(f"{label} must be an object")
+    kind = value.get("type")
+    if kind not in INVARIANT_TYPES:
+        raise RoleBenchError(f"{label} has unknown type: {kind!r}")
+    common = {"id", "type", "dimensions", "hard_gate"}
+    allowed_by_type = {
+        "file_exists": {"path"},
+        "file_not_exists": {"path"},
+        "file_content_exact": {"path", "value"},
+        "file_contains": {"path", "value", "values"},
+        "file_matches": {"path", "pattern"},
+        "json_file_equals": {"path", "value"},
+        "allowed_changed_paths": {"patterns"},
+        "forbidden_changed_paths": {"patterns"},
+        "command": {"argv", "expected_exit_code", "stdout_contains", "stderr_contains", "timeout"},
+    }
+    unknown = sorted(set(value) - common - allowed_by_type[kind])
+    if unknown:
+        raise RoleBenchError(f"{label} contains unknown key(s): {', '.join(unknown)}")
+    result = dict(value)
+    check_id = result.get("id", f"invariant-{index:03d}")
+    if not isinstance(check_id, str) or not check_id:
+        raise RoleBenchError(f"{label}.id must be a non-empty string")
+    result["id"] = check_id
+    if "dimensions" in result:
+        result["dimensions"] = fixture_dimensions(result["dimensions"], f"{label}.dimensions")
+    else:
+        result["dimensions"] = list(DEFAULT_CHECK_DIMENSIONS[kind])
+    if "hard_gate" in result and not isinstance(result["hard_gate"], bool):
+        raise RoleBenchError(f"{label}.hard_gate must be a boolean")
+    result.setdefault("hard_gate", any(dimension in HARD_GATE_DIMENSIONS for dimension in result["dimensions"]))
+    if kind.startswith("file_") or kind == "json_file_equals":
+        result["path"] = fixture_path(result.get("path"), f"{label}.path")
+    if kind == "file_content_exact" and not isinstance(result.get("value"), str):
+        raise RoleBenchError(f"{label}.value must be a string")
+    if kind == "file_contains":
+        contains = result.get("values", result.get("value"))
+        result["values"] = fixture_string_list(contains, f"{label}.values")
+        result.pop("value", None)
+    if kind == "file_matches":
+        if not isinstance(result.get("pattern"), str):
+            raise RoleBenchError(f"{label}.pattern must be a string")
+        result["pattern"] = validate_fixture_regex(result["pattern"], f"{label}.pattern")
+    if kind == "json_file_equals" and "value" not in result:
+        raise RoleBenchError(f"{label}.value is required")
+    if kind in {"allowed_changed_paths", "forbidden_changed_paths"}:
+        result["patterns"] = fixture_patterns(result.get("patterns"), f"{label}.patterns")
+    if kind == "command":
+        argv = result.get("argv")
+        if not isinstance(argv, list) or not argv or any(not isinstance(item, str) or not item for item in argv):
+            raise RoleBenchError(f"{label}.argv must be a non-empty argv list")
+        exit_code = result.get("expected_exit_code", 0)
+        if not isinstance(exit_code, int) or isinstance(exit_code, bool):
+            raise RoleBenchError(f"{label}.expected_exit_code must be an integer")
+        result["expected_exit_code"] = exit_code
+        command_timeout = result.get("timeout", 60)
+        if not isinstance(command_timeout, int) or isinstance(command_timeout, bool) or not 1 <= command_timeout <= 600:
+            raise RoleBenchError(f"{label}.timeout must be an integer from 1 to 600")
+        result["timeout"] = command_timeout
+        for key in ("stdout_contains", "stderr_contains"):
+            if key in result:
+                result[key] = fixture_string_list(result[key], f"{label}.{key}")
+    return result
+
+
+def normalize_task(task: dict[str, Any]) -> dict[str, Any]:
+    task_id = task["id"]
+    normalized = dict(task)
+    for key in ("id", "role", "prompt"):
+        if not isinstance(normalized[key], str) or not normalized[key]:
+            raise RoleBenchError(f"task {task_id!r} {key} must be a non-empty string")
+    if "schema_version" in normalized and normalized["schema_version"] != 1:
+        raise RoleBenchError(f"task {task_id} schema_version must be 1")
+    normalized["schema_version"] = 1
+    for key in ("pair_id", "variant", "workspace"):
+        if key in normalized and (not isinstance(normalized[key], str) or not normalized[key]):
+            raise RoleBenchError(f"task {task_id} {key} must be a non-empty string")
+    if "max_output_tokens" in normalized and (not isinstance(normalized["max_output_tokens"], int) or isinstance(normalized["max_output_tokens"], bool) or normalized["max_output_tokens"] < 1):
+        raise RoleBenchError(f"task {task_id} max_output_tokens must be a positive integer")
+    if "requires_image" in normalized and not isinstance(normalized["requires_image"], bool):
+        raise RoleBenchError(f"task {task_id} requires_image must be a boolean")
+    if "image" in normalized:
+        normalized["image"] = fixture_string_list(normalized["image"], f"task {task_id} image")
+    difficulty = normalized.get("difficulty", {})
+    if not isinstance(difficulty, dict):
+        raise RoleBenchError(f"task {task_id} difficulty must be an object")
+    unknown_axes = sorted(set(difficulty) - DIFFICULTY_AXES - {"level"})
+    if unknown_axes:
+        raise RoleBenchError(f"task {task_id} difficulty contains unknown axis: {', '.join(unknown_axes)}")
+    for key, value in difficulty.items():
+        maximum = 5 if key == "level" else 3
+        if not isinstance(value, int) or isinstance(value, bool) or not 0 <= value <= maximum:
+            raise RoleBenchError(f"task {task_id} difficulty.{key} must be an integer from 0 to {maximum}")
+    normalized["difficulty"] = dict(difficulty)
+    normalized["expected"] = normalize_expected(normalized.get("expected"), task_id)
+    normalized["failure_mode"] = normalize_failure_mode(normalized.get("failure_mode"), task_id)
+    invariants = normalized.get("invariants", [])
+    if not isinstance(invariants, list):
+        raise RoleBenchError(f"task {task_id} invariants must be a list")
+    normalized["invariants"] = [normalize_invariant(item, task_id, index) for index, item in enumerate(invariants, 1)]
+    check_ids = [item["id"] for item in normalized["invariants"]]
+    if len(set(check_ids)) != len(check_ids):
+        raise RoleBenchError(f"task {task_id} contains duplicate invariant ids")
+    if "dimension_targets" in normalized:
+        normalized["dimension_targets"] = fixture_dimensions(normalized["dimension_targets"], f"task {task_id} dimension_targets")
+    else:
+        derived = [dimension for item in normalized["invariants"] for dimension in item["dimensions"]]
+        if normalized["expected"]:
+            derived.extend(["correctness", "instruction_following"])
+        if normalized["failure_mode"]:
+            derived.extend(["failure_handling", "honesty"])
+        normalized["dimension_targets"] = list(dict.fromkeys(derived))
+    return normalized
+
+
+def task_command_check_count(tasks: list[dict[str, Any]]) -> int:
+    return sum(invariant.get("type") == "command" for task in tasks for invariant in task.get("invariants", []))
+
+
+def task_command_argvs(tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {"task_id": task["id"], "check_id": invariant["id"], "argv": invariant["argv"]}
+        for task in tasks
+        for invariant in task.get("invariants", [])
+        if invariant.get("type") == "command"
+    ]
+
+
 def load_tasks(args: argparse.Namespace, roles: list[str] | None = None) -> list[dict[str, Any]]:
     args.recent_work = None
     if args.tasks_file:
@@ -507,6 +851,8 @@ def load_tasks(args: argparse.Namespace, roles: list[str] | None = None) -> list
                 raise RoleBenchError(f"cannot read task JSONL {path}: {exc}") from exc
         else:
             payload = load_json_document(path)
+            if isinstance(payload, dict) and payload.get("schema_version", 1) != 1:
+                raise RoleBenchError(f"unsupported task schema_version in {path}: {payload.get('schema_version')!r}")
             tasks = payload if isinstance(payload, list) else payload.get("tasks", []) if isinstance(payload, dict) else []
     else:
         if getattr(args, "task_source", "core") == "recent":
@@ -524,10 +870,11 @@ def load_tasks(args: argparse.Namespace, roles: list[str] | None = None) -> list
     for task in tasks:
         if not isinstance(task, dict) or not task.get("id") or not task.get("role") or not task.get("prompt"):
             raise RoleBenchError("each task must contain id, role, and prompt")
-        if task["id"] in seen:
-            raise RoleBenchError(f"duplicate task id: {task['id']}")
-        seen.add(task["id"])
-        normalized.append(dict(task))
+        normalized_task = normalize_task(task)
+        if normalized_task["id"] in seen:
+            raise RoleBenchError(f"duplicate task id: {normalized_task['id']}")
+        seen.add(normalized_task["id"])
+        normalized.append(normalized_task)
     return normalized
 
 
@@ -628,6 +975,363 @@ def validate_task_coverage(tasks: list[dict[str, Any]], roles: list[str]) -> Non
 
 def write_json(path: Path, value: Any) -> None:
     path.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def snapshot_workspace(workspace: Path) -> dict[str, Any]:
+    files: dict[str, dict[str, Any]] = {}
+    errors: list[str] = []
+
+    def record_walk_error(exc: OSError) -> None:
+        errors.append(f"{exc.filename or workspace}: {exc}")
+
+    for root_value, directories, filenames in os.walk(workspace, followlinks=False, onerror=record_walk_error):
+        root = Path(root_value)
+        kept_directories = []
+        for name in sorted(directories):
+            path = root / name
+            relative = path.relative_to(workspace).as_posix()
+            if name == ".git":
+                continue
+            if path.is_symlink():
+                try:
+                    files[relative] = {"type": "symlink", "target": os.readlink(path), "mode": path.lstat().st_mode & 0o7777}
+                except OSError as exc:
+                    errors.append(f"{relative}: {exc}")
+                continue
+            try:
+                files[relative] = {"type": "directory", "mode": path.stat().st_mode & 0o7777}
+            except OSError as exc:
+                errors.append(f"{relative}: {exc}")
+            kept_directories.append(name)
+        directories[:] = kept_directories
+        for name in sorted(filenames):
+            path = root / name
+            relative = path.relative_to(workspace).as_posix()
+            try:
+                if path.is_symlink():
+                    files[relative] = {"type": "symlink", "target": os.readlink(path), "mode": path.lstat().st_mode & 0o7777}
+                    continue
+                digest = hashlib.sha256()
+                chunks: list[bytes] = []
+                size = 0
+                with path.open("rb") as handle:
+                    while True:
+                        chunk = handle.read(65536)
+                        if not chunk:
+                            break
+                        size += len(chunk)
+                        digest.update(chunk)
+                        if size <= SNAPSHOT_TEXT_LIMIT:
+                            chunks.append(chunk)
+                entry: dict[str, Any] = {"type": "file", "size": size, "sha256": digest.hexdigest(), "mode": path.stat().st_mode & 0o7777}
+                if size <= SNAPSHOT_TEXT_LIMIT:
+                    try:
+                        entry["text"] = b"".join(chunks).decode("utf-8")
+                    except UnicodeDecodeError:
+                        pass
+                files[relative] = entry
+            except OSError as exc:
+                errors.append(f"{relative}: {exc}")
+    return {"complete": not errors, "files": files, "errors": errors}
+
+
+def public_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "complete": snapshot["complete"],
+        "errors": snapshot["errors"],
+        "files": {
+            path: {key: value for key, value in entry.items() if key != "text"}
+            for path, entry in snapshot["files"].items()
+        },
+    }
+
+
+def diff_workspace_snapshots(before: dict[str, Any], after: dict[str, Any]) -> dict[str, Any]:
+    before_files = before["files"]
+    after_files = after["files"]
+    created = sorted(set(after_files) - set(before_files))
+    deleted = sorted(set(before_files) - set(after_files))
+    modified = sorted(
+        path for path in set(before_files) & set(after_files)
+        if {key: value for key, value in before_files[path].items() if key != "text"}
+        != {key: value for key, value in after_files[path].items() if key != "text"}
+    )
+    patches: list[str] = []
+    patch_size = 0
+    patch_truncated = False
+    for path in created + deleted + modified:
+        old_entry = before_files.get(path, {})
+        new_entry = after_files.get(path, {})
+        old_text = old_entry.get("text")
+        new_text = new_entry.get("text")
+        if not isinstance(old_text, str) and not isinstance(new_text, str):
+            continue
+        old_lines = (old_text or "").splitlines(keepends=True)
+        new_lines = (new_text or "").splitlines(keepends=True)
+        file_patch = "".join(difflib.unified_diff(old_lines, new_lines, fromfile=f"a/{path}" if path not in created else "/dev/null", tofile=f"b/{path}" if path not in deleted else "/dev/null"))
+        remaining = WORKSPACE_PATCH_LIMIT - patch_size
+        if len(file_patch) > remaining:
+            patches.append(file_patch[:remaining])
+            patch_truncated = True
+            break
+        patches.append(file_patch)
+        patch_size += len(file_patch)
+    patch = "".join(patches)
+    if patch_truncated:
+        patch += "\n... workspace patch truncated by RoleBench ...\n"
+    return {
+        "complete": bool(before["complete"] and after["complete"]),
+        "errors": list(before["errors"]) + list(after["errors"]),
+        "created": created,
+        "deleted": deleted,
+        "modified": modified,
+        "changed_paths": sorted(created + deleted + modified),
+        "patch": patch,
+        "patch_truncated": patch_truncated,
+    }
+
+
+def evidence_text(value: Any) -> str:
+    text = str(value).replace("\n", "\\n")
+    return text if len(text) <= EVIDENCE_TEXT_LIMIT else text[:EVIDENCE_TEXT_LIMIT] + "..."
+
+
+def evaluation_check(check_id: str, kind: str, status: str, evidence: str, dimensions: list[str], hard_gate: bool) -> dict[str, Any]:
+    return {
+        "id": check_id,
+        "type": kind,
+        "status": status,
+        "evidence": evidence_text(evidence),
+        "evaluator": "deterministic",
+        "dimensions": dimensions,
+        "hard_gate": hard_gate,
+    }
+
+
+def expected_output_checks(task: dict[str, Any], output: str) -> list[dict[str, Any]]:
+    expected = task.get("expected", {})
+    checks: list[dict[str, Any]] = []
+    dimensions = ["correctness", "instruction_following"]
+    hard_gate = True
+    if "output_exact" in expected:
+        wanted = expected["output_exact"]
+        status = "pass" if output == wanted else "fail"
+        checks.append(evaluation_check("expected-output-exact", "output_exact", status, f"expected={wanted!r}; actual={output!r}", dimensions, hard_gate))
+    for index, wanted in enumerate(expected.get("output_contains", []), 1):
+        status = "pass" if wanted in output else "fail"
+        checks.append(evaluation_check(f"expected-output-contains-{index:03d}", "output_contains", status, f"required substring={wanted!r}", dimensions, hard_gate))
+    for index, pattern in enumerate(expected.get("output_regex", []), 1):
+        status = "pass" if re.search(pattern, output) else "fail"
+        checks.append(evaluation_check(f"expected-output-regex-{index:03d}", "output_regex", status, f"pattern={pattern!r}", dimensions, hard_gate))
+    for index, pattern in enumerate(expected.get("output_not_regex", []), 1):
+        status = "pass" if not re.search(pattern, output) else "fail"
+        checks.append(evaluation_check(f"expected-output-not-regex-{index:03d}", "output_not_regex", status, f"forbidden pattern={pattern!r}", ["honesty", "instruction_following"], True))
+    if "output_json_equals" in expected:
+        try:
+            actual = json.loads(output)
+            status = "pass" if actual == expected["output_json_equals"] else "fail"
+            detail = f"expected={expected['output_json_equals']!r}; actual={actual!r}"
+        except json.JSONDecodeError as exc:
+            status = "fail"
+            detail = f"output is not JSON: {exc}"
+        checks.append(evaluation_check("expected-output-json", "output_json_equals", status, detail, dimensions, hard_gate))
+    if "max_output_chars" in expected:
+        maximum = expected["max_output_chars"]
+        status = "pass" if len(output) <= maximum else "fail"
+        checks.append(evaluation_check("expected-output-length", "max_output_chars", status, f"actual={len(output)}; maximum={maximum}", ["instruction_following"], False))
+    return checks
+
+
+def safe_workspace_path(workspace: Path, relative: str) -> Path:
+    candidate = workspace / relative
+    try:
+        candidate.resolve(strict=False).relative_to(workspace.resolve())
+    except ValueError as exc:
+        raise RoleBenchError(f"fixture path escapes task workspace: {relative!r}") from exc
+    return candidate
+
+
+def file_invariant_check(invariant: dict[str, Any], workspace: Path) -> tuple[str, str]:
+    kind = invariant["type"]
+    path = safe_workspace_path(workspace, invariant["path"])
+    if kind == "file_exists":
+        return ("pass", f"exists: {invariant['path']}") if path.is_file() else ("fail", f"missing file: {invariant['path']}")
+    if kind == "file_not_exists":
+        return ("pass", f"absent: {invariant['path']}") if not path.exists() else ("fail", f"unexpected path exists: {invariant['path']}")
+    if not path.is_file():
+        return "fail", f"missing file: {invariant['path']}"
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        return "fail", f"cannot read UTF-8 file {invariant['path']}: {exc}"
+    if kind == "file_content_exact":
+        return ("pass", f"exact content matched: {invariant['path']}") if text == invariant["value"] else ("fail", f"expected={invariant['value']!r}; actual={text!r}")
+    if kind == "file_contains":
+        missing = [value for value in invariant["values"] if value not in text]
+        return ("pass", f"required content found: {invariant['path']}") if not missing else ("fail", f"missing substrings: {missing!r}")
+    if kind == "file_matches":
+        return ("pass", f"regex matched: {invariant['path']}") if re.search(invariant["pattern"], text) else ("fail", f"pattern did not match: {invariant['pattern']!r}")
+    try:
+        actual = json.loads(text)
+    except json.JSONDecodeError as exc:
+        return "fail", f"file is not JSON: {exc}"
+    return ("pass", f"JSON matched: {invariant['path']}") if actual == invariant["value"] else ("fail", f"expected={invariant['value']!r}; actual={actual!r}")
+
+
+def run_command_invariant(invariant: dict[str, Any], workspace: Path, allowed: bool) -> tuple[str, str]:
+    if not allowed:
+        return "unknown", "command check not enabled; rerun with --allow-check-command after reviewing argv"
+    try:
+        completed = subprocess.run(
+            invariant["argv"],
+            cwd=workspace,
+            check=False,
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=invariant["timeout"],
+        )
+    except subprocess.TimeoutExpired:
+        return "fail", f"command timed out after {invariant['timeout']}s"
+    except OSError as exc:
+        return "fail", f"cannot run command: {exc}"
+    failures = []
+    if completed.returncode != invariant["expected_exit_code"]:
+        failures.append(f"exit={completed.returncode}, expected={invariant['expected_exit_code']}")
+    for value in invariant.get("stdout_contains", []):
+        if value not in completed.stdout:
+            failures.append(f"stdout missing {value!r}")
+    for value in invariant.get("stderr_contains", []):
+        if value not in completed.stderr:
+            failures.append(f"stderr missing {value!r}")
+    detail = "; ".join(failures) if failures else f"exit={completed.returncode}; stdout={completed.stdout!r}; stderr={completed.stderr!r}"
+    return ("fail" if failures else "pass"), detail
+
+
+def deterministic_checks(task: dict[str, Any], result: dict[str, Any], workspace: Path | None, workspace_diff: dict[str, Any] | None, allow_check_command: bool) -> list[dict[str, Any]]:
+    output = result.get("output", "")
+    checks = expected_output_checks(task, output)
+    failure_mode = task.get("failure_mode", {})
+    for index, pattern in enumerate(failure_mode.get("required_output_regex", []), 1):
+        status = "pass" if re.search(pattern, output) else "fail"
+        checks.append(evaluation_check(f"failure-required-{index:03d}", "required_output_regex", status, f"pattern={pattern!r}", ["failure_handling"], False))
+    for index, pattern in enumerate(failure_mode.get("forbidden_output_regex", []), 1):
+        status = "pass" if not re.search(pattern, output) else "fail"
+        checks.append(evaluation_check(f"failure-forbidden-{index:03d}", "forbidden_output_regex", status, f"pattern={pattern!r}", ["honesty"], True))
+    for invariant in task.get("invariants", []):
+        kind = invariant["type"]
+        try:
+            if workspace is None:
+                status, evidence = "unknown", "workspace evidence unavailable"
+            elif kind in {"allowed_changed_paths", "forbidden_changed_paths"}:
+                if not workspace_diff or not workspace_diff["complete"]:
+                    status, evidence = "unknown", "workspace snapshot incomplete"
+                else:
+                    changed = workspace_diff["changed_paths"]
+                    if kind == "allowed_changed_paths":
+                        offending = [path for path in changed if not any(fnmatch.fnmatchcase(path, pattern) for pattern in invariant["patterns"])]
+                        status = "pass" if not offending else "fail"
+                        evidence = f"changed={changed!r}; outside allowed patterns={offending!r}"
+                    else:
+                        offending = [path for path in changed if any(fnmatch.fnmatchcase(path, pattern) for pattern in invariant["patterns"])]
+                        status = "pass" if not offending else "fail"
+                        evidence = f"changed={changed!r}; forbidden matches={offending!r}"
+            elif kind == "command":
+                status, evidence = run_command_invariant(invariant, workspace, allow_check_command)
+            else:
+                status, evidence = file_invariant_check(invariant, workspace)
+        except RoleBenchError as exc:
+            status, evidence = "fail", str(exc)
+        checks.append(evaluation_check(invariant["id"], kind, status, evidence, invariant["dimensions"], invariant["hard_gate"]))
+    return checks
+
+
+def aggregate_dimensions(task: dict[str, Any], checks: list[dict[str, Any]]) -> dict[str, Any]:
+    dimensions: dict[str, Any] = {}
+    for dimension in task.get("dimension_targets", []):
+        relevant = [check for check in checks if dimension in check["dimensions"]]
+        if not relevant:
+            status, score = "unknown", None
+            evidence = ["no deterministic evidence for this dimension"]
+        elif any(check["status"] == "fail" for check in relevant):
+            status, score = "fail", 0
+            evidence = [check["evidence"] for check in relevant if check["status"] == "fail"]
+        elif any(check["status"] == "unknown" for check in relevant):
+            status, score = "unknown", 1
+            evidence = [check["evidence"] for check in relevant if check["status"] == "unknown"]
+        else:
+            status, score = "pass", 2
+            evidence = [check["evidence"] for check in relevant]
+        dimensions[dimension] = {
+            "status": status,
+            "score": score,
+            "evidence": evidence[:5],
+            "evaluator": "deterministic" if relevant else "none",
+            "hard_gate": dimension in HARD_GATE_DIMENSIONS,
+        }
+    return dimensions
+
+
+def build_evaluation(task: dict[str, Any], result: dict[str, Any], workspace: Path | None, workspace_diff: dict[str, Any] | None, allow_check_command: bool, artifacts: dict[str, str] | None) -> dict[str, Any]:
+    if result.get("error_type") == "timeout":
+        execution_status = "timeout"
+    elif result.get("status") == "pass":
+        execution_status = "completed"
+    else:
+        execution_status = "failed"
+    checks = deterministic_checks(task, result, workspace, workspace_diff, allow_check_command)
+    dimensions = aggregate_dimensions(task, checks)
+    hard_checks = [check for check in checks if check["hard_gate"]]
+    hard_dimensions = [value for name, value in dimensions.items() if name in HARD_GATE_DIMENSIONS]
+    if any(check["status"] == "fail" for check in hard_checks) or any(value["status"] == "fail" for value in hard_dimensions):
+        hard_gate_status = "fail"
+    elif execution_status != "completed" or any(check["status"] == "unknown" for check in hard_checks) or any(value["status"] == "unknown" for value in hard_dimensions):
+        hard_gate_status = "unknown"
+    else:
+        hard_gate_status = "pass"
+    if execution_status != "completed" or any(check["status"] == "fail" for check in checks):
+        outcome = "fail"
+    elif not checks or any(check["status"] == "unknown" for check in checks) or any(value["status"] == "unknown" for value in dimensions.values()):
+        outcome = "unknown"
+    else:
+        outcome = "pass"
+    return {
+        "schema_version": 1,
+        "timestamp": now_iso(),
+        "assignment_id": result["assignment_id"],
+        "task_id": result["task_id"],
+        "role": result["role"],
+        "model": result["model"],
+        "thinking": result.get("thinking"),
+        "replicate": result["replicate"],
+        "execution_status": execution_status,
+        "outcome": outcome,
+        "hard_gate_status": hard_gate_status,
+        "checks": checks,
+        "dimensions": dimensions,
+        "artifacts": artifacts or {},
+    }
+
+
+def write_workspace_artifacts(output_dir: Path, artifacts_root: Path, identity: str, before: dict[str, Any], after: dict[str, Any], workspace_diff: dict[str, Any]) -> dict[str, str]:
+    slug = re.sub(r"[^A-Za-z0-9_.-]+", "-", identity).strip("-")[:80] or "cell"
+    suffix = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:10]
+    artifact_dir = artifacts_root / f"{slug}-{suffix}"
+    artifact_dir.mkdir(parents=True, exist_ok=False)
+    before_path = artifact_dir / "workspace-before.json"
+    after_path = artifact_dir / "workspace-after.json"
+    diff_path = artifact_dir / "workspace-diff.json"
+    patch_path = artifact_dir / "workspace.patch"
+    write_json(before_path, public_snapshot(before))
+    write_json(after_path, public_snapshot(after))
+    write_json(diff_path, {key: value for key, value in workspace_diff.items() if key != "patch"})
+    patch_path.write_text(workspace_diff["patch"], encoding="utf-8")
+    return {
+        "workspace_before": str(before_path.relative_to(output_dir)),
+        "workspace_after": str(after_path.relative_to(output_dir)),
+        "workspace_diff": str(diff_path.relative_to(output_dir)),
+        "workspace_patch": str(patch_path.relative_to(output_dir)),
+    }
 
 
 def extract_output(payload: Any) -> str:
@@ -784,7 +1488,11 @@ def format_plan(manifest: dict[str, Any]) -> str:
         f"- estimated tokens: input {estimate['input_tokens']}, output {estimate['output_tokens']}",
         f"- estimated cost: {cost} ({estimate['cost_status']})",
         f"- cost cap: {cap_text}",
+        f"- deterministic evaluator: {', '.join(manifest.get('evaluation', {}).get('dimension_targets', [])) or 'none'} (no model cost)",
+        f"- trusted command checks: {manifest.get('evaluation', {}).get('command_checks', 0)} ({'enabled' if manifest.get('evaluation', {}).get('allow_check_command') else 'disabled'})",
     ]
+    for item in manifest.get("evaluation", {}).get("command_argvs", []):
+        lines.append(f"- command argv [{item['task_id']}/{item['check_id']}]: {json.dumps(item['argv'], ensure_ascii=False)}")
     recent_work = manifest.get("recent_work")
     if manifest.get("task_source") == "recent" and isinstance(recent_work, dict):
         workspaces = recent_work.get("workspaces") or []
@@ -813,7 +1521,27 @@ def percentile(values: list[float], probability: float) -> float | None:
     return ordered[index]
 
 
-def run_one(omp_bin: str, assignment: dict[str, Any], task: dict[str, Any], replicate: int, output_dir: Path, timeout: int, config_file: Path, executor: str, controller_model: str | None) -> dict[str, Any]:
+def output_copy_ignore(source: Path, output_dir: Path):
+    try:
+        relative = output_dir.resolve().relative_to(source.resolve())
+    except ValueError:
+        return None
+    if not relative.parts:
+        raise RoleBenchError("benchmark output directory cannot be the task workspace")
+    parent = Path(*relative.parts[:-1]) if len(relative.parts) > 1 else Path(".")
+    target = relative.parts[-1]
+
+    def ignore(current: str, names: list[str]) -> set[str]:
+        try:
+            current_relative = Path(current).resolve().relative_to(source.resolve())
+        except ValueError:
+            return set()
+        return {target} if current_relative == parent and target in names else set()
+
+    return ignore
+
+
+def run_one(omp_bin: str, assignment: dict[str, Any], task: dict[str, Any], replicate: int, output_dir: Path, timeout: int, config_file: Path, executor: str, controller_model: str | None, allow_check_command: bool = False, artifacts_root: Path | None = None) -> dict[str, Any]:
     started = time.perf_counter()
     result: dict[str, Any] = {
         "timestamp": now_iso(),
@@ -827,12 +1555,16 @@ def run_one(omp_bin: str, assignment: dict[str, Any], task: dict[str, Any], repl
         "executor": executor,
         "provider_call_started": False,
         "status": "error",
+        "execution_status": "failed",
     }
     if task.get("requires_image") and not task.get("image"):
         result.update({"error_type": "missing_image_fixture", "error": "task requires an image fixture"})
+        result["_evaluation"] = build_evaluation(task, result, None, None, allow_check_command, None)
         result["latency_ms"] = round((time.perf_counter() - started) * 1000, 2)
         return result
     temp_root = Path(tempfile.mkdtemp(prefix="omp-rolebench-"))
+    workspace: Path | None = None
+    before_snapshot: dict[str, Any] | None = None
     try:
         workspace = temp_root / "workspace"
         source_workspace = task.get("workspace")
@@ -840,7 +1572,7 @@ def run_one(omp_bin: str, assignment: dict[str, Any], task: dict[str, Any], repl
             source = Path(source_workspace).expanduser().resolve()
             if not source.is_dir():
                 raise RoleBenchError(f"task workspace does not exist: {source}")
-            shutil.copytree(source, workspace)
+            shutil.copytree(source, workspace, ignore=output_copy_ignore(source, output_dir))
         else:
             workspace.mkdir()
         selected_model = assignment["mapping"].get(task["role"]) or assignment.get("candidate")
@@ -899,6 +1631,7 @@ def run_one(omp_bin: str, assignment: dict[str, Any], task: dict[str, Any], repl
             selected_model = controller
         else:
             prompt = task["prompt"]
+        before_snapshot = snapshot_workspace(workspace)
         command = [
             omp_bin,
             "-p",
@@ -946,11 +1679,14 @@ def run_one(omp_bin: str, assignment: dict[str, Any], task: dict[str, Any], repl
                     result["error_type"] = "delegated_task_failure"
                 if result["status"] == "error" and "error_type" not in result:
                     result["error_type"] = "empty_output"
+                if result["status"] == "pass":
+                    result["execution_status"] = "completed"
             except RoleBenchError as exc:
                 result["error_type"] = "malformed_omp_json"
                 result["error"] = str(exc)
     except subprocess.TimeoutExpired as exc:
         result["error_type"] = "timeout"
+        result["execution_status"] = "timeout"
         result["error"] = f"OMP exceeded {timeout}s"
         result["stdout"] = decode_subprocess_text(exc.stdout)
         result["stderr"] = decode_subprocess_text(exc.stderr)
@@ -959,6 +1695,22 @@ def run_one(omp_bin: str, assignment: dict[str, Any], task: dict[str, Any], repl
         result["error"] = str(exc)
     finally:
         result["latency_ms"] = round((time.perf_counter() - started) * 1000, 2)
+        workspace_diff = None
+        artifacts = None
+        evaluation_workspace = workspace if before_snapshot is not None and workspace and workspace.is_dir() else None
+        if evaluation_workspace is not None:
+            after_snapshot = snapshot_workspace(evaluation_workspace)
+            workspace_diff = diff_workspace_snapshots(before_snapshot, after_snapshot)
+            if artifacts_root is not None:
+                identity = f"{assignment['id']}-{task['id']}-run-{replicate}"
+                try:
+                    artifacts = write_workspace_artifacts(output_dir, artifacts_root, identity, before_snapshot, after_snapshot, workspace_diff)
+                except OSError as exc:
+                    result["status"] = "error"
+                    result["execution_status"] = "failed"
+                    result["error_type"] = "artifact_write"
+                    result["error"] = str(exc)
+        result["_evaluation"] = build_evaluation(task, result, evaluation_workspace, workspace_diff, allow_check_command, artifacts)
         shutil.rmtree(temp_root, ignore_errors=True)
     return result
 
@@ -994,9 +1746,21 @@ def run_command(args: argparse.Namespace) -> int:
     output_dir = Path(args.output).expanduser()
     output_dir.mkdir(parents=True, exist_ok=True)
     results_path = output_dir / "results.jsonl"
+    evaluations_path = output_dir / "evaluations.jsonl"
     previous_results = rotate_stale_results(results_path)
+    previous_evaluations = rotate_stale_results(evaluations_path)
+    command_checks = task_command_check_count(tasks)
+    command_argvs = task_command_argvs(tasks)
+    allow_check_command = bool(getattr(args, "allow_check_command", False))
+    dimension_targets = [
+        dimension for dimension in EVALUATION_DIMENSIONS
+        if any(dimension in task.get("dimension_targets", []) for task in tasks)
+    ]
+    artifact_run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     manifest = {
-        "schema_version": 1,
+        "schema_version": 2,
+        "task_schema_version": 1,
+        "evaluation_schema_version": 1,
         "generated_at": now_iso(),
         "omp_bin": args.omp_bin,
         "selection": source,
@@ -1012,6 +1776,18 @@ def run_command(args: argparse.Namespace) -> int:
         "pricing_file": args.pricing_file,
         "max_cost_usd": args.max_cost_usd,
         "previous_results": previous_results,
+        "previous_evaluations": previous_evaluations,
+        "artifact_run_id": artifact_run_id,
+        "evaluation": {
+            "evaluator": "deterministic",
+            "version": 1,
+            "dimension_targets": dimension_targets,
+            "hard_gate_dimensions": sorted(HARD_GATE_DIMENSIONS),
+            "command_checks": command_checks,
+            "command_argvs": command_argvs,
+            "allow_check_command": allow_check_command,
+            "model_cost_usd": 0,
+        },
         "estimate": estimate,
         "consent": {
             "required": bool(args.execute),
@@ -1025,6 +1801,11 @@ def run_command(args: argparse.Namespace) -> int:
     }
     write_json(output_dir / "manifest.json", manifest)
     print(format_plan(manifest), flush=True)
+    if args.execute and command_checks and not allow_check_command:
+        summary = {"run_dir": str(output_dir), "status": "blocked", "reason": "command_checks_not_approved", "executed": False, "command_checks": command_checks}
+        write_json(output_dir / "summary.json", summary)
+        print("Execution blocked: task fixtures contain command checks; review argv and add --allow-check-command.", file=sys.stderr)
+        return 2
     if args.max_cost_usd is not None:
         if estimate["cost_status"] != "estimated":
             summary = {"run_dir": str(output_dir), "status": "blocked", "reason": "cost_unknown", "executed": False}
@@ -1044,11 +1825,13 @@ def run_command(args: argparse.Namespace) -> int:
         print("Execution blocked: obtain user consent, then rerun with --execute --confirm.", file=sys.stderr)
         return 3
     result_rows = 0
+    evaluation_rows = 0
     actual_cost = 0.0
     actual_cost_seen = False
     budget_status = "not-set" if args.max_cost_usd is None else "running"
     stopped_reason = None
     if args.execute:
+        artifacts_root = output_dir / "artifacts" / artifact_run_id
         ordered = list(assignments)
         random.Random(args.seed).shuffle(ordered)
         stop = False
@@ -1066,9 +1849,15 @@ def run_command(args: argparse.Namespace) -> int:
                         config_path,
                         args.executor,
                         args.controller_model,
+                        allow_check_command,
+                        artifacts_root,
                     )
+                    evaluation = row.pop("_evaluation", None)
                     append_result(results_path, row)
                     result_rows += 1
+                    if evaluation is not None:
+                        append_result(evaluations_path, evaluation)
+                        evaluation_rows += 1
                     cost = extract_cost(row.get("usage"))
                     if cost is not None:
                         actual_cost += cost
@@ -1094,6 +1883,7 @@ def run_command(args: argparse.Namespace) -> int:
         "assignments": len(assignments),
         "tasks": len(tasks),
         "result_rows": result_rows,
+        "evaluation_rows": evaluation_rows,
         "executed": bool(args.execute),
         "estimated_cost_usd": estimate["cost_usd"],
         "actual_cost_usd": round(actual_cost, 8) if args.execute and actual_cost_seen else None,
@@ -1110,19 +1900,37 @@ def report_command(args: argparse.Namespace) -> int:
     run_dir = Path(args.run).expanduser()
     manifest_path = run_dir / "manifest.json"
     results_path = run_dir / "results.jsonl"
+    evaluations_path = run_dir / "evaluations.jsonl"
     manifest = load_json_document(manifest_path)
-    rows = []
-    if results_path.exists():
-        for number, line in enumerate(results_path.read_text(encoding="utf-8").splitlines(), 1):
+    def load_jsonl(path: Path, label: str) -> list[dict[str, Any]]:
+        loaded = []
+        if not path.exists():
+            return loaded
+        for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
             if not line.strip():
                 continue
             try:
-                rows.append(json.loads(line))
+                value = json.loads(line)
             except json.JSONDecodeError as exc:
-                raise RoleBenchError(f"malformed results.jsonl line {number}: {exc}") from exc
+                raise RoleBenchError(f"malformed {label} line {number}: {exc}") from exc
+            if not isinstance(value, dict):
+                raise RoleBenchError(f"malformed {label} line {number}: expected JSON object")
+            loaded.append(value)
+        return loaded
+
+    rows = load_jsonl(results_path, "results.jsonl")
+    evaluations = load_jsonl(evaluations_path, "evaluations.jsonl")
     groups: dict[tuple[str, str, str], list[dict[str, Any]]] = defaultdict(list)
     for row in rows:
         groups[(row.get("role", ""), row.get("model", ""), row.get("thinking") or "")].append(row)
+    evaluation_groups: dict[tuple[str, str, str], list[dict[str, Any]]] = defaultdict(list)
+    dimension_groups: dict[tuple[str, str, str, str], list[dict[str, Any]]] = defaultdict(list)
+    for evaluation in evaluations:
+        key = (evaluation.get("role", ""), evaluation.get("model", ""), evaluation.get("thinking") or "")
+        evaluation_groups[key].append(evaluation)
+        for dimension, value in evaluation.get("dimensions", {}).items():
+            if isinstance(value, dict):
+                dimension_groups[(*key, dimension)].append(value)
     lines = [
         "# OMP RoleBench Report",
         "",
@@ -1131,6 +1939,9 @@ def report_command(args: argparse.Namespace) -> int:
         f"- Roles: {', '.join(manifest.get('roles', []))}",
         f"- Assignments: {len(manifest.get('assignments', []))}",
         f"- Result rows: {len(rows)}",
+        f"- Evaluation rows: {len(evaluations)}",
+        "",
+        "## Execution",
         "",
         "| Role | Model | Thinking | Runs | Pass | Error | Pass rate | P50 latency (ms) | P95 latency (ms) | Avg output chars | Cost |",
         "|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|",
@@ -1151,13 +1962,56 @@ def report_command(args: argparse.Namespace) -> int:
         lines.append(f"| `{role}` | `{model}` | `{thinking or '-'}` | {len(values)} | {passes} | {errors} | {rate} | {p50_text} | {p95_text} | {avg_output} | {total_cost} |")
     if not rows:
         lines.extend(["", "No executed results found. This run contains a matrix preview only."])
+    if evaluations:
+        lines.extend([
+            "",
+            "## Outcomes",
+            "",
+            "| Role | Model | Thinking | Evaluations | Pass | Fail | Unknown | Hard-gate failures |",
+            "|---|---|---|---:|---:|---:|---:|---:|",
+        ])
+        for (role, model, thinking), values in sorted(evaluation_groups.items()):
+            passes = sum(value.get("outcome") == "pass" for value in values)
+            failures = sum(value.get("outcome") == "fail" for value in values)
+            unknown = sum(value.get("outcome") == "unknown" for value in values)
+            hard_failures = sum(value.get("hard_gate_status") == "fail" for value in values)
+            lines.append(f"| `{role}` | `{model}` | `{thinking or '-'}` | {len(values)} | {passes} | {failures} | {unknown} | {hard_failures} |")
+        lines.extend([
+            "",
+            "## Dimensions",
+            "",
+            "| Role | Model | Thinking | Dimension | Pass | Fail | Unknown | Avg known score | Hard gate |",
+            "|---|---|---|---|---:|---:|---:|---:|---|",
+        ])
+        for (role, model, thinking, dimension), values in sorted(dimension_groups.items()):
+            passes = sum(value.get("status") == "pass" for value in values)
+            failures = sum(value.get("status") == "fail" for value in values)
+            unknown = sum(value.get("status") == "unknown" for value in values)
+            scores = [float(value["score"]) for value in values if isinstance(value.get("score"), (int, float)) and value.get("status") != "unknown"]
+            avg_score = f"{sum(scores) / len(scores):.2f}" if scores else "unknown"
+            lines.append(f"| `{role}` | `{model}` | `{thinking or '-'}` | `{dimension}` | {passes} | {failures} | {unknown} | {avg_score} | {'yes' if dimension in HARD_GATE_DIMENSIONS else 'no'} |")
+        failed_checks = [
+            (evaluation, check)
+            for evaluation in evaluations
+            for check in evaluation.get("checks", [])
+            if isinstance(check, dict) and check.get("status") == "fail"
+        ]
+        if failed_checks:
+            lines.extend(["", "## Failed Checks", ""])
+            for evaluation, check in failed_checks:
+                evidence = evidence_text(check.get("evidence", "")).replace("|", "\\|")
+                lines.append(f"- `{evaluation.get('task_id', '')}` / `{evaluation.get('model', '')}` / `{check.get('id', '')}`: {evidence}")
     report = "\n".join(lines) + "\n"
     if args.format == "json":
         serializable_groups = {
             f"{role}/{model}:{thinking}" if thinking else f"{role}/{model}": values
             for (role, model, thinking), values in groups.items()
         }
-        rendered = json.dumps({"manifest": manifest, "groups": serializable_groups}, ensure_ascii=False, indent=2) + "\n"
+        serializable_evaluation_groups = {
+            f"{role}/{model}:{thinking}" if thinking else f"{role}/{model}": values
+            for (role, model, thinking), values in evaluation_groups.items()
+        }
+        rendered = json.dumps({"manifest": manifest, "groups": serializable_groups, "evaluations": evaluations, "evaluation_groups": serializable_evaluation_groups}, ensure_ascii=False, indent=2) + "\n"
         if args.output:
             output = Path(args.output).expanduser()
             output.parent.mkdir(parents=True, exist_ok=True)
@@ -1221,6 +2075,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--executor", choices=("direct", "delegated"), default="direct", help="direct model call or a temporary OMP task agent")
     run.add_argument("--controller-model", help="controller model used by delegated executor")
     run.add_argument("--confirm", action="store_true", help="confirm the printed plan and cost estimate before execution")
+    run.add_argument("--allow-check-command", action="store_true", help="allow reviewed argv-based command checks from task fixtures")
     run.add_argument("--pricing-file", help="JSON rates keyed by provider/model, in USD per million input/output tokens")
     run.add_argument("--max-cost-usd", "--budget-usd", dest="max_cost_usd", type=float, help="maximum allowed estimated/observed benchmark cost in USD")
     run.add_argument("--timeout", type=int, default=300)

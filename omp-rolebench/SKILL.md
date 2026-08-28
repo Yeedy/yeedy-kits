@@ -7,7 +7,7 @@ description: Benchmark Oh My Pi model-role assignments. Use when comparing all m
 
 ## Overview
 
-Use `scripts/rolebench.py` to discover the current OMP model catalog, resolve `modelRoles` from an OMP config, generate bounded assignment experiments, optionally execute tasks through OMP, and write JSONL results plus a Markdown report. The harness never edits the user's OMP config; execution is opt-in because it can call metered providers.
+Use `scripts/rolebench.py` to discover the current OMP model catalog, resolve `modelRoles` from an OMP config, generate bounded assignment experiments, optionally execute tasks through OMP, and write raw results, deterministic evaluations, evidence artifacts, and a Markdown report. The harness never edits the user's OMP config; execution is opt-in because it can call metered providers.
 
 ## Quick start
 
@@ -51,9 +51,9 @@ python3 omp-rolebench/scripts/rolebench.py run \
 
 ## Consent and budget gate
 
-Before any provider call, show the user a short plan containing the candidate models, roles, assignment mode, executor, task count, repeat count, request count, estimated input/output tokens, and estimated USD cost. Ask for explicit approval in the conversation. If the user states a budget in natural language (for example, "benchmark cost must stay below $0.50"), convert it to `--max-cost-usd 0.50` and repeat the cap in the confirmation request.
+Before any provider call, show the user a short plan containing the candidate models, roles, assignment mode, executor, task count, repeat count, request count, estimated input/output tokens, estimated USD cost, deterministic evaluation dimensions, and any exact command-check argv. Ask for explicit approval in the conversation. If the user states a budget in natural language (for example, "benchmark cost must stay below $0.50"), convert it to `--max-cost-usd 0.50` and repeat the cap in the confirmation request.
 
-The command also enforces the gate: `--execute` without `--confirm` writes the manifest and estimate but exits without making requests. Only pass `--confirm` after the user approves that exact plan. A supplied `--max-cost-usd` requires known prices from `--pricing-file` or catalog metadata; an unknown estimate, or an estimate above the cap, blocks execution. Pricing files use USD per million tokens:
+The command also enforces the gate: `--execute` without `--confirm` writes the manifest and estimate but exits without making requests. Only pass `--confirm` after the user approves that exact plan. Task fixtures with command checks require a separate `--allow-check-command` flag after the displayed argv has been reviewed; the commands are trusted local code, not a sandbox. A supplied `--max-cost-usd` requires known prices from `--pricing-file` or catalog metadata; an unknown estimate, or an estimate above the cap, blocks execution. Pricing files use USD per million tokens:
 
 ```json
 {
@@ -91,17 +91,19 @@ For task-subagent experiments, see [observed-task-role-ab.md](references/observe
 
 ## Tasks and execution
 
-`--tasks-file` accepts JSON or JSONL task fixtures with `id`, `role`, `prompt`, and optional `workspace`, `expected`, and `max_output_tokens`. When it is omitted, choose between `--task-source core` and `--task-source recent`; the CLI default remains `core` for backward compatibility. At the skill interaction layer, if the user has not chosen a source, ask whether to use the generic suite or recent local work before generating the plan.
+`--tasks-file` accepts task schema V1 as JSON or JSONL. Tasks require `id`, `role`, and `prompt`; they may declare difficulty metadata, easy/hard pairing, expected output, workspace invariants, failure modes, and target dimensions. See [evaluation-v1.md](references/evaluation-v1.md) for the complete schema and evaluator behavior. When a tasks file is omitted, choose between `--task-source core` and `--task-source recent`; the CLI default remains `core` for backward compatibility. At the skill interaction layer, if the user has not chosen a source, ask whether to use the generic suite or recent local work before generating the plan.
+
+The generic core suite remains a low-cost smoke suite. Its deterministic protocol and workspace tasks provide usable V1 checks, while subjective roles remain `unknown` where evidence is insufficient. For role-allocation decisions, provide paired easy/hard fixtures plus controlled failure or adversarial cases rather than treating core-suite latency as quality.
 
 Use `--task-source recent` to generate one task per selected role and workspace from recent Git commits and working-tree changes. Repeat `--recent-workspace` for multiple workspaces, or pass comma-separated paths. Set `--recent-days` and `--recent-commits` to control the lookback window. Git paths are scoped and normalized relative to each selected workspace; tracked deletions remain context only, and only existing image files become vision fixtures. For a non-Git workspace, the generator falls back to recently modified files. If Git is present but a command fails, the generator records the error and shows a warning in the plan instead of hiding it. It records commit subjects and file paths in the generated prompts and manifest, but does not read OMP sessions, Codex memory, or past chat history. Each generated task keeps its workspace path so every benchmark cell runs against an isolated copy; review `manifest.json` before consenting to execution.
 
 If `--tasks-file` is provided, it takes precedence over `--task-source`.
 
-`--execute` invokes `omp -p --mode json --no-session` and appends each result immediately to `results.jsonl`. Each cell gets a temporary config overlay and workspace; the user's normal config is never changed. Reusing an output directory rotates an existing `results.jsonl` to a timestamped `results.jsonl.previous-*` file before writing the new manifest. Without `--execute`, `manifest.json` and the cost estimate are still produced so the experiment can be reviewed before making provider calls.
+`--execute` invokes `omp -p --mode json --no-session` and appends each raw result immediately to `results.jsonl`. It then writes the independent quality result to `evaluations.jsonl`. Each cell gets a temporary config overlay and workspace; the user's normal config is never changed. Before/after hashes, changed paths, and small UTF-8 text patches are retained under `artifacts/<run-id>/`. Reusing an output directory rotates existing result and evaluation JSONL files before writing the new manifest. Without `--execute`, `manifest.json` and the cost estimate are still produced so the experiment can be reviewed before making provider calls.
 
 The default `direct` executor calls the selected model with a role contract prompt. Use `--executor delegated` for the closer-to-production subagent path: it creates a temporary project agent with the candidate model and asks an OMP controller to invoke that agent through the `task` tool. Delegated runs add controller overhead to latency, so compare like with like.
 
-The default executor measures completion, latency, output length, and process errors. It does not pretend to provide a semantic quality score. Add task-specific scores later through the `scores` field in `results.jsonl` or an external reviewer.
+The V1 evaluator deterministically checks declared output contracts, file state, changed-path scope, failure-output patterns, and explicitly approved command results. Execution status, task outcome, dimension status, and hard gates remain separate. Unsupported or subjective dimensions are `unknown`; there is no composite score and V1 does not automatically recommend a model. A fixed judge or blind human review can later supplement deterministic evidence, but must not overwrite raw results.
 
 ## Reports
 
@@ -111,7 +113,7 @@ python3 omp-rolebench/scripts/rolebench.py report \
   --format markdown
 ```
 
-Reports show assignment counts, pass/error rates, latency, output size, thinking variants, and per-role/per-model rows. Treat cost as unknown unless the provider returns usage/cost data; unknown cost is reported as unknown rather than inferred.
+Reports show assignment counts, execution pass/error rates, latency, output size, thinking variants, task outcomes, per-dimension evidence status, and hard-gate failures. Treat cost as unknown unless the provider returns usage/cost data; unknown cost is reported as unknown rather than inferred.
 
 ## Guardrails
 
@@ -119,3 +121,4 @@ Reports show assignment counts, pass/error rates, latency, output size, thinking
 - Run vision tasks only when the fixture contains an image and the catalog/preflight says the model supports vision; otherwise record a visible error.
 - Do not use a model's generated text as the sole judge of another model. Prefer deterministic invariants and blind human or fixed-judge review for quality.
 - Preserve raw stdout/stderr and exit codes. Provider failures, timeouts, and malformed JSON are data, not reasons to silently retry with another model.
+- Treat copied workspaces as isolation for repeatability, not as a host sandbox. Use disposable fixtures and review every command check before enabling it.

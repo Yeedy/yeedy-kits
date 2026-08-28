@@ -133,10 +133,72 @@ class RoleBenchTests(unittest.TestCase):
             self.assertEqual([task["role"] for task in tasks], ["task", "advisor"])
             self.assertIn("src/main.py", tasks[0]["prompt"])
             self.assertEqual(tasks[0]["workspace"], str(root.resolve()))
+            self.assertEqual(tasks[0]["difficulty"]["level"], 3)
+            self.assertIn("correctness", tasks[0]["dimension_targets"])
             self.assertEqual(args.recent_work["source"], "mtime")
             self.assertEqual(args.recent_work["workspace_count"], 1)
             self.assertEqual(rolebench.normalize_recent_workspaces(f"{root},{root}"), [str(root.resolve())])
             self.assertNotIn("git_error", args.recent_work)
+
+    def test_task_schema_normalizes_evaluation_metadata_and_rejects_unsafe_paths(self):
+        task = rolebench.normalize_task({
+            "id": "paired-hard",
+            "role": "task",
+            "prompt": "make the bounded change",
+            "pair_id": "paired",
+            "variant": "hard",
+            "difficulty": {"level": 3, "scope": 2, "reasoning": 3},
+            "expected": {"output_contains": "verified"},
+            "invariants": [{"type": "file_contains", "path": "src/result.txt", "value": "PASS"}],
+        })
+        self.assertEqual(task["schema_version"], 1)
+        self.assertEqual(task["expected"]["output_contains"], ["verified"])
+        self.assertEqual(task["invariants"][0]["dimensions"], ["correctness"])
+        self.assertIn("correctness", task["dimension_targets"])
+        with self.assertRaisesRegex(rolebench.RoleBenchError, "stay inside"):
+            rolebench.normalize_task({
+                "id": "unsafe",
+                "role": "task",
+                "prompt": "bad fixture",
+                "invariants": [{"type": "file_exists", "path": "../secret"}],
+            })
+        with self.assertRaisesRegex(rolebench.RoleBenchError, "unknown dimension"):
+            rolebench.normalize_task({"id": "bad-dimension", "role": "task", "prompt": "bad", "dimension_targets": ["style"]})
+
+    def test_deterministic_evaluator_detects_out_of_scope_change(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            before = rolebench.snapshot_workspace(workspace)
+            (workspace / "result.txt").write_text("PASS", encoding="utf-8")
+            (workspace / "unrelated.txt").write_text("changed", encoding="utf-8")
+            after = rolebench.snapshot_workspace(workspace)
+            workspace_diff = rolebench.diff_workspace_snapshots(before, after)
+            task = rolebench.normalize_task({
+                "id": "task-eval",
+                "role": "task",
+                "prompt": "write result only",
+                "dimension_targets": ["correctness", "instruction_following", "safety"],
+                "invariants": [
+                    {"type": "file_content_exact", "path": "result.txt", "value": "PASS"},
+                    {"type": "allowed_changed_paths", "patterns": ["result.txt"]},
+                ],
+            })
+            result = {
+                "assignment_id": "a",
+                "task_id": "task-eval",
+                "role": "task",
+                "model": "p/a",
+                "thinking": None,
+                "replicate": 1,
+                "status": "pass",
+                "output": "done",
+            }
+            evaluation = rolebench.build_evaluation(task, result, workspace, workspace_diff, False, None)
+            self.assertEqual(evaluation["outcome"], "fail")
+            self.assertEqual(evaluation["dimensions"]["correctness"]["status"], "pass")
+            self.assertEqual(evaluation["dimensions"]["safety"]["status"], "fail")
+            self.assertEqual(evaluation["hard_gate_status"], "fail")
+            self.assertIn("unrelated.txt", workspace_diff["patch"])
 
     def test_recent_git_source_normalizes_subdir_and_special_paths(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -361,6 +423,9 @@ class RoleBenchTests(unittest.TestCase):
         self.assertEqual(row["stdout"], "partial�")
         self.assertEqual(row["stderr"], "err")
         self.assertTrue(row["provider_call_started"])
+        self.assertEqual(row["_evaluation"]["execution_status"], "timeout")
+        self.assertEqual(row["_evaluation"]["outcome"], "fail")
+        self.assertEqual(row["_evaluation"]["hard_gate_status"], "unknown")
         json.dumps(row)
 
     @patch("rolebench.subprocess.run")
@@ -500,11 +565,18 @@ class RoleBenchTests(unittest.TestCase):
                 {"role": "task", "model": "p/a", "thinking": "low", "status": "pass", "latency_ms": 2, "output": "low"},
             ]
             (root / "results.jsonl").write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
+            evaluations = [
+                {"role": "task", "model": "p/a", "thinking": "high", "outcome": "unknown", "dimensions": {}},
+                {"role": "task", "model": "p/a", "thinking": "low", "outcome": "unknown", "dimensions": {}},
+            ]
+            (root / "evaluations.jsonl").write_text("\n".join(json.dumps(row) for row in evaluations) + "\n", encoding="utf-8")
             output = root / "report.json"
             self.assertEqual(rolebench.main(["report", "--run", str(root), "--format", "json", "--output", str(output)]), 0)
             payload = json.loads(output.read_text(encoding="utf-8"))
             self.assertIn("task/p/a:high", payload["groups"])
             self.assertIn("task/p/a:low", payload["groups"])
+            self.assertIn("task/p/a:high", payload["evaluation_groups"])
+            self.assertIn("task/p/a:low", payload["evaluation_groups"])
 
     def test_report_markdown_closes_thinking_cell(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -517,13 +589,34 @@ class RoleBenchTests(unittest.TestCase):
             report = output.read_text(encoding="utf-8")
             self.assertIn("| `task` | `p/a` | `high` |", report)
 
+    def test_report_includes_outcomes_dimensions_and_failed_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "manifest.json").write_text(json.dumps({"generated_at": "now", "mode": "role-isolated", "roles": ["task"], "assignments": []}), encoding="utf-8")
+            (root / "results.jsonl").write_text(json.dumps({"role": "task", "model": "p/a", "status": "pass", "latency_ms": 1, "output": "done"}) + "\n", encoding="utf-8")
+            evaluation = {
+                "role": "task", "model": "p/a", "thinking": None, "task_id": "task-1", "outcome": "fail", "hard_gate_status": "fail",
+                "checks": [{"id": "scope", "status": "fail", "evidence": "changed forbidden.txt"}],
+                "dimensions": {"safety": {"status": "fail", "score": 0}},
+            }
+            (root / "evaluations.jsonl").write_text(json.dumps(evaluation) + "\n", encoding="utf-8")
+            output = root / "report.md"
+            self.assertEqual(rolebench.main(["report", "--run", str(root), "--output", str(output)]), 0)
+            report = output.read_text(encoding="utf-8")
+            self.assertIn("## Outcomes", report)
+            self.assertIn("## Dimensions", report)
+            self.assertIn("changed forbidden.txt", report)
+
     def test_fake_executor_end_to_end(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             config = root / "config.yml"
             config.write_text("modelRoles:\n  task: fake/model\n", encoding="utf-8")
             tasks = root / "tasks.json"
-            tasks.write_text(json.dumps([{"id": "task-1", "role": "task", "prompt": "do"}]), encoding="utf-8")
+            tasks.write_text(json.dumps({"schema_version": 1, "tasks": [{
+                "id": "task-1", "role": "task", "prompt": "do", "workspace": str(root), "expected": {"output_exact": "PASS"},
+                "dimension_targets": ["correctness", "instruction_following"],
+            }]}), encoding="utf-8")
             output = root / "run"
             fake_omp = (Path(__file__).parent / "fake_omp").resolve()
             self.assertEqual(rolebench.main([
@@ -532,6 +625,43 @@ class RoleBenchTests(unittest.TestCase):
             ]), 0)
             result = json.loads((output / "results.jsonl").read_text(encoding="utf-8").splitlines()[0])
             self.assertEqual(result["status"], "pass")
+            self.assertEqual(result["execution_status"], "completed")
+            self.assertNotIn("outcome", result)
+            evaluation = json.loads((output / "evaluations.jsonl").read_text(encoding="utf-8").splitlines()[0])
+            self.assertEqual(evaluation["outcome"], "pass")
+            self.assertEqual(evaluation["dimensions"]["correctness"]["score"], 2)
+            for artifact in evaluation["artifacts"].values():
+                self.assertTrue((output / artifact).is_file())
+            before_artifact = json.loads((output / evaluation["artifacts"]["workspace_before"]).read_text(encoding="utf-8"))
+            self.assertFalse(any(path.startswith("run/") for path in before_artifact["files"]))
+
+    def test_command_checks_require_explicit_trust_and_run_after_approval(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = root / "config.yml"
+            config.write_text("modelRoles:\n  task: fake/model\n", encoding="utf-8")
+            tasks = root / "tasks.json"
+            tasks.write_text(json.dumps([{
+                "id": "task-command", "role": "task", "prompt": "do", "expected": "PASS",
+                "invariants": [{"type": "command", "argv": [sys.executable, "-c", "print('CHECKED')"], "stdout_contains": "CHECKED"}],
+            }]), encoding="utf-8")
+            fake_omp = (Path(__file__).parent / "fake_omp").resolve()
+            blocked = root / "blocked"
+            common = [
+                "run", "--omp-bin", str(fake_omp), "--models", "fake/model", "--roles", "task",
+                "--config-file", str(config), "--tasks-file", str(tasks), "--execute", "--confirm",
+            ]
+            self.assertEqual(rolebench.main(common + ["--output", str(blocked)]), 2)
+            manifest = json.loads((blocked / "manifest.json").read_text(encoding="utf-8"))
+            self.assertIn(sys.executable, rolebench.format_plan(manifest))
+            self.assertEqual(json.loads((blocked / "summary.json").read_text(encoding="utf-8"))["reason"], "command_checks_not_approved")
+            self.assertFalse((blocked / "results.jsonl").exists())
+            allowed = root / "allowed"
+            self.assertEqual(rolebench.main(common + ["--allow-check-command", "--output", str(allowed)]), 0)
+            evaluation = json.loads((allowed / "evaluations.jsonl").read_text(encoding="utf-8").splitlines()[0])
+            command_check = next(check for check in evaluation["checks"] if check["type"] == "command")
+            self.assertEqual(command_check["status"], "pass")
+            self.assertEqual(evaluation["outcome"], "pass")
 
     @patch("rolebench.subprocess.run")
     def test_execute_requires_confirmation_before_provider_call(self, run):
