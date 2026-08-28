@@ -153,21 +153,45 @@ def parse_json_output(text: str) -> Any:
     raise RoleBenchError("OMP returned malformed JSON output")
 
 
-def run_git(workspace: Path, arguments: list[str]) -> str | None:
+def run_git(workspace: Path, arguments: list[str]) -> tuple[str | None, str | None, int | None]:
+    command = "git " + " ".join(arguments)
     try:
         completed = subprocess.run(
             ["git", "-C", str(workspace), *arguments],
             check=False,
             capture_output=True,
-            text=True,
-            errors="replace",
             timeout=30,
         )
-    except (OSError, subprocess.TimeoutExpired):
-        return None
+    except OSError as exc:
+        return None, f"{command}: {exc}", None
+    except subprocess.TimeoutExpired as exc:
+        return None, f"{command}: timed out after {exc.timeout}s", None
+    stdout = decode_subprocess_text(completed.stdout)
+    stderr = decode_subprocess_text(completed.stderr)
     if completed.returncode != 0:
+        detail = " ".join((stderr or stdout).split())[:300]
+        return None, f"{command} exited {completed.returncode}: {detail or 'unknown error'}", completed.returncode
+    return stdout, None, completed.returncode
+
+
+def is_non_git_error(error: str | None, returncode: int | None) -> bool:
+    if returncode != 128 or not error:
+        return False
+    detail = error.lower()
+    return "not a git repository" in detail or "not a git repo" in detail
+
+
+def normalize_git_path(value: str, prefix: str) -> str | None:
+    relative = value
+    if relative.startswith("./"):
+        relative = relative[2:]
+    if prefix:
+        if not relative.startswith(prefix):
+            return None
+        relative = relative[len(prefix):]
+    if not relative or relative.startswith("../") or relative.startswith("/"):
         return None
-    return completed.stdout
+    return relative
 
 
 def recent_files_by_mtime(workspace: Path, cutoff: float, limit: int) -> list[str]:
@@ -191,9 +215,31 @@ def collect_recent_work(workspace_value: str, days: int, commit_limit: int, file
     if not workspace.is_dir():
         raise RoleBenchError(f"recent-work workspace does not exist: {workspace}")
     since = f"{days} days ago"
-    commit_output = run_git(workspace, ["log", f"--since={since}", f"--max-count={commit_limit}", "--format=%h%x09%s"])
-    names_output = run_git(workspace, ["log", f"--since={since}", f"--max-count={commit_limit}", "--format=", "--name-only"])
-    status_output = run_git(workspace, ["status", "--short"])
+    git_errors: list[str] = []
+    prefix = ""
+    git_ready = False
+    root_output, root_error, root_code = run_git(workspace, ["rev-parse", "--show-toplevel"])
+    if root_output is None and not is_non_git_error(root_error, root_code):
+        if root_error:
+            git_errors.append(root_error)
+    if root_output is not None:
+        prefix_output, prefix_error, _ = run_git(workspace, ["rev-parse", "--show-prefix"])
+        if prefix_output is None:
+            if prefix_error:
+                git_errors.append(prefix_error)
+        else:
+            prefix = prefix_output.strip().replace("\\", "/")
+            git_ready = True
+    if git_ready:
+        pathspec = ["--", "."]
+        commit_output, commit_error, _ = run_git(workspace, ["log", f"--since={since}", f"--max-count={commit_limit}", "--format=%h%x09%s", *pathspec])
+        names_output, names_error, _ = run_git(workspace, ["log", f"--since={since}", f"--max-count={commit_limit}", "--format=", "--name-only", "-z", *pathspec])
+        status_output, status_error, _ = run_git(workspace, ["status", "--short", "--porcelain=v1", "--untracked-files=all", "-z", *pathspec])
+        for error in (commit_error, names_error, status_error):
+            if error:
+                git_errors.append(error)
+    else:
+        commit_output = names_output = status_output = None
     commits = []
     if commit_output:
         for line in commit_output.splitlines():
@@ -201,29 +247,42 @@ def collect_recent_work(workspace_value: str, days: int, commit_limit: int, file
                 commit, subject = line.split("\t", 1)
                 commits.append({"commit": commit, "subject": subject})
     changed_files: list[str] = []
-    for value in (names_output or "").splitlines():
-        relative = value.strip()
+    for value in (names_output or "").split("\0"):
+        relative = normalize_git_path(value, prefix)
         if relative and relative not in changed_files:
             changed_files.append(relative)
     working_tree: list[str] = []
     if status_output:
-        for line in status_output.splitlines():
-            relative = line[3:].strip() if len(line) >= 4 else ""
-            if " -> " in relative:
-                relative = relative.rsplit(" -> ", 1)[-1]
-            if relative and relative not in changed_files:
-                changed_files.append(relative)
-            if line.strip():
-                working_tree.append(line)
+        status_values = [value for value in status_output.split("\0") if value]
+        index = 0
+        while index < len(status_values):
+            entry = status_values[index]
+            status = entry[:2]
+            path_value = entry[3:] if len(entry) >= 4 else ""
+            paths = [path_value]
+            if "R" in status or "C" in status:
+                if index + 1 < len(status_values):
+                    paths.append(status_values[index + 1])
+                    index += 1
+            normalized_paths = [path for path in (normalize_git_path(path, prefix) for path in paths) if path]
+            for relative in normalized_paths:
+                if relative not in changed_files:
+                    changed_files.append(relative)
+            if normalized_paths:
+                display_paths = list(reversed(normalized_paths)) if len(normalized_paths) > 1 else normalized_paths
+                display = " -> ".join(display_paths)
+                working_tree.append(f"{status} {display}".rstrip())
+            index += 1
     source = "git" if commits or changed_files or working_tree else "mtime"
     if not commits and not changed_files:
         changed_files = recent_files_by_mtime(workspace, time.time() - days * 86400, file_limit)
         source = "mtime" if changed_files else source
     if not commits and not changed_files and not working_tree:
-        raise RoleBenchError(f"no work found in {workspace} during the last {days} day(s); use --task-source core or increase --recent-days")
+        detail = f"; git error: {git_errors[0]}" if git_errors else ""
+        raise RoleBenchError(f"no work found in {workspace} during the last {days} day(s){detail}; use --task-source core or increase --recent-days")
     changed_files = changed_files[:file_limit]
-    images = [relative for relative in changed_files if Path(relative).suffix.lower() in RECENT_IMAGE_SUFFIXES]
-    return {
+    images = [relative for relative in changed_files if Path(relative).suffix.lower() in RECENT_IMAGE_SUFFIXES and (workspace / relative).is_file()]
+    result = {
         "source": source,
         "workspace": str(workspace),
         "days": days,
@@ -233,6 +292,9 @@ def collect_recent_work(workspace_value: str, days: int, commit_limit: int, file
         "working_tree": working_tree[:file_limit],
         "images": images,
     }
+    if git_errors:
+        result["git_error"] = "; ".join(dict.fromkeys(git_errors))[:1000]
+    return result
 
 
 def normalize_recent_workspaces(value: str | list[str] | tuple[str, ...] | None) -> list[str]:
@@ -726,9 +788,20 @@ def format_plan(manifest: dict[str, Any]) -> str:
     recent_work = manifest.get("recent_work")
     if manifest.get("task_source") == "recent" and isinstance(recent_work, dict):
         workspaces = recent_work.get("workspaces") or []
-        paths = [item.get("workspace") for item in workspaces if isinstance(item, dict) and item.get("workspace")]
-        if paths:
-            lines.insert(5, f"- recent workspaces ({len(paths)}): {', '.join(paths)}")
+        workspace_labels = [
+            f"{item['workspace']} [{item.get('source', 'unknown')}]"
+            for item in workspaces
+            if isinstance(item, dict) and item.get("workspace")
+        ]
+        if workspace_labels:
+            lines.insert(5, f"- recent workspaces ({len(workspace_labels)}): {', '.join(workspace_labels)}")
+        warnings = [
+            f"{item.get('workspace', 'unknown')}: {item['git_error']}"
+            for item in workspaces
+            if isinstance(item, dict) and item.get("git_error")
+        ]
+        if warnings:
+            lines.insert(6, "- recent work warnings: " + " | ".join(warnings))
     return "\n".join(lines)
 
 

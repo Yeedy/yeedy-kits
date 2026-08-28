@@ -12,6 +12,19 @@ import rolebench
 
 
 class RoleBenchTests(unittest.TestCase):
+    def git(self, directory, *arguments):
+        return subprocess.run(
+            ["git", "-C", str(directory), *arguments],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+    def init_git_repo(self, root):
+        self.git(root, "init", "-q")
+        self.git(root, "config", "user.email", "rolebench-tests@example.com")
+        self.git(root, "config", "user.name", "RoleBench Tests")
+
     def make_run_args(self, root, **overrides):
         config = root / "config.yml"
         config.write_text("modelRoles:\n  smol: p/base\n  task: p/base\n", encoding="utf-8")
@@ -123,6 +136,134 @@ class RoleBenchTests(unittest.TestCase):
             self.assertEqual(args.recent_work["source"], "mtime")
             self.assertEqual(args.recent_work["workspace_count"], 1)
             self.assertEqual(rolebench.normalize_recent_workspaces(f"{root},{root}"), [str(root.resolve())])
+            self.assertNotIn("git_error", args.recent_work)
+
+    def test_recent_git_source_normalizes_subdir_and_special_paths(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = root / "pkg"
+            workspace.mkdir()
+            (root / "other").mkdir()
+            self.init_git_repo(root)
+            (workspace / "tracked.py").write_text("print('tracked')\n", encoding="utf-8")
+            (workspace / "deleted.png").write_bytes(b"deleted")
+            self.git(root, "add", ".")
+            self.git(root, "commit", "-qm", "initial")
+            (workspace / "recent.py").write_text("print('recent')\n", encoding="utf-8")
+            (root / "other" / "outside.py").write_text("print('outside')\n", encoding="utf-8")
+            (workspace / "中文 shot.png").write_bytes(b"image")
+            self.git(root, "add", ".")
+            self.git(root, "commit", "-qm", "recent changes")
+            (workspace / "deleted.png").unlink()
+            self.git(root, "mv", "pkg/recent.py", "pkg/renamed file.py")
+            untracked = workspace / "assets" / "新图.png"
+            untracked.parent.mkdir()
+            untracked.write_bytes(b"new image")
+
+            recent = rolebench.collect_recent_work(str(workspace), 30, 5)
+
+            self.assertEqual(recent["source"], "git")
+            self.assertEqual(recent["workspace"], str(workspace.resolve()))
+            self.assertIn("recent changes", {item["subject"] for item in recent["commits"]})
+            self.assertIn("recent.py", recent["changed_files"])
+            self.assertIn("renamed file.py", recent["changed_files"])
+            self.assertIn("assets/新图.png", recent["changed_files"])
+            self.assertIn("中文 shot.png", recent["changed_files"])
+            self.assertNotIn("../other/outside.py", recent["changed_files"])
+            self.assertNotIn("deleted.png", recent["images"])
+            self.assertIn("中文 shot.png", recent["images"])
+            self.assertIn("assets/新图.png", recent["images"])
+            self.assertTrue(any("recent.py -> renamed file.py" in line for line in recent["working_tree"]))
+
+            task = rolebench.build_recent_tasks(["vision"], recent)[0]
+            self.assertEqual(task["workspace"], str(workspace.resolve()))
+            self.assertEqual(task["image"], [str(workspace.resolve() / "中文 shot.png")])
+            self.assertTrue(Path(task["image"][0]).is_file())
+
+    def test_recent_git_error_is_recorded_and_shown_in_plan(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "recent.py").write_text("print('recent')\n", encoding="utf-8")
+            with patch.object(rolebench, "run_git", return_value=(None, "git status failed: permission denied", 1)):
+                recent = rolebench.collect_recent_work(str(root), 1, 5)
+            self.assertEqual(recent["source"], "mtime")
+            self.assertIn("permission denied", recent["git_error"])
+            manifest = {
+                "candidates": [{"selector": "p/a"}],
+                "roles": ["task"],
+                "mode": "all-same",
+                "executor": "direct",
+                "task_source": "recent",
+                "tasks": [{"id": "recent-task", "role": "task", "prompt": "inspect"}],
+                "runs": 1,
+                "estimate": {"assignments": 1, "calls": 1, "input_tokens": 1, "output_tokens": 1, "cost_usd": None, "cost_status": "unknown"},
+                "recent_work": {"source": "mtime", "workspace_count": 1, "workspaces": [recent]},
+            }
+            plan = rolebench.format_plan(manifest)
+            self.assertIn(f"{root.resolve()} [mtime]", plan)
+            self.assertIn("recent work warnings", plan)
+            self.assertIn("permission denied", plan)
+
+    @patch("rolebench.subprocess.run")
+    def test_run_git_returns_decoded_error_details(self, run):
+        run.return_value = SimpleNamespace(returncode=1, stdout=b"", stderr=b"fatal: permission denied\xff")
+        output, error, returncode = rolebench.run_git(Path("."), ["status"])
+        self.assertIsNone(output)
+        self.assertEqual(returncode, 1)
+        self.assertIn("permission denied", error)
+
+    def test_recent_task_source_reports_invalid_or_empty_workspace(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with self.assertRaises(rolebench.RoleBenchError):
+                rolebench.collect_recent_work(str(root / "missing"), 1, 5)
+            with self.assertRaises(rolebench.RoleBenchError):
+                rolebench.collect_recent_work(str(root), 1, 5)
+            with patch.object(rolebench, "run_git", return_value=(None, "git log failed: permission denied", 1)):
+                with self.assertRaisesRegex(rolebench.RoleBenchError, "git error: git log failed"):
+                    rolebench.collect_recent_work(str(root), 1, 5)
+            args = SimpleNamespace(
+                tasks_file=None,
+                task_source="recent",
+                recent_workspace=str(root),
+                recent_days=1,
+                recent_commits=5,
+                suite="core",
+            )
+            with self.assertRaisesRegex(rolebench.RoleBenchError, "requires selected roles"):
+                rolebench.load_tasks(args)
+
+    def test_recent_run_writes_manifest_and_plan_details(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "src").mkdir()
+            (root / "src" / "main.py").write_text("print('recent')\n", encoding="utf-8")
+            output = root / "run"
+            args = self.make_run_args(
+                root,
+                mode="all-same",
+                task_source="recent",
+                recent_workspace=[str(root)],
+                recent_days=1,
+                recent_commits=5,
+                execute=False,
+                confirm=False,
+                output=str(output),
+            )
+            self.assertEqual(rolebench.run_command(args), 0)
+            manifest = rolebench.load_json_document(output / "manifest.json")
+            self.assertEqual(manifest["task_source"], "recent")
+            self.assertEqual(manifest["recent_work"]["workspace_count"], 1)
+            self.assertIn(f"{root.resolve()} [mtime]", rolebench.format_plan(manifest))
+
+    def test_main_rejects_non_positive_recent_window(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = str(Path(directory) / "run")
+            for option in ("--recent-days", "--recent-commits"):
+                self.assertEqual(
+                    rolebench.main(["run", "--models", "p/a", "--roles", "task", "--mode", "all-same", option, "0", "--output", output]),
+                    2,
+                )
 
     def test_recent_task_source_supports_multiple_workspaces(self):
         with tempfile.TemporaryDirectory() as first, tempfile.TemporaryDirectory() as second:
@@ -144,8 +285,39 @@ class RoleBenchTests(unittest.TestCase):
             self.assertEqual({task["role"] for task in tasks}, {"task", "advisor"})
             self.assertEqual({task["workspace"] for task in tasks}, {str(root.resolve()) for root in roots})
             self.assertEqual(len({task["id"] for task in tasks}), 4)
+            self.assertTrue(all("src/main1.py" in task["prompt"] and "src/main2.py" not in task["prompt"] for task in tasks[:2]))
+            self.assertTrue(all("src/main2.py" in task["prompt"] and "src/main1.py" not in task["prompt"] for task in tasks[2:]))
             self.assertEqual(args.recent_work["workspace_count"], 2)
             self.assertEqual(len(args.recent_work["workspaces"]), 2)
+
+    def test_recent_workspaces_reports_mixed_sources(self):
+        with tempfile.TemporaryDirectory() as git_directory, tempfile.TemporaryDirectory() as plain_directory:
+            git_root = Path(git_directory)
+            plain_root = Path(plain_directory)
+            self.init_git_repo(git_root)
+            (git_root / "tracked.py").write_text("print('git')\n", encoding="utf-8")
+            self.git(git_root, "add", ".")
+            self.git(git_root, "commit", "-qm", "git work")
+            (plain_root / "plain.py").write_text("print('mtime')\n", encoding="utf-8")
+            recent = rolebench.collect_recent_workspaces([str(git_root), str(plain_root)], 1, 5)
+            self.assertEqual(recent["source"], "mixed")
+            self.assertEqual([item["source"] for item in recent["workspaces"]], ["git", "mtime"])
+
+    def test_deleted_image_does_not_become_vision_fixture(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.init_git_repo(root)
+            image = root / "deleted.png"
+            image.write_bytes(b"image")
+            self.git(root, "add", ".")
+            self.git(root, "commit", "-qm", "add image")
+            image.unlink()
+            recent = rolebench.collect_recent_work(str(root), 1, 5)
+            self.assertIn("deleted.png", recent["changed_files"])
+            self.assertEqual(recent["images"], [])
+            task = rolebench.build_recent_tasks(["vision"], recent)[0]
+            self.assertNotIn("requires_image", task)
+            self.assertNotIn("image", task)
 
     @patch("rolebench.subprocess.run")
     def test_direct_run_records_output(self, run):
