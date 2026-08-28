@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import random
 import re
 import shutil
@@ -60,6 +61,20 @@ CORE_TASKS = [
     {"id": "advisor-001", "role": "advisor", "prompt": "Review this policy: retry every provider error with the cheapest model. Identify reliability and observability risks and propose a safer policy."},
     {"id": "default-001", "role": "default", "prompt": "State the success criteria for a reproducible model benchmark in four bullets."},
 ]
+RECENT_ROLE_TASKS = {
+    "tiny": "Summarize the recent work context in one precise sentence. Do not invent details.",
+    "smol": "List the three most important recent changes and the file associated with each.",
+    "commit": "Propose a conventional commit message for the latest recent change. Explain the scope in one sentence.",
+    "task": "Inspect the recent work context in the workspace. Run the most relevant lightweight verification without changing source files, then report what passed and what remains uncertain.",
+    "slow": "Analyze the recent work context. Identify the most likely regression risk and give two concrete checks that would distinguish it from provider variance.",
+    "plan": "Create a safe next-step implementation plan based on the recent work context. Include affected files, validation, and rollback risk.",
+    "vision": "Review the recent image or UI-related work context. Describe visible, actionable concerns only; if no image fixture is available, state that limitation clearly.",
+    "designer": "Review the recent work context for UI, workflow, or information-architecture implications. Give concrete improvements and note when the context is not UI-related.",
+    "advisor": "Critically review the recent work context. Identify correctness, security, reliability, and maintainability risks first, with concrete follow-up checks.",
+    "default": "State the success criteria for the recent work context in four concise bullets.",
+}
+RECENT_IGNORE_DIRS = {".git", ".omp", ".codex", "node_modules", "__pycache__", ".venv", "venv", "dist", "build"}
+RECENT_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
 
 
 class RoleBenchError(Exception):
@@ -136,6 +151,153 @@ def parse_json_output(text: str) -> Any:
         if values:
             return values
     raise RoleBenchError("OMP returned malformed JSON output")
+
+
+def run_git(workspace: Path, arguments: list[str]) -> str | None:
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(workspace), *arguments],
+            check=False,
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if completed.returncode != 0:
+        return None
+    return completed.stdout
+
+
+def recent_files_by_mtime(workspace: Path, cutoff: float, limit: int) -> list[str]:
+    found: list[tuple[float, str]] = []
+    for root, directories, filenames in os.walk(workspace):
+        directories[:] = [name for name in directories if name not in RECENT_IGNORE_DIRS and not name.startswith(".")]
+        for filename in filenames:
+            path = Path(root) / filename
+            try:
+                modified = path.stat().st_mtime
+            except OSError:
+                continue
+            if modified >= cutoff:
+                found.append((modified, path.relative_to(workspace).as_posix()))
+    found.sort(key=lambda item: (-item[0], item[1]))
+    return [relative for _, relative in found[:limit]]
+
+
+def collect_recent_work(workspace_value: str, days: int, commit_limit: int, file_limit: int = 20) -> dict[str, Any]:
+    workspace = Path(workspace_value).expanduser().resolve()
+    if not workspace.is_dir():
+        raise RoleBenchError(f"recent-work workspace does not exist: {workspace}")
+    since = f"{days} days ago"
+    commit_output = run_git(workspace, ["log", f"--since={since}", f"--max-count={commit_limit}", "--format=%h%x09%s"])
+    names_output = run_git(workspace, ["log", f"--since={since}", f"--max-count={commit_limit}", "--format=", "--name-only"])
+    status_output = run_git(workspace, ["status", "--short"])
+    commits = []
+    if commit_output:
+        for line in commit_output.splitlines():
+            if "\t" in line:
+                commit, subject = line.split("\t", 1)
+                commits.append({"commit": commit, "subject": subject})
+    changed_files: list[str] = []
+    for value in (names_output or "").splitlines():
+        relative = value.strip()
+        if relative and relative not in changed_files:
+            changed_files.append(relative)
+    working_tree: list[str] = []
+    if status_output:
+        for line in status_output.splitlines():
+            relative = line[3:].strip() if len(line) >= 4 else ""
+            if " -> " in relative:
+                relative = relative.rsplit(" -> ", 1)[-1]
+            if relative and relative not in changed_files:
+                changed_files.append(relative)
+            if line.strip():
+                working_tree.append(line)
+    source = "git" if commits or changed_files or working_tree else "mtime"
+    if not commits and not changed_files:
+        changed_files = recent_files_by_mtime(workspace, time.time() - days * 86400, file_limit)
+        source = "mtime" if changed_files else source
+    if not commits and not changed_files and not working_tree:
+        raise RoleBenchError(f"no work found in {workspace} during the last {days} day(s); use --task-source core or increase --recent-days")
+    changed_files = changed_files[:file_limit]
+    images = [relative for relative in changed_files if Path(relative).suffix.lower() in RECENT_IMAGE_SUFFIXES]
+    return {
+        "source": source,
+        "workspace": str(workspace),
+        "days": days,
+        "commit_limit": commit_limit,
+        "commits": commits,
+        "changed_files": changed_files,
+        "working_tree": working_tree[:file_limit],
+        "images": images,
+    }
+
+
+def normalize_recent_workspaces(value: str | list[str] | tuple[str, ...] | None) -> list[str]:
+    values = [value] if isinstance(value, str) else list(value or [])
+    workspaces: list[str] = []
+    seen: set[str] = set()
+    for item in values:
+        for workspace in split_csv(item):
+            resolved = str(Path(workspace).expanduser().resolve())
+            if resolved not in seen:
+                seen.add(resolved)
+                workspaces.append(resolved)
+    return workspaces or [str(Path(".").resolve())]
+
+
+def collect_recent_workspaces(value: str | list[str] | tuple[str, ...] | None, days: int, commit_limit: int, file_limit: int = 20) -> dict[str, Any]:
+    workspaces = [collect_recent_work(path, days, commit_limit, file_limit) for path in normalize_recent_workspaces(value)]
+    sources = {item["source"] for item in workspaces}
+    summary: dict[str, Any] = {
+        "source": next(iter(sources)) if len(sources) == 1 else "mixed",
+        "workspace_count": len(workspaces),
+        "workspaces": workspaces,
+        "days": days,
+        "commit_limit": commit_limit,
+    }
+    if len(workspaces) == 1:
+        summary.update(workspaces[0])
+        summary["workspaces"] = workspaces
+        summary["workspace_count"] = 1
+    return summary
+
+
+def recent_work_context(recent_work: dict[str, Any]) -> str:
+    lines = [f"Workspace: {recent_work['workspace']}", f"Recent-work source: {recent_work['source']} ({recent_work['days']} day window)"]
+    if recent_work["commits"]:
+        lines.append("Recent commits:")
+        lines.extend(f"- {item['commit']} {item['subject']}" for item in recent_work["commits"])
+    if recent_work["changed_files"]:
+        lines.append("Changed files:")
+        lines.extend(f"- {path}" for path in recent_work["changed_files"])
+    if recent_work["working_tree"]:
+        lines.append("Working tree:")
+        lines.extend(f"- {line}" for line in recent_work["working_tree"])
+    return "\n".join(lines)
+
+
+def build_recent_tasks(roles: list[str], recent_work: dict[str, Any]) -> list[dict[str, Any]]:
+    workspaces = recent_work.get("workspaces") or [recent_work]
+    tasks = []
+    for workspace_index, workspace in enumerate(workspaces, 1):
+        context = recent_work_context(workspace)
+        workspace_slug = re.sub(r"[^A-Za-z0-9_-]+", "-", Path(workspace["workspace"]).name) or "workspace"
+        for role in roles:
+            role_slug = re.sub(r"[^A-Za-z0-9_-]+", "-", role)
+            task = {
+                "id": f"recent-{workspace_index:02d}-{workspace_slug}-{role_slug}-001",
+                "role": role,
+                "prompt": RECENT_ROLE_TASKS.get(role, RECENT_ROLE_TASKS["default"]) + "\n\n" + context,
+                "workspace": workspace["workspace"],
+            }
+            if role == "vision" and workspace["images"]:
+                task["requires_image"] = True
+                task["image"] = [str(Path(workspace["workspace"]) / workspace["images"][0])]
+            tasks.append(task)
+    return tasks
 
 
 def _catalog_items(node: Any, provider_hint: str | None = None) -> Iterable[dict[str, Any]]:
@@ -269,7 +431,8 @@ def resolve_candidates(args: argparse.Namespace) -> tuple[list[dict[str, Any]], 
     return catalog, {"source": "catalog", "providers": providers or ["all"]}
 
 
-def load_tasks(args: argparse.Namespace) -> list[dict[str, Any]]:
+def load_tasks(args: argparse.Namespace, roles: list[str] | None = None) -> list[dict[str, Any]]:
+    args.recent_work = None
     if args.tasks_file:
         path = Path(args.tasks_file)
         if path.suffix.lower() == ".jsonl":
@@ -284,7 +447,14 @@ def load_tasks(args: argparse.Namespace) -> list[dict[str, Any]]:
             payload = load_json_document(path)
             tasks = payload if isinstance(payload, list) else payload.get("tasks", []) if isinstance(payload, dict) else []
     else:
-        tasks = CORE_TASKS if args.suite == "core" else []
+        if getattr(args, "task_source", "core") == "recent":
+            if not roles:
+                raise RoleBenchError("recent task source requires selected roles")
+            recent_work = collect_recent_workspaces(args.recent_workspace, args.recent_days, args.recent_commits)
+            args.recent_work = recent_work
+            tasks = build_recent_tasks(roles, recent_work)
+        else:
+            tasks = CORE_TASKS if args.suite == "core" else []
     if not tasks:
         raise RoleBenchError("task suite is empty; provide --tasks-file or use --suite core")
     normalized = []
@@ -545,6 +715,7 @@ def format_plan(manifest: dict[str, Any]) -> str:
         f"- models: {', '.join(item['selector'] for item in manifest['candidates'])}",
         f"- roles: {', '.join(manifest['roles'])}",
         f"- mode/executor: {manifest['mode']} / {manifest['executor']}",
+        f"- task source: {manifest.get('task_source', 'core')}",
         f"- task fixtures: {len(manifest['tasks'])}",
         f"- assignments: {estimate['assignments']}",
         f"- requests: {estimate['calls']} ({manifest['runs']} run(s) per task)",
@@ -552,6 +723,12 @@ def format_plan(manifest: dict[str, Any]) -> str:
         f"- estimated cost: {cost} ({estimate['cost_status']})",
         f"- cost cap: {cap_text}",
     ]
+    recent_work = manifest.get("recent_work")
+    if manifest.get("task_source") == "recent" and isinstance(recent_work, dict):
+        workspaces = recent_work.get("workspaces") or []
+        paths = [item.get("workspace") for item in workspaces if isinstance(item, dict) and item.get("workspace")]
+        if paths:
+            lines.insert(5, f"- recent workspaces ({len(paths)}): {', '.join(paths)}")
     return "\n".join(lines)
 
 
@@ -735,7 +912,7 @@ def run_command(args: argparse.Namespace) -> int:
     config_path = Path(args.config_file).expanduser()
     roles, baseline = resolve_roles(args.roles, config_path, require_config=args.mode == "role-isolated")
     candidates, source = resolve_candidates(args)
-    tasks = load_tasks(args)
+    tasks = load_tasks(args, roles)
     validate_task_coverage(tasks, roles)
     assignments = build_assignments(args.mode, roles, baseline, candidates, args.assignment_file)
     supplied_pricing = load_pricing(args.pricing_file)
@@ -756,6 +933,8 @@ def run_command(args: argparse.Namespace) -> int:
         "runs": args.runs,
         "execute": bool(args.execute),
         "executor": args.executor,
+        "task_source": "file" if args.tasks_file else getattr(args, "task_source", "core"),
+        "recent_work": getattr(args, "recent_work", None),
         "controller_model": args.controller_model,
         "pricing_file": args.pricing_file,
         "max_cost_usd": args.max_cost_usd,
@@ -960,6 +1139,10 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--assignment-file", help="YAML-like role assignment file for explicit mode")
     run.add_argument("--suite", choices=("core", "none"), default="core")
     run.add_argument("--tasks-file", help="JSON or JSONL task fixtures")
+    run.add_argument("--task-source", choices=("core", "recent"), default="core", help="task source when --tasks-file is not supplied")
+    run.add_argument("--recent-workspace", action="append", default=None, help="workspace to inspect for --task-source recent; repeat or use comma-separated paths")
+    run.add_argument("--recent-days", type=int, default=14, help="lookback window for recent work")
+    run.add_argument("--recent-commits", type=int, default=5, help="maximum recent commits to include")
     run.add_argument("--runs", type=int, default=1)
     run.add_argument("--execute", action="store_true", help="invoke OMP; otherwise only write manifest")
     run.add_argument("--executor", choices=("direct", "delegated"), default="direct", help="direct model call or a temporary OMP task agent")
@@ -988,6 +1171,10 @@ def main(argv: list[str] | None = None) -> int:
                 raise RoleBenchError("--runs must be >= 1")
             if args.timeout < 1:
                 raise RoleBenchError("--timeout must be >= 1")
+            if args.recent_days < 1:
+                raise RoleBenchError("--recent-days must be >= 1")
+            if args.recent_commits < 1:
+                raise RoleBenchError("--recent-commits must be >= 1")
             if args.max_cost_usd is not None and args.max_cost_usd < 0:
                 raise RoleBenchError("--max-cost-usd must be >= 0")
             return run_command(args)

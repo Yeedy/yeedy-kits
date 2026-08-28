@@ -27,6 +27,10 @@ class RoleBenchTests(unittest.TestCase):
             "assignment_file": None,
             "suite": "none",
             "tasks_file": None,
+            "task_source": "core",
+            "recent_workspace": ".",
+            "recent_days": 14,
+            "recent_commits": 5,
             "runs": 1,
             "execute": True,
             "executor": "direct",
@@ -97,6 +101,51 @@ class RoleBenchTests(unittest.TestCase):
         candidates, source = rolebench.resolve_candidates(args)
         self.assertEqual(source["source"], "assignment")
         self.assertEqual({candidate["thinking"] for candidate in candidates}, {"high"})
+
+    def test_recent_task_source_uses_workspace_changes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            changed = root / "src" / "main.py"
+            changed.parent.mkdir()
+            changed.write_text("print('recent')\n", encoding="utf-8")
+            args = SimpleNamespace(
+                tasks_file=None,
+                task_source="recent",
+                recent_workspace=str(root),
+                recent_days=1,
+                recent_commits=5,
+                suite="core",
+            )
+            tasks = rolebench.load_tasks(args, ["task", "advisor"])
+            self.assertEqual([task["role"] for task in tasks], ["task", "advisor"])
+            self.assertIn("src/main.py", tasks[0]["prompt"])
+            self.assertEqual(tasks[0]["workspace"], str(root.resolve()))
+            self.assertEqual(args.recent_work["source"], "mtime")
+            self.assertEqual(args.recent_work["workspace_count"], 1)
+            self.assertEqual(rolebench.normalize_recent_workspaces(f"{root},{root}"), [str(root.resolve())])
+
+    def test_recent_task_source_supports_multiple_workspaces(self):
+        with tempfile.TemporaryDirectory() as first, tempfile.TemporaryDirectory() as second:
+            roots = [Path(first), Path(second)]
+            for index, root in enumerate(roots, 1):
+                changed = root / "src" / f"main{index}.py"
+                changed.parent.mkdir()
+                changed.write_text(f"print({index})\n", encoding="utf-8")
+            args = SimpleNamespace(
+                tasks_file=None,
+                task_source="recent",
+                recent_workspace=[str(roots[0]), str(roots[1])],
+                recent_days=1,
+                recent_commits=5,
+                suite="core",
+            )
+            tasks = rolebench.load_tasks(args, ["task", "advisor"])
+            self.assertEqual(len(tasks), 4)
+            self.assertEqual({task["role"] for task in tasks}, {"task", "advisor"})
+            self.assertEqual({task["workspace"] for task in tasks}, {str(root.resolve()) for root in roots})
+            self.assertEqual(len({task["id"] for task in tasks}), 4)
+            self.assertEqual(args.recent_work["workspace_count"], 2)
+            self.assertEqual(len(args.recent_work["workspaces"]), 2)
 
     @patch("rolebench.subprocess.run")
     def test_direct_run_records_output(self, run):

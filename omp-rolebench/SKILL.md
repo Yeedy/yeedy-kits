@@ -21,6 +21,18 @@ python3 omp-rolebench/scripts/rolebench.py run \
   --output runs/glm-vs-ds
 ```
 
+Generate the task suite from recent local work instead of the generic prompts:
+
+```bash
+python3 omp-rolebench/scripts/rolebench.py run \
+  --models opencode-go/glm-5.3-flash,opencode-go/deepseek-v4-flash-vision-exp \
+  --roles smol,task,advisor \
+  --task-source recent \
+  --recent-workspace . \
+  --recent-days 14 \
+  --output runs/recent-work
+```
+
 Run the same matrix with the OMP subprocess executor only after reviewing it:
 
 ```bash
@@ -79,7 +91,11 @@ For task-subagent experiments, see [observed-task-role-ab.md](references/observe
 
 ## Tasks and execution
 
-`--tasks-file` accepts JSON or JSONL task fixtures with `id`, `role`, `prompt`, and optional `workspace`, `expected`, and `max_output_tokens`. Without it, the built-in `core` suite provides small role-contract prompts for `tiny`, `smol`, `commit`, `task`, `slow`, `plan`, `vision`, `designer`, and `advisor`.
+`--tasks-file` accepts JSON or JSONL task fixtures with `id`, `role`, `prompt`, and optional `workspace`, `expected`, and `max_output_tokens`. When it is omitted, choose between `--task-source core` and `--task-source recent`; the CLI default remains `core` for backward compatibility. At the skill interaction layer, if the user has not chosen a source, ask whether to use the generic suite or recent local work before generating the plan.
+
+Use `--task-source recent` to generate one task per selected role and workspace from recent Git commits and working-tree changes. Repeat `--recent-workspace` for multiple workspaces, or pass comma-separated paths. Set `--recent-days` and `--recent-commits` to control the lookback window. For a non-Git workspace, the generator falls back to recently modified files. It records commit subjects and file paths in the generated prompts and manifest, but does not read OMP sessions, Codex memory, or past chat history. Each generated task keeps its workspace path so every benchmark cell runs against an isolated copy; review `manifest.json` before consenting to execution.
+
+If `--tasks-file` is provided, it takes precedence over `--task-source`.
 
 `--execute` invokes `omp -p --mode json --no-session` and appends each result immediately to `results.jsonl`. Each cell gets a temporary config overlay and workspace; the user's normal config is never changed. Reusing an output directory rotates an existing `results.jsonl` to a timestamped `results.jsonl.previous-*` file before writing the new manifest. Without `--execute`, `manifest.json` and the cost estimate are still produced so the experiment can be reviewed before making provider calls.
 
