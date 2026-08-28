@@ -1,0 +1,7 @@
+{
+  "models": [
+    {"provider": "opencode-go", "id": "glm-5.3-flash", "modalities": ["text"]},
+    {"provider": "opencode-go", "id": "deepseek-v4-flash-vision-exp", "modalities": ["text", "image"]},
+    {"provider": "kimi-code", "id": "k3-256k", "modalities": ["text"]}
+  ]
+}

@@ -1,0 +1,4 @@
+interface:
+  display_name: "OMP RoleBench"
+  short_description: "Benchmark OMP models across roles and assignments"
+  default_prompt: "Benchmark selected OMP models across all or selected roles."

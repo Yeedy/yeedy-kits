@@ -1,0 +1,3 @@
+assignment:
+  smol: opencode-go/glm-5.3-flash:high
+  task: opencode-go/deepseek-v4-flash-vision-exp:high

@@ -24,6 +24,12 @@
 
 详见 [optimize-agent-memory/SKILL.md](optimize-agent-memory/SKILL.md)。
 
+### omp-rolebench
+
+对 Oh My Pi 的模型与 `modelRoles` 做可重复 benchmark。支持全量/供应商/显式模型筛选、全部/指定角色、单角色隔离和全角色同模型分配，并在执行前展示方案、估算成本并要求确认，最后输出 JSONL 原始结果与 Markdown 报告。
+
+详见 [omp-rolebench/SKILL.md](omp-rolebench/SKILL.md)。
+
 ## Repository Layout
 
 ```text

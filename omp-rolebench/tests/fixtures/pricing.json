@@ -1,0 +1,6 @@
+{
+  "fake/model": {
+    "input_per_million": 0.075,
+    "output_per_million": 0.25
+  }
+}
