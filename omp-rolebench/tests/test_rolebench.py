@@ -285,6 +285,17 @@ class RoleBenchTests(unittest.TestCase):
             self.assertIn("task/p/a:high", payload["groups"])
             self.assertIn("task/p/a:low", payload["groups"])
 
+    def test_report_markdown_closes_thinking_cell(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "manifest.json").write_text(json.dumps({"generated_at": "now", "mode": "role-isolated", "roles": ["task"], "assignments": []}), encoding="utf-8")
+            row = {"role": "task", "model": "p/a", "thinking": "high", "status": "pass", "latency_ms": 1, "output": "ok"}
+            (root / "results.jsonl").write_text(json.dumps(row) + "\n", encoding="utf-8")
+            output = root / "report.md"
+            self.assertEqual(rolebench.main(["report", "--run", str(root), "--format", "markdown", "--output", str(output)]), 0)
+            report = output.read_text(encoding="utf-8")
+            self.assertIn("| `task` | `p/a` | `high` |", report)
+
     def test_fake_executor_end_to_end(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

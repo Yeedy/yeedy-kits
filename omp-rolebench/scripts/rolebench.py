@@ -896,7 +896,7 @@ def report_command(args: argparse.Namespace) -> int:
         avg_output = f"{sum(output_size) / len(output_size):.1f}" if output_size else "0"
         rate = f"{passes / len(values):.1%}" if values else "0.0%"
         total_cost = f"${sum(costs):.6f}" if costs else "unknown"
-        lines.append(f"| `{role}` | `{model}` | `{thinking or '-'} | {len(values)} | {passes} | {errors} | {rate} | {p50_text} | {p95_text} | {avg_output} | {total_cost} |")
+        lines.append(f"| `{role}` | `{model}` | `{thinking or '-'}` | {len(values)} | {passes} | {errors} | {rate} | {p50_text} | {p95_text} | {avg_output} | {total_cost} |")
     if not rows:
         lines.extend(["", "No executed results found. This run contains a matrix preview only."])
     report = "\n".join(lines) + "\n"
