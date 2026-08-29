@@ -620,6 +620,24 @@ def resolve_roles(value: str, config_file: Path, require_config: bool = False) -
     return roles, baseline
 
 
+def resolve_judge_model(args: argparse.Namespace, config_file: Path) -> tuple[str | None, str | None]:
+    explicit = getattr(args, "judge_model", None)
+    if explicit:
+        parse_selector(explicit)
+        return explicit, "explicit"
+    if not getattr(args, "recommend", False):
+        return None, None
+    try:
+        configured_roles = parse_model_roles(config_file)
+    except RoleBenchError as exc:
+        raise RoleBenchError("--recommend requires --judge-model or a configured modelRoles.default") from exc
+    default_model = configured_roles.get("default")
+    if not default_model:
+        raise RoleBenchError("--recommend requires --judge-model or modelRoles.default in the OMP config")
+    parse_selector(default_model)
+    return default_model, "default-role"
+
+
 def resolve_candidates(args: argparse.Namespace) -> tuple[list[dict[str, Any]], Any]:
     explicit = split_csv(args.models) + [item for value in (args.model or []) for item in split_csv(value)]
     providers = split_csv(args.providers)
@@ -1578,7 +1596,47 @@ def write_workspace_artifacts(output_dir: Path, artifacts_root: Path, identity: 
     }
 
 
+def omp_completed_messages(payload: Any) -> list[dict[str, Any]] | None:
+    if isinstance(payload, list):
+        events = payload
+    elif isinstance(payload, dict) and payload.get("type") in {"message_start", "message_end"}:
+        events = [payload]
+    elif isinstance(payload, dict) and isinstance(payload.get("events"), list):
+        events = payload["events"]
+    else:
+        return None
+    saw_message_event = False
+    messages = []
+    for event in events:
+        if not isinstance(event, dict) or event.get("type") not in {"message_start", "message_end"}:
+            continue
+        saw_message_event = True
+        message = event.get("message")
+        if event.get("type") == "message_end" and isinstance(message, dict):
+            messages.append(message)
+    return messages if saw_message_event else None
+
+
+def message_text(message: dict[str, Any]) -> str:
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, dict):
+        content = [content]
+    if not isinstance(content, list):
+        return ""
+    chunks = []
+    for item in content:
+        if isinstance(item, dict) and item.get("type") == "text" and isinstance(item.get("text"), str):
+            chunks.append(item["text"])
+    return "".join(chunks)
+
+
 def extract_output(payload: Any) -> str:
+    completed_messages = omp_completed_messages(payload)
+    if completed_messages is not None:
+        answers = [message_text(message) for message in completed_messages if message.get("role") == "assistant"]
+        return next((answer for answer in reversed(answers) if answer.strip()), "")
     if isinstance(payload, str):
         return payload
     if isinstance(payload, dict):
@@ -1601,7 +1659,33 @@ def extract_output(payload: Any) -> str:
     return ""
 
 
+def aggregate_usage(usages: list[dict[str, Any]]) -> dict[str, Any] | None:
+    if not usages:
+        return None
+    aggregate: dict[str, Any] = {}
+    for key in ("input", "output", "cacheRead", "cacheWrite", "totalTokens", "reasoningTokens"):
+        values = [usage.get(key) for usage in usages]
+        numeric = [value for value in values if isinstance(value, (int, float)) and not isinstance(value, bool)]
+        if numeric:
+            aggregate[key] = sum(numeric)
+    cost: dict[str, Any] = {}
+    for key in ("input", "output", "cacheRead", "cacheWrite", "total"):
+        values = [usage.get("cost", {}).get(key) for usage in usages if isinstance(usage.get("cost"), dict)]
+        numeric = [value for value in values if isinstance(value, (int, float)) and not isinstance(value, bool)]
+        if numeric:
+            cost[key] = sum(numeric)
+    if cost:
+        aggregate["cost"] = cost
+    return aggregate or None
+
+
 def extract_usage(payload: Any) -> dict[str, Any] | None:
+    completed_messages = omp_completed_messages(payload)
+    if completed_messages is not None:
+        assistant_messages = [message for message in completed_messages if message.get("role") == "assistant"]
+        if not assistant_messages or any(not isinstance(message.get("usage"), dict) for message in assistant_messages):
+            return None
+        return aggregate_usage([message["usage"] for message in assistant_messages])
     if isinstance(payload, dict):
         for key in ("usage", "cost"):
             value = payload.get(key)
@@ -1619,20 +1703,62 @@ def extract_usage(payload: Any) -> dict[str, Any] | None:
     return None
 
 
+def parse_fixed_judge_document(text: str) -> dict[str, Any]:
+    stripped = text.strip()
+    fence = re.fullmatch(r"```(?:json)?\s*\n(.*?)\n```", stripped, re.DOTALL | re.IGNORECASE)
+    if fence:
+        stripped = fence.group(1).strip()
+    try:
+        payload = json.loads(stripped)
+    except (json.JSONDecodeError, RecursionError) as exc:
+        raise RoleBenchError(f"fixed judge returned invalid JSON: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise RoleBenchError("fixed judge output must be a JSON object")
+    return payload
+
+
+def normalize_fixed_judge_dimensions(payload: dict[str, Any], requested_dimensions: list[str]) -> dict[str, Any]:
+    dimensions: Any = payload.get("dimensions")
+    if dimensions is None and isinstance(payload.get("evaluation"), dict):
+        evaluation = payload["evaluation"]
+        dimensions = evaluation.get("dimensions", evaluation)
+    if dimensions is None:
+        flat = {name: payload[name] for name in requested_dimensions if isinstance(payload.get(name), dict)}
+        dimensions = flat or None
+    if isinstance(dimensions, list):
+        normalized = {}
+        for item in dimensions:
+            if not isinstance(item, dict):
+                raise RoleBenchError("fixed judge dimension list entries must be objects")
+            name = item.get("name", item.get("dimension"))
+            if not isinstance(name, str) or not name:
+                raise RoleBenchError("fixed judge dimension list entries need name or dimension")
+            if name in normalized:
+                raise RoleBenchError(f"fixed judge returned duplicate dimension: {name}")
+            normalized[name] = {key: value for key, value in item.items() if key not in {"name", "dimension"}}
+        dimensions = normalized
+    if not isinstance(dimensions, dict):
+        raise RoleBenchError("fixed judge output must contain dimensions")
+    return dimensions
+
+
 def extract_cost(usage: Any) -> float | None:
     if isinstance(usage, dict):
         nested = usage.get("cost")
-        if nested is not None:
-            found = extract_cost(nested)
-            if found is not None:
-                return found
+        if isinstance(nested, dict):
+            for key in ("total", "totalCost", "total_cost", "usd", "amount"):
+                value = nested.get(key)
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    return float(value)
+        elif isinstance(nested, (int, float)) and not isinstance(nested, bool):
+            return float(nested)
         for key in ("total", "totalCost", "total_cost", "usd", "amount"):
             value = usage.get(key)
-            if isinstance(value, (int, float)):
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
                 if key == "total" and any(token_key in usage for token_key in ("input", "output", "inputTokens", "outputTokens", "totalTokens", "reasoningTokens")):
                     continue
                 return float(value)
-    if isinstance(usage, (int, float)):
+    if isinstance(usage, (int, float)) and not isinstance(usage, bool):
         return float(usage)
     return None
 
@@ -1954,16 +2080,23 @@ def run_fixed_judge(omp_bin: str, judge_model: str, task: dict[str, Any], result
             return raw, build_judge_evaluation(task, result, raw, None, raw["error"])
         payload = parse_json_output(raw["stdout"])
         judge_text = extract_output(payload)
-        candidate = payload if isinstance(payload, dict) and isinstance(payload.get("dimensions"), dict) else json.loads(judge_text)
-        if not isinstance(candidate, dict) or not isinstance(candidate.get("dimensions"), dict):
-            raise RoleBenchError("fixed judge output must contain a dimensions object")
+        requested_dimensions = fixed_judge_dimensions(task)
+        direct_judge_payload = isinstance(payload, dict) and (
+            "dimensions" in payload
+            or isinstance(payload.get("evaluation"), dict)
+            or any(isinstance(payload.get(name), dict) for name in requested_dimensions)
+        )
+        candidate = payload if direct_judge_payload else parse_fixed_judge_document(judge_text)
+        if direct_judge_payload and not judge_text:
+            judge_text = json.dumps(candidate, ensure_ascii=False)
+        dimensions = normalize_fixed_judge_dimensions(candidate, requested_dimensions)
         raw["output"] = judge_text
         usage = extract_usage(payload)
         if usage is not None:
             raw["usage"] = usage
         raw["status"] = "pass"
         raw["execution_status"] = "completed"
-        return raw, build_judge_evaluation(task, result, raw, candidate["dimensions"])
+        return raw, build_judge_evaluation(task, result, raw, dimensions)
     except subprocess.TimeoutExpired as exc:
         raw["error_type"] = "judge_timeout"
         raw["error"] = f"fixed judge exceeded {timeout}s"
@@ -2017,7 +2150,13 @@ def format_plan(manifest: dict[str, Any]) -> str:
     if fixed_judge.get("enabled"):
         judge_estimate = estimate.get("judge", {})
         judge_tokens = f"tokens input {judge_estimate.get('input_tokens', 0)}, output {judge_estimate.get('output_tokens', 0)}"
-        lines.insert(9, f"- fixed judge: {fixed_judge.get('model')} / rubric {fixed_judge.get('rubric_version')} ({judge_estimate.get('calls', 0)} request(s), {judge_tokens}, ${judge_estimate.get('cost_usd'):.6f} estimated)" if judge_estimate.get("cost_usd") is not None else f"- fixed judge: {fixed_judge.get('model')} / rubric {fixed_judge.get('rubric_version')} ({judge_estimate.get('calls', 0)} request(s), {judge_tokens}, cost unknown)")
+        source = {"default-role": "default role", "explicit": "explicit override"}.get(fixed_judge.get("model_source"), "configured")
+        judge_line = f"- fixed judge: {fixed_judge.get('model')} ({source}) / rubric {fixed_judge.get('rubric_version')} ({judge_estimate.get('calls', 0)} request(s), {judge_tokens}, "
+        if judge_estimate.get("cost_usd") is not None:
+            judge_line += f"${judge_estimate['cost_usd']:.6f} estimated)"
+        else:
+            judge_line += "cost unknown)"
+        lines.insert(9, judge_line)
     if manifest.get("recommend"):
         lines.append(f"- recommendations: enabled after {manifest.get('min_recommendation_runs', 3)} run(s) per task and deterministic/fixed-judge hard gates")
     for item in manifest.get("evaluation", {}).get("command_argvs", []):
@@ -2433,11 +2572,9 @@ def run_command(args: argparse.Namespace) -> int:
     assignments = build_assignments(args.mode, roles, baseline, candidates, args.assignment_file)
     supplied_pricing = load_pricing(args.pricing_file)
     pricing = candidate_pricing(candidates, supplied_pricing)
-    judge_model = getattr(args, "judge_model", None)
+    judge_model, judge_model_source = resolve_judge_model(args, config_path)
     recommend = bool(getattr(args, "recommend", False))
     min_recommendation_runs = int(getattr(args, "min_recommendation_runs", 3))
-    if recommend and not judge_model:
-        raise RoleBenchError("--recommend requires --judge-model")
     if min_recommendation_runs < 1:
         raise RoleBenchError("--min-recommendation-runs must be >= 1")
     estimate = estimate_benchmark(roles, assignments, tasks, args.runs, pricing)
@@ -2495,6 +2632,7 @@ def run_command(args: argparse.Namespace) -> int:
         "previous_judge_evaluations": previous_judge_evaluations,
         "previous_recommendations": previous_recommendations,
         "judge_model": judge_model,
+        "judge_model_source": judge_model_source,
         "judge_timeout": getattr(args, "judge_timeout", FIXED_JUDGE_TIMEOUT),
         "recommend": recommend,
         "min_recommendation_runs": min_recommendation_runs,
@@ -2511,6 +2649,7 @@ def run_command(args: argparse.Namespace) -> int:
             "fixed_judge": {
                 "enabled": bool(judge_model),
                 "model": judge_model,
+                "model_source": judge_model_source,
                 "rubric_version": FIXED_JUDGE_RUBRIC_VERSION,
                 "schema_version": FIXED_JUDGE_SCHEMA_VERSION,
                 "cost_usd": judge_estimate["cost_usd"],

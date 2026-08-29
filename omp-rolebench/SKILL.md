@@ -49,7 +49,7 @@ python3 omp-rolebench/scripts/rolebench.py run \
   --output runs/20260828-120000
 ```
 
-Add the V2 fixed judge and gated role recommendations only after reviewing the combined estimate:
+Add the V2 fixed judge and gated role recommendations only after reviewing the combined estimate. If `--judge-model` is omitted, recommendations use the model configured for `modelRoles.default` as the judge:
 
 ```bash
 python3 omp-rolebench/scripts/rolebench.py run \
@@ -58,7 +58,6 @@ python3 omp-rolebench/scripts/rolebench.py run \
   --mode role-isolated \
   --suite core \
   --runs 3 \
-  --judge-model opencode-go/glm-5.3-flash \
   --min-recommendation-runs 3 \
   --pricing-file pricing.json \
   --max-cost-usd 0.50 \
@@ -68,9 +67,9 @@ python3 omp-rolebench/scripts/rolebench.py run \
 
 ## Consent and budget gate
 
-Before any provider call, show the user a short plan containing the candidate models, roles, assignment mode, executor, task count, repeat count, request count, estimated input/output tokens, estimated USD cost, deterministic evaluation dimensions, and any exact command-check argv. When `--judge-model` is present, include the fixed-judge model, rubric version, request count, token estimate, and cost; the displayed total and `--max-cost-usd` gate cover both candidate and judge calls. Ask for explicit approval in the conversation. If the user states a budget in natural language (for example, "benchmark cost must stay below $0.50"), convert it to `--max-cost-usd 0.50` and repeat the cap in the confirmation request.
+Before any provider call, show the user a short plan containing the candidate models, roles, assignment mode, executor, task count, repeat count, request count, estimated input/output tokens, estimated USD cost, deterministic evaluation dimensions, and any exact command-check argv. When a fixed judge is enabled, include the judge model, whether it came from `modelRoles.default` or an explicit `--judge-model` override, rubric version, request count, token estimate, and cost; the displayed total and `--max-cost-usd` gate cover both candidate and judge calls. Ask for explicit approval in the conversation. Before executing, the user can name a different judge model; rerun the preview with `--judge-model provider/model[:thinking]` and obtain consent for that revised plan. If the user states a budget in natural language (for example, "benchmark cost must stay below $0.50"), convert it to `--max-cost-usd 0.50` and repeat the cap in the confirmation request.
 
-The command also enforces the gate: `--execute` without `--confirm` writes the manifest and estimate but exits without making requests. Only pass `--confirm` after the user approves that exact plan. Task fixtures with command checks require a separate `--allow-check-command` flag after the displayed argv has been reviewed; the commands are trusted local code, not a sandbox. A fixed judge always requires a known judge price before execution, even without a cap. A supplied `--max-cost-usd` additionally requires known prices for every candidate and the judge; an unknown estimate, or an estimate above the cap, blocks execution. Pricing files use USD per million tokens:
+The command also enforces the gate: `--execute` without `--confirm` writes the manifest and estimate but exits without making requests. Only pass `--confirm` after the user approves that exact plan. Task fixtures with command checks require a separate `--allow-check-command` flag after the displayed argv has been reviewed; the commands are trusted local code, not a sandbox. A fixed judge always requires a known judge price before execution, even without a cap. `--recommend` without `--judge-model` resolves the judge from `modelRoles.default` and fails early if that role is not configured. A supplied `--max-cost-usd` additionally requires known prices for every candidate and the judge; an unknown estimate, or an estimate above the cap, blocks execution. Pricing files use USD per million tokens:
 
 ```json
 {
@@ -116,7 +115,7 @@ Use `--task-source recent` to generate one task per selected role and workspace 
 
 If `--tasks-file` is provided, it takes precedence over `--task-source`.
 
-`--execute` invokes `omp -p --mode json --no-session` and appends each raw result immediately to `results.jsonl`. It then writes the independent quality result to `evaluations.jsonl`. Each cell gets a temporary config overlay and workspace; the user's normal config is never changed. Before/after hashes, changed paths, and small UTF-8 text patches are retained under `artifacts/<run-id>/`. Reusing an output directory rotates existing result and evaluation JSONL files before writing the new manifest. Without `--execute`, `manifest.json` and the combined cost estimate are still produced so the experiment can be reviewed before making provider calls.
+`--execute` invokes `omp -p --mode json --no-session` and appends each raw result immediately to `results.jsonl`. For OMP event streams, the harness records only the last completed assistant text as model output and sums usage from every completed assistant message in the cell; user prompts and tool results are not treated as answers or costs. It then writes the independent quality result to `evaluations.jsonl`. Each cell gets a temporary config overlay and workspace; the user's normal config is never changed. Before/after hashes, changed paths, and small UTF-8 text patches are retained under `artifacts/<run-id>/`. Reusing an output directory rotates existing result and evaluation JSONL files before writing the new manifest. Without `--execute`, `manifest.json` and the combined cost estimate are still produced so the experiment can be reviewed before making provider calls.
 
 The default `direct` executor calls the selected model with a role contract prompt. Use `--executor delegated` for the closer-to-production subagent path: it creates a temporary project agent with the candidate model and asks an OMP controller to invoke that agent through the `task` tool. Delegated runs add controller overhead to latency, so compare like with like.
 
@@ -130,7 +129,7 @@ python3 omp-rolebench/scripts/rolebench.py report \
   --format markdown
 ```
 
-Reports show assignment counts, execution pass/error rates, latency, output size, thinking variants, task outcomes, per-dimension evidence status, hard-gate failures, fixed-judge results, and gated recommendations when requested. Recommendation reports include candidate-level blocking reasons, evaluated hard dimensions, and links to raw/evaluation/artifact evidence. Treat cost as unknown unless the provider returns usage/cost data; unknown cost is reported as unknown rather than inferred. See [evaluation-v2.md](references/evaluation-v2.md) for the fixed-judge and recommendation artifacts.
+Reports show assignment counts, execution pass/error rates, latency, output size, thinking variants, task outcomes, per-dimension evidence status, hard-gate failures, fixed-judge results, and gated recommendations when requested. Recommendation reports include candidate-level blocking reasons, evaluated hard dimensions, and links to raw/evaluation/artifact evidence. Treat cost as unknown unless completed assistant events contain usage/cost data; multi-turn assistant costs are summed, while missing usage remains unknown rather than inferred. See [evaluation-v2.md](references/evaluation-v2.md) for the fixed-judge and recommendation artifacts.
 
 ## Guardrails
 

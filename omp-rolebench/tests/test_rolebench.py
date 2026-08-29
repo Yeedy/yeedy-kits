@@ -72,7 +72,48 @@ class RoleBenchTests(unittest.TestCase):
 
     def test_cost_extraction_does_not_confuse_token_total(self):
         self.assertEqual(rolebench.extract_cost({"input": 2, "output": 3, "cost": {"total": 0.012}}), 0.012)
+        self.assertEqual(rolebench.extract_cost({"input": 2, "output": 3, "cost": {"input": 0.004, "output": 0.008, "total": 0.012}}), 0.012)
         self.assertIsNone(rolebench.extract_cost({"input": 2, "output": 3, "total": 5}))
+
+    def test_omp_event_stream_uses_assistant_output_and_aggregates_usage(self):
+        payload = [
+            {
+                "type": "message_end",
+                "message": {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "PROMPT"}],
+                    "usage": {"input": 0, "output": 0, "totalTokens": 0, "cost": {"total": 0}},
+                },
+            },
+            {
+                "type": "message_end",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "toolCall", "name": "read"}],
+                    "usage": {"input": 10, "output": 2, "totalTokens": 12, "cost": {"input": 0.1, "output": 0.02, "total": 0.12}},
+                },
+            },
+            {
+                "type": "message_end",
+                "message": {"role": "toolResult", "content": [{"type": "text", "text": "TOOL OUTPUT"}]},
+            },
+            {
+                "type": "message_end",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "thinking", "thinking": "private"}, {"type": "text", "text": "FINAL"}],
+                    "usage": {"input": 20, "output": 4, "reasoningTokens": 1, "totalTokens": 24, "cost": {"input": 0.2, "output": 0.04, "total": 0.24}},
+                },
+            },
+        ]
+        self.assertEqual(rolebench.extract_output(payload), "FINAL")
+        usage = rolebench.extract_usage(payload)
+        self.assertEqual(usage["input"], 30)
+        self.assertEqual(usage["output"], 6)
+        self.assertEqual(usage["reasoningTokens"], 1)
+        self.assertAlmostEqual(rolebench.extract_cost(usage), 0.36)
+        payload[-1]["message"].pop("usage")
+        self.assertIsNone(rolebench.extract_usage(payload))
 
     def test_explicit_thinking_variants_remain_distinct(self):
         args = SimpleNamespace(models="p/a:high,p/a:low", model=None, providers="all", mode="role-isolated", assignment_file=None, omp_bin="missing", catalog_file=None)
@@ -150,6 +191,29 @@ class RoleBenchTests(unittest.TestCase):
         self.assertEqual(evaluation["hard_gate_status"], "unknown")
         self.assertEqual(evaluation["outcome"], "unknown")
 
+    def test_fixed_judge_normalizes_observed_equivalent_schemas(self):
+        requested = ["correctness", "honesty"]
+        item = {"status": "pass", "score": 2, "evidence": ["supported"]}
+        variants = [
+            {"dimensions": {"correctness": item, "honesty": item}},
+            {"dimensions": [{"name": "correctness", **item}, {"name": "honesty", **item}]},
+            {"dimensions": [{"dimension": "correctness", **item}, {"dimension": "honesty", **item}]},
+            {"correctness": item, "honesty": item},
+            {"evaluation": {"correctness": item, "honesty": item}, "overall": {"summary": "ok"}},
+        ]
+        for variant in variants:
+            with self.subTest(keys=list(variant)):
+                normalized = rolebench.normalize_fixed_judge_dimensions(variant, requested)
+                self.assertEqual(set(normalized), set(requested))
+                self.assertEqual(normalized["correctness"]["status"], "pass")
+        fenced = "```json\n" + json.dumps(variants[1]) + "\n```"
+        self.assertEqual(rolebench.parse_fixed_judge_document(fenced), variants[1])
+        with self.assertRaisesRegex(rolebench.RoleBenchError, "duplicate dimension"):
+            rolebench.normalize_fixed_judge_dimensions(
+                {"dimensions": [{"name": "correctness", **item}, {"dimension": "correctness", **item}]},
+                requested,
+            )
+
     @patch("rolebench.subprocess.run")
     def test_fixed_judge_keeps_raw_result_separate_from_evaluation(self, run):
         judge_payload = {
@@ -172,6 +236,27 @@ class RoleBenchTests(unittest.TestCase):
         self.assertIn("judge/model", command)
         self.assertIn("--thinking", command)
         self.assertIn("high", command)
+
+    @patch("rolebench.subprocess.run")
+    def test_fixed_judge_reads_final_assistant_event_and_list_dimensions(self, run):
+        judge_payload = {
+            "dimensions": [
+                {"dimension": "correctness", "status": "pass", "score": 2, "evidence": ["matched"]},
+            ]
+        }
+        events = [
+            {"type": "message_end", "message": {"role": "user", "content": [{"type": "text", "text": "PROMPT"}], "usage": {"cost": {"total": 0}}}},
+            {"type": "message_end", "message": {"role": "assistant", "content": [{"type": "text", "text": "```json\n" + json.dumps(judge_payload) + "\n```"}], "usage": {"input": 5, "output": 2, "totalTokens": 7, "cost": {"total": 0.01}}}},
+        ]
+        run.return_value = SimpleNamespace(returncode=0, stdout="\n".join(json.dumps(event) for event in events), stderr="")
+        task = {"id": "task-judge", "role": "task", "prompt": "do", "dimension_targets": ["correctness"]}
+        result = {"assignment_id": "a", "task_id": "task-judge", "role": "task", "model": "p/a", "replicate": 1, "execution_status": "completed", "output": "PASS"}
+        deterministic = {"execution_status": "completed", "outcome": "pass", "hard_gate_status": "pass", "checks": []}
+        raw, evaluation = rolebench.run_fixed_judge("omp", "judge/model", task, result, deterministic, timeout=5)
+        self.assertEqual(raw["status"], "pass")
+        self.assertNotIn("PROMPT", raw["output"])
+        self.assertEqual(rolebench.extract_cost(raw["usage"]), 0.01)
+        self.assertEqual(evaluation["dimensions"]["correctness"]["status"], "pass")
 
     @patch("rolebench.subprocess.run", side_effect=OSError("omp is missing"))
     def test_fixed_judge_marks_call_started_only_before_subprocess(self, run):
@@ -990,6 +1075,41 @@ class RoleBenchTests(unittest.TestCase):
             run.assert_not_called()
             summary = json.loads((root / "run" / "summary.json").read_text(encoding="utf-8"))
             self.assertEqual(summary["reason"], "judge_cost_unknown")
+
+    def test_recommendation_defaults_to_configured_default_role_judge(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = root / "config.yml"
+            args = self.make_run_args(root, config_file=str(config), judge_model=None, recommend=True, execute=False, confirm=False)
+            config.write_text("modelRoles:\n  default: judge/default:high\n  task: p/base\n", encoding="utf-8")
+            with patch.object(rolebench, "load_tasks", return_value=[{"id": "task-1", "role": "task", "prompt": "do", "dimension_targets": ["correctness"]}]):
+                self.assertEqual(rolebench.run_command(args), 0)
+            manifest = json.loads((root / "run" / "manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["judge_model"], "judge/default:high")
+            self.assertEqual(manifest["judge_model_source"], "default-role")
+            self.assertIn("judge/default:high (default role)", rolebench.format_plan(manifest))
+
+    def test_explicit_judge_model_overrides_default_role(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = root / "config.yml"
+            args = self.make_run_args(root, config_file=str(config), judge_model="judge/override", recommend=True, execute=False, confirm=False)
+            config.write_text("modelRoles:\n  default: judge/default\n  task: p/base\n", encoding="utf-8")
+            with patch.object(rolebench, "load_tasks", return_value=[{"id": "task-1", "role": "task", "prompt": "do", "dimension_targets": ["correctness"]}]):
+                self.assertEqual(rolebench.run_command(args), 0)
+            manifest = json.loads((root / "run" / "manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["judge_model"], "judge/override")
+            self.assertEqual(manifest["judge_model_source"], "explicit")
+
+    def test_recommendation_requires_default_role_when_judge_is_not_explicit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = root / "config.yml"
+            args = self.make_run_args(root, config_file=str(config), judge_model=None, recommend=True, execute=False, confirm=False)
+            config.write_text("modelRoles:\n  task: p/base\n", encoding="utf-8")
+            with patch.object(rolebench, "load_tasks", return_value=[{"id": "task-1", "role": "task", "prompt": "do", "dimension_targets": ["correctness"]}]):
+                with self.assertRaisesRegex(rolebench.RoleBenchError, "modelRoles.default"):
+                    rolebench.run_command(args)
 
     def test_recommendation_preview_does_not_write_unexecuted_result(self):
         with tempfile.TemporaryDirectory() as directory:
