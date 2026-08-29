@@ -234,8 +234,11 @@ class RoleBenchTests(unittest.TestCase):
         self.assertNotIn("secret/provider", prompt)
         command = run.call_args.args[0]
         self.assertIn("judge/model", command)
-        self.assertIn("--thinking", command)
-        self.assertIn("high", command)
+        thinking_index = command.index("--thinking")
+        cwd_index = command.index("--cwd")
+        self.assertEqual(command[thinking_index + 1], "high")
+        self.assertEqual(cwd_index, thinking_index + 2)
+        self.assertTrue(command[cwd_index + 1])
 
     @patch("rolebench.subprocess.run")
     def test_fixed_judge_reads_final_assistant_event_and_list_dimensions(self, run):
@@ -864,6 +867,29 @@ class RoleBenchTests(unittest.TestCase):
         command = run.call_args.args[0]
         self.assertIn("--tools", command)
         self.assertIn("task", command)
+        prompt = command[-1]
+        self.assertIn("do not background it", prompt)
+        self.assertIn("keep waiting until the result is delivered", prompt)
+
+    def test_tasks_file_resolves_relative_workspace_from_suite_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            suite = root / "suite" / "tasks.jsonl"
+            workspace = suite.parent / "fixtures" / "work"
+            workspace.mkdir(parents=True)
+            suite.write_text(
+                json.dumps({
+                    "schema_version": 1,
+                    "id": "portable-task",
+                    "role": "task",
+                    "prompt": "do it",
+                    "workspace": "fixtures/work",
+                }) + "\n",
+                encoding="utf-8",
+            )
+            args = SimpleNamespace(tasks_file=str(suite), task_source="core", suite="none")
+            tasks = rolebench.load_tasks(args, ["task"])
+            self.assertEqual(tasks[0]["workspace"], str(workspace.resolve()))
 
     @patch("rolebench.subprocess.run")
     def test_delegated_run_defaults_controller_without_unbound_error(self, run):

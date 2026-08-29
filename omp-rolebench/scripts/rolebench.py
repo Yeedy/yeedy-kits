@@ -931,7 +931,7 @@ def task_command_argvs(tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def load_tasks(args: argparse.Namespace, roles: list[str] | None = None) -> list[dict[str, Any]]:
     args.recent_work = None
     if args.tasks_file:
-        path = Path(args.tasks_file)
+        path = Path(args.tasks_file).expanduser().resolve()
         if path.suffix.lower() == ".jsonl":
             tasks = []
             try:
@@ -961,6 +961,11 @@ def load_tasks(args: argparse.Namespace, roles: list[str] | None = None) -> list
     for task in tasks:
         if not isinstance(task, dict) or not task.get("id") or not task.get("role") or not task.get("prompt"):
             raise RoleBenchError("each task must contain id, role, and prompt")
+        if args.tasks_file and isinstance(task.get("workspace"), str):
+            workspace = Path(task["workspace"]).expanduser()
+            if not workspace.is_absolute():
+                task = dict(task)
+                task["workspace"] = str((path.parent / workspace).resolve())
         normalized_task = normalize_task(task)
         if normalized_task["id"] in seen:
             raise RoleBenchError(f"duplicate task id: {normalized_task['id']}")
@@ -2053,11 +2058,10 @@ def run_fixed_judge(omp_bin: str, judge_model: str, task: dict[str, Any], result
                 "--no-title",
                 "--model",
                 judge_selector["selector"],
-                "--cwd",
             ]
             if judge_selector.get("thinking"):
                 judge_command.extend(["--thinking", judge_selector["thinking"]])
-            judge_command.extend([directory, "--auto-approve", prompt])
+            judge_command.extend(["--cwd", directory, "--auto-approve", prompt])
             raw["provider_call_started"] = True
             try:
                 completed = subprocess.run(
@@ -2435,7 +2439,11 @@ def run_one(omp_bin: str, assignment: dict[str, Any], task: dict[str, Any], repl
             agent_name = f"bench-{assignment['id'].replace('_', '-')}-{task['role']}-{replicate}"
             prompt = (
                 f"Use the task tool exactly once with agent={agent_name!r}. "
-                "Do not solve the assignment yourself. Return the delegated result verbatim.\n\n"
+                "Do not solve the assignment yourself. "
+                "Keep the delegated call synchronous: do not background it, and if it still "
+                "returns a job handle, keep waiting until the result is delivered. "
+                "You MUST NOT end your turn before you have the delegated final result. "
+                "Return the delegated result verbatim.\n\n"
                 f"Assignment for role {task['role']}:\n{task['prompt']}"
             )
             if image_args:
