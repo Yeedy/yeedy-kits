@@ -7,7 +7,7 @@ description: Benchmark Oh My Pi model-role assignments. Use when comparing all m
 
 ## Overview
 
-Use `scripts/rolebench.py` to discover the current OMP model catalog, resolve `modelRoles` from an OMP config, generate bounded assignment experiments, optionally execute tasks through OMP, and write raw results, deterministic evaluations, evidence artifacts, and a Markdown report. The harness never edits the user's OMP config; execution is opt-in because it can call metered providers.
+Use `scripts/rolebench.py` to discover the current OMP model catalog, resolve `modelRoles` from an OMP config, generate bounded assignment experiments, optionally execute tasks through OMP, and write raw results, deterministic evaluations, evidence artifacts, optional fixed-judge evaluations, and a Markdown report. The harness never edits the user's OMP config; execution is opt-in because it can call metered providers.
 
 ## Quick start
 
@@ -49,9 +49,26 @@ python3 omp-rolebench/scripts/rolebench.py run \
   --output runs/20260828-120000
 ```
 
+Add the V2 fixed judge and gated role recommendations only after reviewing the combined estimate:
+
+```bash
+python3 omp-rolebench/scripts/rolebench.py run \
+  --models opencode-go/glm-5.3-flash,opencode-go/deepseek-v4-flash-vision-exp \
+  --roles smol,task,advisor \
+  --mode role-isolated \
+  --suite core \
+  --runs 3 \
+  --judge-model opencode-go/glm-5.3-flash \
+  --min-recommendation-runs 3 \
+  --pricing-file pricing.json \
+  --max-cost-usd 0.50 \
+  --execute --confirm --recommend \
+  --output runs/v2-20260829
+```
+
 ## Consent and budget gate
 
-Before any provider call, show the user a short plan containing the candidate models, roles, assignment mode, executor, task count, repeat count, request count, estimated input/output tokens, estimated USD cost, deterministic evaluation dimensions, and any exact command-check argv. Ask for explicit approval in the conversation. If the user states a budget in natural language (for example, "benchmark cost must stay below $0.50"), convert it to `--max-cost-usd 0.50` and repeat the cap in the confirmation request.
+Before any provider call, show the user a short plan containing the candidate models, roles, assignment mode, executor, task count, repeat count, request count, estimated input/output tokens, estimated USD cost, deterministic evaluation dimensions, and any exact command-check argv. When `--judge-model` is present, include the fixed-judge model, rubric version, request count, token estimate, and cost; the displayed total and `--max-cost-usd` gate cover both candidate and judge calls. Ask for explicit approval in the conversation. If the user states a budget in natural language (for example, "benchmark cost must stay below $0.50"), convert it to `--max-cost-usd 0.50` and repeat the cap in the confirmation request.
 
 The command also enforces the gate: `--execute` without `--confirm` writes the manifest and estimate but exits without making requests. Only pass `--confirm` after the user approves that exact plan. Task fixtures with command checks require a separate `--allow-check-command` flag after the displayed argv has been reviewed; the commands are trusted local code, not a sandbox. A supplied `--max-cost-usd` requires known prices from `--pricing-file` or catalog metadata; an unknown estimate, or an estimate above the cap, blocks execution. Pricing files use USD per million tokens:
 
@@ -99,11 +116,11 @@ Use `--task-source recent` to generate one task per selected role and workspace 
 
 If `--tasks-file` is provided, it takes precedence over `--task-source`.
 
-`--execute` invokes `omp -p --mode json --no-session` and appends each raw result immediately to `results.jsonl`. It then writes the independent quality result to `evaluations.jsonl`. Each cell gets a temporary config overlay and workspace; the user's normal config is never changed. Before/after hashes, changed paths, and small UTF-8 text patches are retained under `artifacts/<run-id>/`. Reusing an output directory rotates existing result and evaluation JSONL files before writing the new manifest. Without `--execute`, `manifest.json` and the cost estimate are still produced so the experiment can be reviewed before making provider calls.
+`--execute` invokes `omp -p --mode json --no-session` and appends each raw result immediately to `results.jsonl`. It then writes the independent quality result to `evaluations.jsonl`. Each cell gets a temporary config overlay and workspace; the user's normal config is never changed. Before/after hashes, changed paths, and small UTF-8 text patches are retained under `artifacts/<run-id>/`. Reusing an output directory rotates existing result and evaluation JSONL files before writing the new manifest. Without `--execute`, `manifest.json` and the combined cost estimate are still produced so the experiment can be reviewed before making provider calls.
 
 The default `direct` executor calls the selected model with a role contract prompt. Use `--executor delegated` for the closer-to-production subagent path: it creates a temporary project agent with the candidate model and asks an OMP controller to invoke that agent through the `task` tool. Delegated runs add controller overhead to latency, so compare like with like.
 
-The V1 evaluator deterministically checks declared output contracts, file state, changed-path scope, failure-output patterns, and explicitly approved command results. Execution status, task outcome, dimension status, and hard gates remain separate. Incomplete execution, evaluator limits, missing evidence, and dimensions without applicable checks are `unknown` with a `null` score; no hard gate passes without evidence. Snapshot, artifact, or evaluator failures are recorded without overwriting a completed raw provider result. There is no composite score and V1 does not automatically recommend a model. A fixed judge or blind human review can later supplement deterministic evidence, but must not overwrite raw results.
+The V1 evaluator deterministically checks declared output contracts, file state, changed-path scope, failure-output patterns, and explicitly approved command results. With `--judge-model`, V2 sends a blinded task/output/evidence packet to a versioned fixed judge and writes `judge_results.jsonl` plus `judge_evaluations.jsonl`; malformed or incomplete judge evidence is `unknown` and never overwrites V1 results. Execution status, task outcome, dimension status, and hard gates remain separate. Incomplete execution, evaluator limits, missing evidence, and dimensions without applicable checks are `unknown` with a `null` score; no hard gate passes without evidence. Snapshot, artifact, or evaluator failures are recorded without overwriting a completed raw provider result. Add `--recommend` to write a recommendation only after every selected role has the minimum repeated runs and both deterministic and fixed-judge hard gates pass; blocked candidates retain their reasons. There is no composite score. Tool-trace reconstruction, host security isolation, and statistical significance remain outside this V2 slice. See [evaluation-v2.md](references/evaluation-v2.md) for the schema and limits.
 
 ## Reports
 
@@ -113,7 +130,7 @@ python3 omp-rolebench/scripts/rolebench.py report \
   --format markdown
 ```
 
-Reports show assignment counts, execution pass/error rates, latency, output size, thinking variants, task outcomes, per-dimension evidence status, and hard-gate failures. Treat cost as unknown unless the provider returns usage/cost data; unknown cost is reported as unknown rather than inferred.
+Reports show assignment counts, execution pass/error rates, latency, output size, thinking variants, task outcomes, per-dimension evidence status, hard-gate failures, fixed-judge results, and gated recommendations when requested. Treat cost as unknown unless the provider returns usage/cost data; unknown cost is reported as unknown rather than inferred. See [evaluation-v2.md](references/evaluation-v2.md) for the fixed-judge and recommendation artifacts.
 
 ## Guardrails
 
@@ -122,3 +139,4 @@ Reports show assignment counts, execution pass/error rates, latency, output size
 - Do not use a model's generated text as the sole judge of another model. Prefer deterministic invariants and blind human or fixed-judge review for quality.
 - Preserve raw stdout/stderr and exit codes. Provider failures, timeouts, and malformed JSON are data, not reasons to silently retry with another model.
 - Treat copied workspaces as isolation for repeatability, not as a host sandbox. Use disposable fixtures and review every command check before enabling it.
+- V1 has three tracked non-blocking limits: approved command capture is read-capped but not write-capped, rerun rotation happens before later gates, and regex-worker crashes are currently indistinguishable from non-matches. See [evaluation-v1.md](references/evaluation-v1.md) before relying on these paths for hostile inputs.

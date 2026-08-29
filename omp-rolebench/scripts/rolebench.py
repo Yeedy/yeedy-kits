@@ -220,6 +220,12 @@ COMMAND_OUTPUT_LIMIT = 1024 * 1024
 EVIDENCE_TEXT_LIMIT = 1000
 SAFE_COMMAND_ENV_KEYS = ("PATH", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "TMPDIR", "SYSTEMROOT", "PATHEXT")
 REGEX_WORKER = "import json,re,sys; pattern,text=json.load(sys.stdin); sys.exit(0 if re.search(pattern,text) else 1)"
+FIXED_JUDGE_SCHEMA_VERSION = 1
+FIXED_JUDGE_RUBRIC_VERSION = "rolebench-v2-20260829"
+FIXED_JUDGE_OUTPUT_TOKENS = 768
+FIXED_JUDGE_TIMEOUT = 180
+JUDGE_INPUT_LIMIT = 64 * 1024
+RECOMMENDATION_SCHEMA_VERSION = 1
 
 
 class RoleBenchError(Exception):
@@ -1693,6 +1699,256 @@ def estimate_benchmark(roles: list[str], assignments: list[dict[str, Any]], task
     }
 
 
+def fixed_judge_dimensions(task: dict[str, Any]) -> list[str]:
+    return list(dict.fromkeys(task.get("dimension_targets", [])))
+
+
+def build_fixed_judge_prompt(task: dict[str, Any], result: dict[str, Any], deterministic_evaluation: dict[str, Any]) -> str:
+    model_output = decode_subprocess_text(result.get("output", ""))
+    task_view = {
+        key: value
+        for key, value in task.items()
+        if key not in {"workspace", "image"}
+    }
+    evidence_view = {
+        "execution_status": deterministic_evaluation.get("execution_status"),
+        "outcome": deterministic_evaluation.get("outcome"),
+        "hard_gate_status": deterministic_evaluation.get("hard_gate_status"),
+        "checks": [
+            {
+                "type": check.get("type"),
+                "status": check.get("status"),
+                "evidence": check.get("evidence"),
+                "dimensions": check.get("dimensions"),
+            }
+            for check in deterministic_evaluation.get("checks", [])
+        ],
+    }
+    payload = {
+        "task": task_view,
+        "role": task.get("role"),
+        "execution": {
+            "status": result.get("execution_status") or deterministic_evaluation.get("execution_status"),
+            "output": evidence_text(model_output) if len(model_output) <= JUDGE_INPUT_LIMIT else model_output[:JUDGE_INPUT_LIMIT] + "...",
+            "error": result.get("error"),
+        },
+        "deterministic_evidence": evidence_view,
+    }
+    return (
+        "You are the fixed semantic evaluator for OMP RoleBench. "
+        f"Rubric version: {FIXED_JUDGE_RUBRIC_VERSION}. Return JSON only, with no markdown. "
+        "Evaluate the work against the task and available evidence, never infer hidden actions, "
+        "and mark unsupported claims unknown. For each requested dimension return status pass, fail, "
+        "or unknown; score must be 0 for fail, 2 for pass, and null for unknown; evidence must be a "
+        "short list of observable reasons. Do not identify or guess the provider model.\n\n"
+        + json.dumps(payload, ensure_ascii=False, indent=2)
+    )
+
+
+def estimate_fixed_judge(roles: list[str], assignments: list[dict[str, Any]], tasks: list[dict[str, Any]], runs: int, judge_model: str | None, pricing: dict[str, dict[str, float]]) -> dict[str, Any]:
+    if not judge_model:
+        return {"enabled": False, "model": None, "calls": 0, "input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0, "cost_status": "not-requested", "by_assignment": []}
+    rows = []
+    calls = 0
+    input_tokens = 0
+    output_tokens = 0
+    known_cost = 0.0
+    cost_known = True
+    selector = parse_selector(judge_model)["selector"]
+    for assignment in assignments:
+        applicable = [task for task in tasks if task_for_assignment(task, assignment)]
+        for task in applicable:
+            task_view = {key: value for key, value in task.items() if key not in {"workspace", "image"}}
+            task_tokens = math.ceil(len(json.dumps(task_view, ensure_ascii=False)) / 4)
+            estimated_model_output_tokens = min(int(task.get("max_output_tokens", 512)), JUDGE_INPUT_LIMIT // 4)
+            task_input = max(1, task_tokens + estimated_model_output_tokens + 300)
+            task_calls = runs
+            calls += task_calls
+            input_tokens += task_input * task_calls
+            output_tokens += FIXED_JUDGE_OUTPUT_TOKENS * task_calls
+            rates = pricing.get(selector, {})
+            if "input_per_million" in rates and "output_per_million" in rates:
+                known_cost += task_calls * (task_input * rates["input_per_million"] + FIXED_JUDGE_OUTPUT_TOKENS * rates["output_per_million"]) / 1_000_000
+            else:
+                cost_known = False
+            rows.append({
+                "assignment_id": assignment["id"],
+                "role": task["role"],
+                "calls": task_calls,
+                "input_tokens": task_input * task_calls,
+                "output_tokens": FIXED_JUDGE_OUTPUT_TOKENS * task_calls,
+            })
+    return {
+        "enabled": True,
+        "model": judge_model,
+        "calls": calls,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "cost_usd": round(known_cost, 8) if cost_known else None,
+        "cost_status": "estimated" if cost_known else "unknown",
+        "by_assignment": rows,
+    }
+
+
+def unknown_judge_dimensions(dimensions: list[str], evidence: str) -> dict[str, Any]:
+    return {
+        dimension: {
+            "status": "unknown",
+            "score": None,
+            "evidence": [evidence],
+            "evaluator": "fixed_judge",
+            "hard_gate": dimension in HARD_GATE_DIMENSIONS,
+        }
+        for dimension in dimensions
+    }
+
+
+def build_judge_evaluation(task: dict[str, Any], result: dict[str, Any], judge_result: dict[str, Any], dimensions_payload: dict[str, Any] | None, error: str | None = None) -> dict[str, Any]:
+    dimensions = fixed_judge_dimensions(task)
+    if error or not isinstance(dimensions_payload, dict):
+        dimensions_value = unknown_judge_dimensions(dimensions, error or "fixed judge returned no dimension object")
+    else:
+        dimensions_value = {}
+        for dimension in dimensions:
+            item = dimensions_payload.get(dimension)
+            if not isinstance(item, dict):
+                dimensions_value[dimension] = unknown_judge_dimensions([dimension], "fixed judge omitted this dimension")[dimension]
+                continue
+            status = item.get("status")
+            score = item.get("score")
+            if status not in {"pass", "fail", "unknown"}:
+                status = "unknown"
+            if status == "pass":
+                score = 2
+            elif status == "fail":
+                score = 0
+            else:
+                score = None
+            evidence = item.get("evidence", [])
+            if isinstance(evidence, str):
+                evidence = [evidence]
+            if not isinstance(evidence, list) or not all(isinstance(value, str) for value in evidence):
+                evidence = ["fixed judge evidence was malformed"]
+                status, score = "unknown", None
+            dimensions_value[dimension] = {
+                "status": status,
+                "score": score,
+                "evidence": [evidence_text(value) for value in evidence[:5]],
+                "evaluator": "fixed_judge",
+                "hard_gate": dimension in HARD_GATE_DIMENSIONS,
+            }
+    values = list(dimensions_value.values())
+    hard_values = [value for value in values if value["hard_gate"]]
+    if any(value["status"] == "fail" for value in hard_values):
+        hard_gate_status = "fail"
+    elif not hard_values or any(value["status"] == "unknown" for value in hard_values):
+        hard_gate_status = "unknown"
+    else:
+        hard_gate_status = "pass"
+    if any(value["status"] == "fail" for value in values):
+        outcome = "fail"
+    elif not values or any(value["status"] == "unknown" for value in values):
+        outcome = "unknown"
+    else:
+        outcome = "pass"
+    return {
+        "schema_version": FIXED_JUDGE_SCHEMA_VERSION,
+        "evaluation_status": "failed" if error else "completed",
+        "evaluator": "fixed_judge",
+        "rubric_version": FIXED_JUDGE_RUBRIC_VERSION,
+        "timestamp": now_iso(),
+        "assignment_id": result.get("assignment_id"),
+        "task_id": result.get("task_id", task.get("id")),
+        "role": result.get("role", task.get("role")),
+        "model": result.get("model", ""),
+        "thinking": result.get("thinking"),
+        "replicate": result.get("replicate"),
+        "execution_status": result.get("execution_status"),
+        "outcome": outcome,
+        "hard_gate_status": hard_gate_status,
+        "dimensions": dimensions_value,
+        "summary": dimensions_payload.get("summary") if isinstance(dimensions_payload, dict) and isinstance(dimensions_payload.get("summary"), str) else None,
+        "judge_result_id": judge_result.get("judge_result_id"),
+        "errors": [error] if error else [],
+    }
+
+
+def run_fixed_judge(omp_bin: str, judge_model: str, task: dict[str, Any], result: dict[str, Any], deterministic_evaluation: dict[str, Any], timeout: int = FIXED_JUDGE_TIMEOUT) -> tuple[dict[str, Any], dict[str, Any]]:
+    judge_result_id = f"{result.get('assignment_id', '')}:{result.get('task_id', '')}:{result.get('replicate', '')}"
+    raw: dict[str, Any] = {
+        "schema_version": FIXED_JUDGE_SCHEMA_VERSION,
+        "judge_result_id": judge_result_id,
+        "timestamp": now_iso(),
+        "assignment_id": result.get("assignment_id"),
+        "task_id": result.get("task_id", task.get("id")),
+        "role": result.get("role", task.get("role")),
+        "model": judge_model,
+        "replicate": result.get("replicate"),
+        "evaluator": "fixed_judge",
+        "rubric_version": FIXED_JUDGE_RUBRIC_VERSION,
+        "provider_call_started": True,
+        "status": "error",
+        "execution_status": "failed",
+    }
+    try:
+        prompt = build_fixed_judge_prompt(task, result, deterministic_evaluation)
+        judge_selector = parse_selector(judge_model)
+        raw["model"] = judge_selector["selector"]
+        raw["thinking"] = judge_selector.get("thinking")
+        with tempfile.TemporaryDirectory(prefix="omp-rolebench-judge-") as directory:
+            judge_command = [
+                omp_bin,
+                "-p",
+                "--mode",
+                "json",
+                "--no-session",
+                "--no-title",
+                "--model",
+                judge_selector["selector"],
+                "--cwd",
+            ]
+            if judge_selector.get("thinking"):
+                judge_command.extend(["--thinking", judge_selector["thinking"]])
+            judge_command.extend([directory, "--auto-approve", prompt])
+            completed = subprocess.run(
+                judge_command,
+                check=False,
+                capture_output=True,
+                text=True,
+                errors="replace",
+                timeout=timeout,
+            )
+        raw["exit_code"] = completed.returncode
+        raw["stdout"] = decode_subprocess_text(completed.stdout)
+        raw["stderr"] = decode_subprocess_text(completed.stderr)
+        if completed.returncode != 0:
+            raw["error_type"] = "judge_exit"
+            raw["error"] = raw["stderr"].strip() or f"fixed judge exited with {completed.returncode}"
+            return raw, build_judge_evaluation(task, result, raw, None, raw["error"])
+        payload = parse_json_output(raw["stdout"])
+        judge_text = extract_output(payload)
+        candidate = payload if isinstance(payload, dict) and isinstance(payload.get("dimensions"), dict) else json.loads(judge_text)
+        if not isinstance(candidate, dict) or not isinstance(candidate.get("dimensions"), dict):
+            raise RoleBenchError("fixed judge output must contain a dimensions object")
+        raw["output"] = judge_text
+        usage = extract_usage(payload)
+        if usage is not None:
+            raw["usage"] = usage
+        raw["status"] = "pass"
+        raw["execution_status"] = "completed"
+        return raw, build_judge_evaluation(task, result, raw, candidate["dimensions"])
+    except subprocess.TimeoutExpired as exc:
+        raw["error_type"] = "judge_timeout"
+        raw["error"] = f"fixed judge exceeded {timeout}s"
+        raw["stdout"] = decode_subprocess_text(exc.stdout)
+        raw["stderr"] = decode_subprocess_text(exc.stderr)
+        return raw, build_judge_evaluation(task, result, raw, None, raw["error"])
+    except (OSError, RoleBenchError, json.JSONDecodeError, RecursionError, TypeError, ValueError) as exc:
+        raw["error_type"] = "judge_invalid"
+        raw["error"] = str(exc)
+        return raw, build_judge_evaluation(task, result, raw, None, raw["error"])
+
+
 def candidate_pricing(candidates: list[dict[str, Any]], supplied: dict[str, dict[str, float]]) -> dict[str, dict[str, float]]:
     pricing = dict(supplied)
     for candidate in candidates:
@@ -1724,11 +1980,18 @@ def format_plan(manifest: dict[str, Any]) -> str:
         f"- assignments: {estimate['assignments']}",
         f"- requests: {estimate['calls']} ({manifest['runs']} run(s) per task)",
         f"- estimated tokens: input {estimate['input_tokens']}, output {estimate['output_tokens']}",
-        f"- estimated cost: {cost} ({estimate['cost_status']})",
+        f"- estimated model cost: {cost} ({estimate['cost_status']})",
+        f"- estimated total cost: {('$%.6f' % estimate['total_cost_usd']) if estimate.get('total_cost_usd') is not None else 'unknown'} ({estimate.get('total_cost_status', estimate['cost_status'])})",
         f"- cost cap: {cap_text}",
         f"- deterministic evaluator: {', '.join(manifest.get('evaluation', {}).get('dimension_targets', [])) or 'none'} (no model cost)",
         f"- trusted command checks: {manifest.get('evaluation', {}).get('command_checks', 0)} ({'enabled' if manifest.get('evaluation', {}).get('allow_check_command') else 'disabled'})",
     ]
+    fixed_judge = manifest.get("evaluation", {}).get("fixed_judge", {})
+    if fixed_judge.get("enabled"):
+        judge_estimate = estimate.get("judge", {})
+        lines.insert(9, f"- fixed judge: {fixed_judge.get('model')} / rubric {fixed_judge.get('rubric_version')} ({judge_estimate.get('calls', 0)} request(s), ${judge_estimate.get('cost_usd'):.6f} estimated)" if judge_estimate.get("cost_usd") is not None else f"- fixed judge: {fixed_judge.get('model')} / rubric {fixed_judge.get('rubric_version')} ({judge_estimate.get('calls', 0)} request(s), cost unknown)")
+    if manifest.get("recommend"):
+        lines.append(f"- recommendations: enabled after {manifest.get('min_recommendation_runs', 3)} run(s) per task and deterministic/fixed-judge hard gates")
     for item in manifest.get("evaluation", {}).get("command_argvs", []):
         lines.append(f"- command argv [{item['task_id']}/{item['check_id']}]: {json.dumps(item['argv'], ensure_ascii=False)}")
     recent_work = manifest.get("recent_work")
@@ -1757,6 +2020,128 @@ def percentile(values: list[float], probability: float) -> float | None:
     ordered = sorted(values)
     index = max(0, min(len(ordered) - 1, math.ceil(len(ordered) * probability) - 1))
     return ordered[index]
+
+
+def build_recommendations(
+    roles: list[str],
+    tasks: list[dict[str, Any]],
+    results: list[dict[str, Any]],
+    evaluations: list[dict[str, Any]],
+    judge_results: list[dict[str, Any]],
+    judge_evaluations: list[dict[str, Any]],
+    min_runs: int,
+) -> dict[str, Any]:
+    groups: dict[tuple[str, str, str], list[dict[str, Any]]] = defaultdict(list)
+    for evaluation in evaluations:
+        groups[(evaluation.get("role", ""), evaluation.get("model", ""), evaluation.get("thinking") or "")].append(evaluation)
+    raw_groups: dict[tuple[str, str, str], list[dict[str, Any]]] = defaultdict(list)
+    for result in results:
+        raw_groups[(result.get("role", ""), result.get("model", ""), result.get("thinking") or "")].append(result)
+    judge_by_cell = {
+        (evaluation.get("assignment_id"), evaluation.get("task_id"), evaluation.get("replicate")): evaluation
+        for evaluation in judge_evaluations
+    }
+    judge_raw_by_cell = {
+        (result.get("assignment_id"), result.get("task_id"), result.get("replicate")): result
+        for result in judge_results
+    }
+    candidates_by_role: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for (role, model, thinking), values in sorted(groups.items()):
+        counts = defaultdict(int)
+        for value in values:
+            counts[value.get("task_id")] += 1
+        blockers: list[str] = []
+        if not counts or min(counts.values()) < min_runs:
+            blockers.append(f"need at least {min_runs} runs per task")
+        deterministic_hard = [value.get("hard_gate_status") for value in values]
+        if any(status == "fail" for status in deterministic_hard):
+            blockers.append("deterministic hard gate failed")
+        elif not deterministic_hard or any(status != "pass" for status in deterministic_hard):
+            blockers.append("deterministic hard gate is not fully verified")
+        judge_values = [judge_by_cell.get((value.get("assignment_id"), value.get("task_id"), value.get("replicate"))) for value in values]
+        judge_values = [value for value in judge_values if value is not None]
+        if len(judge_values) < len(values):
+            blockers.append("fixed judge evidence is incomplete")
+        judge_hard_statuses = [
+            dimension.get("status")
+            for value in judge_values
+            for name, dimension in value.get("dimensions", {}).items()
+            if name in HARD_GATE_DIMENSIONS and isinstance(dimension, dict)
+        ]
+        if any(status == "fail" for status in judge_hard_statuses):
+            blockers.append("fixed judge hard gate failed")
+        elif not judge_hard_statuses or any(status != "pass" for status in judge_hard_statuses):
+            blockers.append("fixed judge hard gate is not fully verified")
+        scores = [
+            dimension.get("score")
+            for value in judge_values
+            for name, dimension in value.get("dimensions", {}).items()
+            if name not in HARD_GATE_DIMENSIONS and isinstance(dimension, dict) and isinstance(dimension.get("score"), (int, float))
+        ]
+        quality_score = round(sum(scores) / len(scores), 4) if scores else None
+        raw_values = raw_groups[(role, model, thinking)]
+        latency = [float(value["latency_ms"]) for value in raw_values if isinstance(value.get("latency_ms"), (int, float))]
+        model_costs = [cost for value in raw_values if (cost := extract_cost(value.get("usage"))) is not None]
+        judge_costs = [
+            cost
+            for value in judge_values
+            if (cost := extract_cost(judge_raw_by_cell.get((value.get("assignment_id"), value.get("task_id"), value.get("replicate")), {}).get("usage"))) is not None
+        ]
+        model_cost_known = bool(raw_values) and len(model_costs) == len(raw_values)
+        judge_cost_known = bool(judge_values) and len(judge_costs) == len(judge_values)
+        model_cost = round(sum(model_costs), 8) if model_cost_known else None
+        judge_cost = round(sum(judge_costs), 8) if judge_cost_known else None
+        total_cost = round(model_cost + judge_cost, 8) if model_cost is not None and judge_cost is not None else None
+        candidate = {
+            "role": role,
+            "model": model,
+            "thinking": thinking or None,
+            "samples": len(values),
+            "samples_per_task": dict(counts),
+            "deterministic_hard_gate": "pass" if deterministic_hard and all(status == "pass" for status in deterministic_hard) else "blocked",
+            "judge_hard_gate": "pass" if judge_hard_statuses and all(status == "pass" for status in judge_hard_statuses) else "blocked",
+            "quality_score": quality_score,
+            "p50_latency_ms": percentile(latency, 0.5),
+            "model_cost_usd": model_cost,
+            "judge_cost_usd": judge_cost,
+            "total_cost_usd": total_cost,
+            "cost_status": "observed" if total_cost is not None else "unknown",
+            "eligible": not blockers,
+            "blocked_reasons": blockers,
+        }
+        candidates_by_role[role].append(candidate)
+    role_recommendations = []
+    for role in roles:
+        candidates = candidates_by_role.get(role, [])
+        eligible = [candidate for candidate in candidates if candidate["eligible"]]
+        eligible.sort(key=lambda candidate: (
+            -(candidate["quality_score"] if candidate["quality_score"] is not None else -1),
+            candidate["p50_latency_ms"] if candidate["p50_latency_ms"] is not None else float("inf"),
+            candidate["total_cost_usd"] is None,
+            candidate["total_cost_usd"] if candidate["total_cost_usd"] is not None else float("inf"),
+        ))
+        winner = eligible[0] if eligible else None
+        role_recommendations.append({
+            "role": role,
+            "model": winner["model"] if winner else None,
+            "thinking": winner["thinking"] if winner else None,
+            "status": "recommended" if winner else "blocked",
+            "reason": (
+                "hard gates passed; highest fixed-judge quality score, then latency and cost"
+                if winner
+                else "no candidate met the minimum runs and hard-gate requirements"
+            ),
+            "candidate": winner,
+        })
+    return {
+        "schema_version": RECOMMENDATION_SCHEMA_VERSION,
+        "generated_at": now_iso(),
+        "evaluator": "deterministic+fixed_judge",
+        "min_runs_per_task": min_runs,
+        "status": "complete" if all(item["status"] == "recommended" for item in role_recommendations) else "blocked",
+        "roles": role_recommendations,
+        "candidates": [candidate for role in roles for candidate in candidates_by_role.get(role, [])],
+    }
 
 
 def output_copy_ignore(source: Path, output_dir: Path):
@@ -1998,13 +2383,36 @@ def run_command(args: argparse.Namespace) -> int:
     assignments = build_assignments(args.mode, roles, baseline, candidates, args.assignment_file)
     supplied_pricing = load_pricing(args.pricing_file)
     pricing = candidate_pricing(candidates, supplied_pricing)
+    judge_model = getattr(args, "judge_model", None)
+    recommend = bool(getattr(args, "recommend", False))
+    min_recommendation_runs = int(getattr(args, "min_recommendation_runs", 3))
+    if recommend and not judge_model:
+        raise RoleBenchError("--recommend requires --judge-model")
+    if min_recommendation_runs < 1:
+        raise RoleBenchError("--min-recommendation-runs must be >= 1")
     estimate = estimate_benchmark(roles, assignments, tasks, args.runs, pricing)
+    judge_estimate = estimate_fixed_judge(roles, assignments, tasks, args.runs, judge_model, pricing)
+    estimate["model_cost_usd"] = estimate["cost_usd"]
+    estimate["judge"] = judge_estimate
+    estimate["judge_cost_usd"] = judge_estimate["cost_usd"]
+    estimate["total_cost_usd"] = (
+        round((estimate["cost_usd"] or 0) + (judge_estimate["cost_usd"] or 0), 8)
+        if estimate["cost_status"] == "estimated" and judge_estimate["cost_status"] in {"estimated", "not-requested"}
+        else None
+    )
+    estimate["total_cost_status"] = "estimated" if estimate["total_cost_usd"] is not None else ("not-requested" if not judge_model and estimate["cost_status"] == "not-requested" else "unknown")
     output_dir = Path(args.output).expanduser()
     output_dir.mkdir(parents=True, exist_ok=True)
     results_path = output_dir / "results.jsonl"
     evaluations_path = output_dir / "evaluations.jsonl"
+    judge_results_path = output_dir / "judge_results.jsonl"
+    judge_evaluations_path = output_dir / "judge_evaluations.jsonl"
+    recommendations_path = output_dir / "recommendations.json"
     previous_results = rotate_stale_results(results_path)
     previous_evaluations = rotate_stale_results(evaluations_path)
+    previous_judge_results = rotate_stale_results(judge_results_path)
+    previous_judge_evaluations = rotate_stale_results(judge_evaluations_path)
+    previous_recommendations = rotate_stale_results(recommendations_path)
     command_checks = task_command_check_count(tasks)
     command_argvs = task_command_argvs(tasks)
     allow_check_command = bool(getattr(args, "allow_check_command", False))
@@ -2033,6 +2441,13 @@ def run_command(args: argparse.Namespace) -> int:
         "max_cost_usd": args.max_cost_usd,
         "previous_results": previous_results,
         "previous_evaluations": previous_evaluations,
+        "previous_judge_results": previous_judge_results,
+        "previous_judge_evaluations": previous_judge_evaluations,
+        "previous_recommendations": previous_recommendations,
+        "judge_model": judge_model,
+        "judge_timeout": getattr(args, "judge_timeout", FIXED_JUDGE_TIMEOUT),
+        "recommend": recommend,
+        "min_recommendation_runs": min_recommendation_runs,
         "artifact_run_id": artifact_run_id,
         "evaluation": {
             "evaluator": "deterministic",
@@ -2043,6 +2458,13 @@ def run_command(args: argparse.Namespace) -> int:
             "command_argvs": command_argvs,
             "allow_check_command": allow_check_command,
             "model_cost_usd": 0,
+            "fixed_judge": {
+                "enabled": bool(judge_model),
+                "model": judge_model,
+                "rubric_version": FIXED_JUDGE_RUBRIC_VERSION,
+                "schema_version": FIXED_JUDGE_SCHEMA_VERSION,
+                "cost_usd": judge_estimate["cost_usd"],
+            },
         },
         "estimate": estimate,
         "consent": {
@@ -2063,15 +2485,15 @@ def run_command(args: argparse.Namespace) -> int:
         print("Execution blocked: task fixtures contain command checks; review argv and add --allow-check-command.", file=sys.stderr)
         return 2
     if args.max_cost_usd is not None:
-        if estimate["cost_status"] != "estimated":
-            summary = {"run_dir": str(output_dir), "status": "blocked", "reason": "cost_unknown", "executed": False}
+        if estimate["total_cost_status"] != "estimated":
+            summary = {"run_dir": str(output_dir), "status": "blocked", "reason": "cost_unknown", "executed": False, "estimate": estimate}
             write_json(output_dir / "summary.json", summary)
-            print("Execution blocked: cost is unknown; provide --pricing-file with per-million-token rates.", file=sys.stderr)
+            print("Execution blocked: model or fixed-judge cost is unknown; provide --pricing-file with all rates.", file=sys.stderr)
             return 2
-        if estimate["cost_usd"] > args.max_cost_usd:
-            summary = {"run_dir": str(output_dir), "status": "blocked", "reason": "estimated_cost_exceeds_cap", "estimated_cost_usd": estimate["cost_usd"], "max_cost_usd": args.max_cost_usd, "executed": False}
+        if estimate["total_cost_usd"] > args.max_cost_usd:
+            summary = {"run_dir": str(output_dir), "status": "blocked", "reason": "estimated_cost_exceeds_cap", "estimated_cost_usd": estimate["total_cost_usd"], "model_cost_usd": estimate["cost_usd"], "judge_cost_usd": judge_estimate["cost_usd"], "max_cost_usd": args.max_cost_usd, "executed": False}
             write_json(output_dir / "summary.json", summary)
-            print(f"Execution blocked: estimated cost ${estimate['cost_usd']:.6f} exceeds cap ${args.max_cost_usd:.6f}.", file=sys.stderr)
+            print(f"Execution blocked: estimated total cost ${estimate['total_cost_usd']:.6f} exceeds cap ${args.max_cost_usd:.6f}.", file=sys.stderr)
             return 2
     if args.confirm and not args.execute:
         raise RoleBenchError("--confirm requires --execute")
@@ -2083,6 +2505,13 @@ def run_command(args: argparse.Namespace) -> int:
     result_rows = 0
     evaluation_rows = 0
     evaluation_write_errors = 0
+    judge_result_rows = 0
+    judge_evaluation_rows = 0
+    judge_write_errors = 0
+    executed_results: list[dict[str, Any]] = []
+    executed_evaluations: list[dict[str, Any]] = []
+    executed_judge_results: list[dict[str, Any]] = []
+    executed_judge_evaluations: list[dict[str, Any]] = []
     actual_cost = 0.0
     actual_cost_seen = False
     budget_status = "not-set" if args.max_cost_usd is None else "running"
@@ -2130,10 +2559,12 @@ def run_command(args: argparse.Namespace) -> int:
                         row["_evaluation"] = failed_evaluation(task, row, exc)
                     evaluation = row.pop("_evaluation", None)
                     append_result(results_path, row)
+                    executed_results.append(row)
                     result_rows += 1
                     if evaluation is not None:
                         try:
                             append_result(evaluations_path, evaluation)
+                            executed_evaluations.append(evaluation)
                             evaluation_rows += 1
                         except (OSError, TypeError, ValueError) as exc:
                             evaluation_write_errors += 1
@@ -2153,10 +2584,60 @@ def run_command(args: argparse.Namespace) -> int:
                             stopped_reason = "actual_cost_reached_cap"
                             stop = True
                             break
+                    if judge_model:
+                        judge_row, judge_evaluation = run_fixed_judge(
+                            args.omp_bin,
+                            judge_model,
+                            task,
+                            row,
+                            evaluation or failed_evaluation(task, row, "deterministic evaluation unavailable"),
+                            int(getattr(args, "judge_timeout", FIXED_JUDGE_TIMEOUT)),
+                        )
+                        try:
+                            append_result(judge_results_path, judge_row)
+                            executed_judge_results.append(judge_row)
+                            judge_result_rows += 1
+                        except (OSError, TypeError, ValueError) as exc:
+                            judge_write_errors += 1
+                            print(f"Fixed-judge row could not be written for {task['id']}: {exc}", file=sys.stderr)
+                        try:
+                            append_result(judge_evaluations_path, judge_evaluation)
+                            executed_judge_evaluations.append(judge_evaluation)
+                            judge_evaluation_rows += 1
+                        except (OSError, TypeError, ValueError) as exc:
+                            judge_write_errors += 1
+                            print(f"Fixed-judge evaluation could not be written for {task['id']}: {exc}", file=sys.stderr)
+                        judge_cost = extract_cost(judge_row.get("usage"))
+                        if judge_cost is not None:
+                            actual_cost += judge_cost
+                            actual_cost_seen = True
+                        if args.max_cost_usd is not None and judge_row.get("provider_call_started"):
+                            if judge_cost is None:
+                                budget_status = "unverifiable"
+                                stopped_reason = "fixed_judge_did_not_return_cost"
+                                stop = True
+                                break
+                            if actual_cost >= args.max_cost_usd:
+                                budget_status = "reached"
+                                stopped_reason = "actual_cost_reached_cap"
+                                stop = True
+                                break
                 if stop:
                     break
             if stop:
                 break
+    recommendations = None
+    if recommend and args.execute:
+        recommendations = build_recommendations(
+            roles,
+            tasks,
+            executed_results,
+            executed_evaluations,
+            executed_judge_results,
+            executed_judge_evaluations,
+            min_recommendation_runs,
+        )
+        write_json(recommendations_path, recommendations)
     summary = {
         "run_dir": str(output_dir),
         "status": "completed" if args.execute else "preview",
@@ -2165,8 +2646,14 @@ def run_command(args: argparse.Namespace) -> int:
         "result_rows": result_rows,
         "evaluation_rows": evaluation_rows,
         "evaluation_write_errors": evaluation_write_errors,
+        "judge_result_rows": judge_result_rows,
+        "judge_evaluation_rows": judge_evaluation_rows,
+        "judge_write_errors": judge_write_errors,
+        "recommendations": recommendations["status"] if recommendations else ("not-executed" if recommend else "not-requested"),
         "executed": bool(args.execute),
-        "estimated_cost_usd": estimate["cost_usd"],
+        "estimated_cost_usd": estimate["total_cost_usd"],
+        "estimated_model_cost_usd": estimate["cost_usd"],
+        "estimated_judge_cost_usd": judge_estimate["cost_usd"],
         "actual_cost_usd": round(actual_cost, 8) if args.execute and actual_cost_seen else None,
         "max_cost_usd": args.max_cost_usd,
         "budget_status": budget_status,
@@ -2182,6 +2669,9 @@ def report_command(args: argparse.Namespace) -> int:
     manifest_path = run_dir / "manifest.json"
     results_path = run_dir / "results.jsonl"
     evaluations_path = run_dir / "evaluations.jsonl"
+    judge_results_path = run_dir / "judge_results.jsonl"
+    judge_evaluations_path = run_dir / "judge_evaluations.jsonl"
+    recommendations_path = run_dir / "recommendations.json"
     manifest = load_json_document(manifest_path)
     def load_jsonl(path: Path, label: str) -> list[dict[str, Any]]:
         loaded = []
@@ -2201,6 +2691,9 @@ def report_command(args: argparse.Namespace) -> int:
 
     rows = load_jsonl(results_path, "results.jsonl")
     evaluations = load_jsonl(evaluations_path, "evaluations.jsonl")
+    judge_results = load_jsonl(judge_results_path, "judge_results.jsonl")
+    judge_evaluations = load_jsonl(judge_evaluations_path, "judge_evaluations.jsonl")
+    recommendations = load_json_document(recommendations_path) if recommendations_path.exists() else None
     groups: dict[tuple[str, str, str], list[dict[str, Any]]] = defaultdict(list)
     for row in rows:
         groups[(row.get("role", ""), row.get("model", ""), row.get("thinking") or "")].append(row)
@@ -2221,6 +2714,7 @@ def report_command(args: argparse.Namespace) -> int:
         f"- Assignments: {len(manifest.get('assignments', []))}",
         f"- Result rows: {len(rows)}",
         f"- Evaluation rows: {len(evaluations)}",
+        f"- Fixed-judge rows: {len(judge_evaluations)}",
         "",
         "## Execution",
         "",
@@ -2282,6 +2776,23 @@ def report_command(args: argparse.Namespace) -> int:
             for evaluation, check in failed_checks:
                 evidence = evidence_text(check.get("evidence", "")).replace("|", "\\|")
                 lines.append(f"- `{evaluation.get('task_id', '')}` / `{evaluation.get('model', '')}` / `{check.get('id', '')}`: {evidence}")
+    if judge_evaluations:
+        lines.extend([
+            "",
+            "## Fixed Judge",
+            "",
+            f"Rubric: `{judge_evaluations[0].get('rubric_version', 'unknown')}`",
+            "",
+            "| Role | Task | Model | Outcome | Hard gate | Summary |",
+            "|---|---|---|---|---|---|",
+        ])
+        for evaluation in judge_evaluations:
+            summary = evidence_text(evaluation.get("summary") or "").replace("|", "\\|")
+            lines.append(f"| `{evaluation.get('role', '')}` | `{evaluation.get('task_id', '')}` | `{evaluation.get('model', '')}` | {evaluation.get('outcome', 'unknown')} | {evaluation.get('hard_gate_status', 'unknown')} | {summary} |")
+    if isinstance(recommendations, dict):
+        lines.extend(["", "## Recommendations", "", f"Status: `{recommendations.get('status', 'unknown')}`", "", "| Role | Model | Thinking | Status | Reason |", "|---|---|---|---|---|"])
+        for item in recommendations.get("roles", []):
+            lines.append(f"| `{item.get('role', '')}` | `{item.get('model') or '-'}` | `{item.get('thinking') or '-'}` | {item.get('status', 'blocked')} | {evidence_text(item.get('reason', ''))} |")
     report = "\n".join(lines) + "\n"
     if args.format == "json":
         serializable_groups = {
@@ -2292,7 +2803,7 @@ def report_command(args: argparse.Namespace) -> int:
             f"{role}/{model}:{thinking}" if thinking else f"{role}/{model}": values
             for (role, model, thinking), values in evaluation_groups.items()
         }
-        rendered = json.dumps({"manifest": manifest, "groups": serializable_groups, "evaluations": evaluations, "evaluation_groups": serializable_evaluation_groups}, ensure_ascii=False, indent=2) + "\n"
+        rendered = json.dumps({"manifest": manifest, "groups": serializable_groups, "evaluations": evaluations, "evaluation_groups": serializable_evaluation_groups, "judge_results": judge_results, "judge_evaluations": judge_evaluations, "recommendations": recommendations}, ensure_ascii=False, indent=2) + "\n"
         if args.output:
             output = Path(args.output).expanduser()
             output.parent.mkdir(parents=True, exist_ok=True)
@@ -2359,6 +2870,10 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--allow-check-command", action="store_true", help="allow reviewed argv-based command checks from task fixtures")
     run.add_argument("--pricing-file", help="JSON rates keyed by provider/model, in USD per million input/output tokens")
     run.add_argument("--max-cost-usd", "--budget-usd", dest="max_cost_usd", type=float, help="maximum allowed estimated/observed benchmark cost in USD")
+    run.add_argument("--judge-model", help="fixed semantic judge provider/model selector; adds a separately budgeted judge call per cell")
+    run.add_argument("--judge-timeout", type=int, default=FIXED_JUDGE_TIMEOUT, help="fixed judge timeout in seconds")
+    run.add_argument("--recommend", action="store_true", help="write recommendations.json after fixed-judge evaluation")
+    run.add_argument("--min-recommendation-runs", type=int, default=3, help="minimum fixed runs per task before recommending a model")
     run.add_argument("--timeout", type=int, default=300)
     run.add_argument("--seed", type=int, default=0)
     run.add_argument("--output", required=True)
@@ -2386,6 +2901,10 @@ def main(argv: list[str] | None = None) -> int:
                 raise RoleBenchError("--recent-commits must be >= 1")
             if args.max_cost_usd is not None and args.max_cost_usd < 0:
                 raise RoleBenchError("--max-cost-usd must be >= 0")
+            if args.judge_timeout < 1:
+                raise RoleBenchError("--judge-timeout must be >= 1")
+            if args.min_recommendation_runs < 1:
+                raise RoleBenchError("--min-recommendation-runs must be >= 1")
             return run_command(args)
         if args.command == "report":
             return report_command(args)

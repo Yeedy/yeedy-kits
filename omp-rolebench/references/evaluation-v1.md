@@ -102,3 +102,11 @@ Snapshot, artifact, or evaluator failures are recorded as warnings or failed eva
 V1 has no stable OMP tool-event trace, fixed judge, or human rubric. It can detect file state, output contracts, changed-path scope, and reviewed command outcomes, but it must report subjective or unsupported dimensions as `unknown`. In particular, it cannot reliably prove whether a model actually ran a test merely from the final answer. Do not turn an `unknown` dimension into a model recommendation.
 
 OMP runs with a copied task workspace and temporary config, but this is not a host security sandbox. Use disposable fixtures and do not benchmark untrusted prompts or commands against sensitive host data.
+
+## Known non-blocking follow-ups
+
+These are tracked limitations for a later hardening pass and do not block the V1 closeout:
+
+- Command output is read back with a 1 MiB cap, but the temporary capture files are not currently write-capped. A runaway approved command could therefore consume substantial disk space during its timeout window.
+- A rerun still rotates existing `results.jsonl` and `evaluations.jsonl` before later gates run. A gate-blocked rerun can therefore move a previous run aside even though no provider call was made.
+- A runtime exception inside the regex worker is currently represented by exit code 1, which is interpreted as "did not match". Fixture compilation and the worker timeout keep the practical trigger surface small, but a future version should distinguish worker failure from a valid non-match.
