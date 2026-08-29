@@ -47,7 +47,7 @@ python3 omp-rolebench/scripts/rolebench.py run \
   --output runs/v2-20260829
 ```
 
-`--judge-timeout` controls the per-judge subprocess timeout. A cost cap requires known pricing for every candidate and the fixed judge. Consent is still required for the combined estimate; `--confirm` is not a substitute for showing the plan to the user.
+`--judge-timeout` controls the per-judge subprocess timeout. Execution with `--judge-model` always requires known pricing for the judge; when a cost cap is supplied, pricing must also be known for every candidate. Consent is still required for the combined estimate; `--confirm` is not a substitute for showing the plan to the user.
 
 ## Judge contract
 
@@ -68,7 +68,7 @@ RoleBench normalizes scores to `2` for pass, `0` for fail, and `null` for unknow
 - `judge_results.jsonl`: raw fixed-judge subprocess output, status, stderr, usage, and provider metadata.
 - `judge_evaluations.jsonl`: normalized dimension statuses, scores, evidence, hard-gate status, and rubric version.
 - `recommendations.json`: schema version, minimum-run requirement, each candidate's eligibility/blockers, and one recommendation record per selected role.
-- Markdown and JSON reports include fixed-judge rows and recommendations when those artifacts exist. They retain V1 outcomes and dimensions separately.
+- Markdown and JSON reports include fixed-judge rows and recommendations when those artifacts exist. Markdown recommendation tables retain candidate-level blocking reasons, hard-dimension coverage, and links to raw/evaluation/artifact evidence. They retain V1 outcomes and dimensions separately.
 
 Use the recommendation only when its status is `complete`. A `blocked` status is an actionable result: inspect the candidate-level reasons and the underlying raw/evaluation artifacts rather than treating the absence of a winner as a model failure.
 

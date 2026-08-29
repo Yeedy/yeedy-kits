@@ -70,7 +70,7 @@ python3 omp-rolebench/scripts/rolebench.py run \
 
 Before any provider call, show the user a short plan containing the candidate models, roles, assignment mode, executor, task count, repeat count, request count, estimated input/output tokens, estimated USD cost, deterministic evaluation dimensions, and any exact command-check argv. When `--judge-model` is present, include the fixed-judge model, rubric version, request count, token estimate, and cost; the displayed total and `--max-cost-usd` gate cover both candidate and judge calls. Ask for explicit approval in the conversation. If the user states a budget in natural language (for example, "benchmark cost must stay below $0.50"), convert it to `--max-cost-usd 0.50` and repeat the cap in the confirmation request.
 
-The command also enforces the gate: `--execute` without `--confirm` writes the manifest and estimate but exits without making requests. Only pass `--confirm` after the user approves that exact plan. Task fixtures with command checks require a separate `--allow-check-command` flag after the displayed argv has been reviewed; the commands are trusted local code, not a sandbox. A supplied `--max-cost-usd` requires known prices from `--pricing-file` or catalog metadata; an unknown estimate, or an estimate above the cap, blocks execution. Pricing files use USD per million tokens:
+The command also enforces the gate: `--execute` without `--confirm` writes the manifest and estimate but exits without making requests. Only pass `--confirm` after the user approves that exact plan. Task fixtures with command checks require a separate `--allow-check-command` flag after the displayed argv has been reviewed; the commands are trusted local code, not a sandbox. A fixed judge always requires a known judge price before execution, even without a cap. A supplied `--max-cost-usd` additionally requires known prices for every candidate and the judge; an unknown estimate, or an estimate above the cap, blocks execution. Pricing files use USD per million tokens:
 
 ```json
 {
@@ -130,7 +130,7 @@ python3 omp-rolebench/scripts/rolebench.py report \
   --format markdown
 ```
 
-Reports show assignment counts, execution pass/error rates, latency, output size, thinking variants, task outcomes, per-dimension evidence status, hard-gate failures, fixed-judge results, and gated recommendations when requested. Treat cost as unknown unless the provider returns usage/cost data; unknown cost is reported as unknown rather than inferred. See [evaluation-v2.md](references/evaluation-v2.md) for the fixed-judge and recommendation artifacts.
+Reports show assignment counts, execution pass/error rates, latency, output size, thinking variants, task outcomes, per-dimension evidence status, hard-gate failures, fixed-judge results, and gated recommendations when requested. Recommendation reports include candidate-level blocking reasons, evaluated hard dimensions, and links to raw/evaluation/artifact evidence. Treat cost as unknown unless the provider returns usage/cost data; unknown cost is reported as unknown rather than inferred. See [evaluation-v2.md](references/evaluation-v2.md) for the fixed-judge and recommendation artifacts.
 
 ## Guardrails
 

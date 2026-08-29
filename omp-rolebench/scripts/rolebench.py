@@ -1705,6 +1705,7 @@ def fixed_judge_dimensions(task: dict[str, Any]) -> list[str]:
 
 def build_fixed_judge_prompt(task: dict[str, Any], result: dict[str, Any], deterministic_evaluation: dict[str, Any]) -> str:
     model_output = decode_subprocess_text(result.get("output", ""))
+    error_output = evidence_text(result.get("error", ""))
     task_view = {
         key: value
         for key, value in task.items()
@@ -1729,8 +1730,8 @@ def build_fixed_judge_prompt(task: dict[str, Any], result: dict[str, Any], deter
         "role": task.get("role"),
         "execution": {
             "status": result.get("execution_status") or deterministic_evaluation.get("execution_status"),
-            "output": evidence_text(model_output) if len(model_output) <= JUDGE_INPUT_LIMIT else model_output[:JUDGE_INPUT_LIMIT] + "...",
-            "error": result.get("error"),
+            "output": model_output if len(model_output) <= JUDGE_INPUT_LIMIT else model_output[:JUDGE_INPUT_LIMIT] + "...",
+            "error": error_output,
         },
         "deterministic_evidence": evidence_view,
     }
@@ -1758,10 +1759,31 @@ def estimate_fixed_judge(roles: list[str], assignments: list[dict[str, Any]], ta
     for assignment in assignments:
         applicable = [task for task in tasks if task_for_assignment(task, assignment)]
         for task in applicable:
-            task_view = {key: value for key, value in task.items() if key not in {"workspace", "image"}}
-            task_tokens = math.ceil(len(json.dumps(task_view, ensure_ascii=False)) / 4)
-            estimated_model_output_tokens = min(int(task.get("max_output_tokens", 512)), JUDGE_INPUT_LIMIT // 4)
-            task_input = max(1, task_tokens + estimated_model_output_tokens + 300)
+            max_evidence = evidence_text("x" * (EVIDENCE_TEXT_LIMIT + 1))
+            skeleton_checks = deterministic_checks(
+                task,
+                {"output": "", "execution_status": "completed"},
+                None,
+                None,
+                False,
+                True,
+            )
+            skeleton_checks = [
+                {**check, "evidence": max_evidence}
+                for check in skeleton_checks
+            ]
+            skeleton_evaluation = {
+                "execution_status": "completed",
+                "outcome": "unknown",
+                "hard_gate_status": "unknown",
+                "checks": skeleton_checks,
+            }
+            estimate_prompt = build_fixed_judge_prompt(
+                task,
+                {"execution_status": "completed", "output": "x" * (JUDGE_INPUT_LIMIT + 1), "error": "x" * (EVIDENCE_TEXT_LIMIT + 1)},
+                skeleton_evaluation,
+            )
+            task_input = max(1, math.ceil(len(estimate_prompt) / 4))
             task_calls = runs
             calls += task_calls
             input_tokens += task_input * task_calls
@@ -1886,7 +1908,7 @@ def run_fixed_judge(omp_bin: str, judge_model: str, task: dict[str, Any], result
         "replicate": result.get("replicate"),
         "evaluator": "fixed_judge",
         "rubric_version": FIXED_JUDGE_RUBRIC_VERSION,
-        "provider_call_started": True,
+        "provider_call_started": False,
         "status": "error",
         "execution_status": "failed",
     }
@@ -1910,14 +1932,19 @@ def run_fixed_judge(omp_bin: str, judge_model: str, task: dict[str, Any], result
             if judge_selector.get("thinking"):
                 judge_command.extend(["--thinking", judge_selector["thinking"]])
             judge_command.extend([directory, "--auto-approve", prompt])
-            completed = subprocess.run(
-                judge_command,
-                check=False,
-                capture_output=True,
-                text=True,
-                errors="replace",
-                timeout=timeout,
-            )
+            raw["provider_call_started"] = True
+            try:
+                completed = subprocess.run(
+                    judge_command,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    errors="replace",
+                    timeout=timeout,
+                )
+            except (OSError, ValueError):
+                raw["provider_call_started"] = False
+                raise
         raw["exit_code"] = completed.returncode
         raw["stdout"] = decode_subprocess_text(completed.stdout)
         raw["stderr"] = decode_subprocess_text(completed.stderr)
@@ -1989,7 +2016,8 @@ def format_plan(manifest: dict[str, Any]) -> str:
     fixed_judge = manifest.get("evaluation", {}).get("fixed_judge", {})
     if fixed_judge.get("enabled"):
         judge_estimate = estimate.get("judge", {})
-        lines.insert(9, f"- fixed judge: {fixed_judge.get('model')} / rubric {fixed_judge.get('rubric_version')} ({judge_estimate.get('calls', 0)} request(s), ${judge_estimate.get('cost_usd'):.6f} estimated)" if judge_estimate.get("cost_usd") is not None else f"- fixed judge: {fixed_judge.get('model')} / rubric {fixed_judge.get('rubric_version')} ({judge_estimate.get('calls', 0)} request(s), cost unknown)")
+        judge_tokens = f"tokens input {judge_estimate.get('input_tokens', 0)}, output {judge_estimate.get('output_tokens', 0)}"
+        lines.insert(9, f"- fixed judge: {fixed_judge.get('model')} / rubric {fixed_judge.get('rubric_version')} ({judge_estimate.get('calls', 0)} request(s), {judge_tokens}, ${judge_estimate.get('cost_usd'):.6f} estimated)" if judge_estimate.get("cost_usd") is not None else f"- fixed judge: {fixed_judge.get('model')} / rubric {fixed_judge.get('rubric_version')} ({judge_estimate.get('calls', 0)} request(s), {judge_tokens}, cost unknown)")
     if manifest.get("recommend"):
         lines.append(f"- recommendations: enabled after {manifest.get('min_recommendation_runs', 3)} run(s) per task and deterministic/fixed-judge hard gates")
     for item in manifest.get("evaluation", {}).get("command_argvs", []):
@@ -2051,8 +2079,13 @@ def build_recommendations(
         for value in values:
             counts[value.get("task_id")] += 1
         blockers: list[str] = []
-        if not counts or min(counts.values()) < min_runs:
-            blockers.append(f"need at least {min_runs} runs per task")
+        expected_task_ids = sorted({task["id"] for task in tasks if task.get("role") == role})
+        if not expected_task_ids:
+            blockers.append("no task fixtures for this role")
+        else:
+            incomplete_tasks = [task_id for task_id in expected_task_ids if counts.get(task_id, 0) < min_runs]
+            if incomplete_tasks:
+                blockers.append(f"need at least {min_runs} runs for every task; incomplete={incomplete_tasks!r}")
         deterministic_hard = [value.get("hard_gate_status") for value in values]
         if any(status == "fail" for status in deterministic_hard):
             blockers.append("deterministic hard gate failed")
@@ -2068,6 +2101,12 @@ def build_recommendations(
             for name, dimension in value.get("dimensions", {}).items()
             if name in HARD_GATE_DIMENSIONS and isinstance(dimension, dict)
         ]
+        judge_hard_dimensions = sorted({
+            name
+            for value in judge_values
+            for name, dimension in value.get("dimensions", {}).items()
+            if name in HARD_GATE_DIMENSIONS and isinstance(dimension, dict)
+        })
         if any(status == "fail" for status in judge_hard_statuses):
             blockers.append("fixed judge hard gate failed")
         elif not judge_hard_statuses or any(status != "pass" for status in judge_hard_statuses):
@@ -2092,6 +2131,11 @@ def build_recommendations(
         model_cost = round(sum(model_costs), 8) if model_cost_known else None
         judge_cost = round(sum(judge_costs), 8) if judge_cost_known else None
         total_cost = round(model_cost + judge_cost, 8) if model_cost is not None and judge_cost is not None else None
+        evidence_paths = {"results.jsonl", "evaluations.jsonl", "judge_results.jsonl", "judge_evaluations.jsonl"}
+        for value in values:
+            artifacts = value.get("artifacts", {})
+            if isinstance(artifacts, dict):
+                evidence_paths.update(path for path in artifacts.values() if isinstance(path, str))
         candidate = {
             "role": role,
             "model": model,
@@ -2100,12 +2144,14 @@ def build_recommendations(
             "samples_per_task": dict(counts),
             "deterministic_hard_gate": "pass" if deterministic_hard and all(status == "pass" for status in deterministic_hard) else "blocked",
             "judge_hard_gate": "pass" if judge_hard_statuses and all(status == "pass" for status in judge_hard_statuses) else "blocked",
+            "judge_hard_dimensions": judge_hard_dimensions,
             "quality_score": quality_score,
             "p50_latency_ms": percentile(latency, 0.5),
             "model_cost_usd": model_cost,
             "judge_cost_usd": judge_cost,
             "total_cost_usd": total_cost,
             "cost_status": "observed" if total_cost is not None else "unknown",
+            "evidence": sorted(evidence_paths),
             "eligible": not blockers,
             "blocked_reasons": blockers,
         }
@@ -2283,7 +2329,11 @@ def run_one(omp_bin: str, assignment: dict[str, Any], task: dict[str, Any], repl
         command.append(prompt)
         command.extend(image_args)
         result["provider_call_started"] = True
-        completed = subprocess.run(command, check=False, capture_output=True, text=True, errors="replace", timeout=timeout)
+        try:
+            completed = subprocess.run(command, check=False, capture_output=True, text=True, errors="replace", timeout=timeout)
+        except (OSError, ValueError):
+            result["provider_call_started"] = False
+            raise
         result["exit_code"] = completed.returncode
         stdout = decode_subprocess_text(completed.stdout)
         stderr = decode_subprocess_text(completed.stderr)
@@ -2400,7 +2450,7 @@ def run_command(args: argparse.Namespace) -> int:
         if estimate["cost_status"] == "estimated" and judge_estimate["cost_status"] in {"estimated", "not-requested"}
         else None
     )
-    estimate["total_cost_status"] = "estimated" if estimate["total_cost_usd"] is not None else ("not-requested" if not judge_model and estimate["cost_status"] == "not-requested" else "unknown")
+    estimate["total_cost_status"] = "estimated" if estimate["total_cost_usd"] is not None else "unknown"
     output_dir = Path(args.output).expanduser()
     output_dir.mkdir(parents=True, exist_ok=True)
     results_path = output_dir / "results.jsonl"
@@ -2484,6 +2534,11 @@ def run_command(args: argparse.Namespace) -> int:
         write_json(output_dir / "summary.json", summary)
         print("Execution blocked: task fixtures contain command checks; review argv and add --allow-check-command.", file=sys.stderr)
         return 2
+    if args.execute and judge_model and judge_estimate["cost_status"] != "estimated":
+        summary = {"run_dir": str(output_dir), "status": "blocked", "reason": "judge_cost_unknown", "executed": False, "estimate": estimate}
+        write_json(output_dir / "summary.json", summary)
+        print("Execution blocked: fixed-judge cost is unknown; provide --pricing-file with the judge rate.", file=sys.stderr)
+        return 2
     if args.max_cost_usd is not None:
         if estimate["total_cost_status"] != "estimated":
             summary = {"run_dir": str(output_dir), "status": "blocked", "reason": "cost_unknown", "executed": False, "estimate": estimate}
@@ -2550,7 +2605,7 @@ def run_command(args: argparse.Namespace) -> int:
                             "model": assignment["mapping"].get(task["role"], ""),
                             "thinking": assignment.get("thinking", {}).get(task["role"]),
                             "executor": args.executor,
-                            "provider_call_started": True,
+                            "provider_call_started": False,
                             "status": "error",
                             "execution_status": "failed",
                             "error_type": "harness_internal",
@@ -2790,9 +2845,27 @@ def report_command(args: argparse.Namespace) -> int:
             summary = evidence_text(evaluation.get("summary") or "").replace("|", "\\|")
             lines.append(f"| `{evaluation.get('role', '')}` | `{evaluation.get('task_id', '')}` | `{evaluation.get('model', '')}` | {evaluation.get('outcome', 'unknown')} | {evaluation.get('hard_gate_status', 'unknown')} | {summary} |")
     if isinstance(recommendations, dict):
-        lines.extend(["", "## Recommendations", "", f"Status: `{recommendations.get('status', 'unknown')}`", "", "| Role | Model | Thinking | Status | Reason |", "|---|---|---|---|---|"])
+        def recommendation_links(item: dict[str, Any]) -> str:
+            paths = item.get("evidence", [])
+            if not isinstance(paths, list):
+                return ""
+            return ", ".join(f"[{path}]({path})" for path in paths if isinstance(path, str))
+
+        lines.extend(["", "## Recommendations", "", f"Status: `{recommendations.get('status', 'unknown')}`", "", "| Role | Model | Thinking | Status | Reason | Evidence |", "|---|---|---|---|---|---|"])
         for item in recommendations.get("roles", []):
-            lines.append(f"| `{item.get('role', '')}` | `{item.get('model') or '-'}` | `{item.get('thinking') or '-'}` | {item.get('status', 'blocked')} | {evidence_text(item.get('reason', ''))} |")
+            candidate = item.get("candidate") if isinstance(item.get("candidate"), dict) else {}
+            reason = evidence_text(item.get("reason", "")).replace("|", "\\|")
+            lines.append(f"| `{item.get('role', '')}` | `{item.get('model') or '-'}` | `{item.get('thinking') or '-'}` | {item.get('status', 'blocked')} | {reason} | {recommendation_links(candidate)} |")
+        candidates = recommendations.get("candidates", [])
+        if isinstance(candidates, list) and candidates:
+            lines.extend(["", "### Recommendation Candidates", "", "| Role | Model | Thinking | Eligible | Hard dimensions | Quality | Blocked reasons | Evidence |", "|---|---|---|---|---|---:|---|---|"])
+            for candidate in candidates:
+                if not isinstance(candidate, dict):
+                    continue
+                reasons = evidence_text("; ".join(str(reason) for reason in candidate.get("blocked_reasons", []))).replace("|", "\\|")
+                hard_dimensions = ", ".join(candidate.get("judge_hard_dimensions", [])) or "none"
+                quality = candidate.get("quality_score") if candidate.get("quality_score") is not None else "unknown"
+                lines.append(f"| `{candidate.get('role', '')}` | `{candidate.get('model', '')}` | `{candidate.get('thinking') or '-'}` | {candidate.get('eligible', False)} | `{hard_dimensions}` | {quality} | {reasons or '-'} | {recommendation_links(candidate)} |")
     report = "\n".join(lines) + "\n"
     if args.format == "json":
         serializable_groups = {

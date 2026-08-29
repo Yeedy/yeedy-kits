@@ -109,6 +109,17 @@ class RoleBenchTests(unittest.TestCase):
         self.assertNotIn("/sensitive/workspace", prompt)
         self.assertNotIn("/sensitive/image.png", prompt)
 
+    def test_fixed_judge_prompt_preserves_medium_output_and_truncates_large_output(self):
+        task = {"id": "task-judge", "role": "task", "prompt": "do", "dimension_targets": ["correctness"]}
+        deterministic = {"execution_status": "completed", "outcome": "unknown", "hard_gate_status": "unknown", "checks": []}
+        medium_output = "x" * 2000
+        medium_prompt = rolebench.build_fixed_judge_prompt(task, {"execution_status": "completed", "output": medium_output}, deterministic)
+        self.assertIn(medium_output, medium_prompt)
+        large_output = "y" * (rolebench.JUDGE_INPUT_LIMIT + 10)
+        large_prompt = rolebench.build_fixed_judge_prompt(task, {"execution_status": "completed", "output": large_output}, deterministic)
+        self.assertIn("y" * rolebench.JUDGE_INPUT_LIMIT + "...", large_prompt)
+        self.assertNotIn("y" * 10 + '"', large_prompt)
+
     def test_fixed_judge_estimate_includes_repeated_calls_and_cost(self):
         pricing = {"judge/model": {"input_per_million": 1.0, "output_per_million": 2.0}}
         assignments = [{"id": "assignment-001", "mode": "all-same", "mapping": {"task": "p/a"}}]
@@ -162,6 +173,17 @@ class RoleBenchTests(unittest.TestCase):
         self.assertIn("--thinking", command)
         self.assertIn("high", command)
 
+    @patch("rolebench.subprocess.run", side_effect=OSError("omp is missing"))
+    def test_fixed_judge_marks_call_started_only_before_subprocess(self, run):
+        task = {"id": "task-judge", "role": "task", "prompt": "do", "dimension_targets": ["correctness"]}
+        result = {"assignment_id": "a", "task_id": "task-judge", "role": "task", "model": "p/a", "replicate": 1, "execution_status": "completed", "output": "PASS"}
+        deterministic = {"execution_status": "completed", "outcome": "pass", "hard_gate_status": "pass", "checks": []}
+        raw, evaluation = rolebench.run_fixed_judge("omp", "judge/model", task, result, deterministic, timeout=5)
+        self.assertFalse(raw["provider_call_started"])
+        self.assertEqual(raw["error_type"], "judge_invalid")
+        self.assertEqual(evaluation["outcome"], "unknown")
+        run.assert_called_once()
+
     def test_recommendations_require_repeated_hard_gate_evidence(self):
         task = {"id": "task-1", "role": "task", "dimension_targets": ["correctness", "instruction_following"]}
         results = []
@@ -194,6 +216,17 @@ class RoleBenchTests(unittest.TestCase):
         blocked = rolebench.build_recommendations(["task"], [task], results[:1], evaluations[:1], judge_results[:1], judge_evaluations[:1], 3)
         self.assertEqual(blocked["status"], "blocked")
         self.assertIn("at least 3 runs", blocked["candidates"][0]["blocked_reasons"][0])
+        coverage = rolebench.build_recommendations(
+            ["task"],
+            [task, {"id": "task-2", "role": "task", "dimension_targets": ["correctness"]}],
+            results,
+            evaluations,
+            judge_results,
+            judge_evaluations,
+            3,
+        )
+        self.assertEqual(coverage["status"], "blocked")
+        self.assertIn("task-2", coverage["candidates"][0]["blocked_reasons"][0])
 
     def test_catalog_normalizes_provider_group(self):
         fixture = Path(__file__).parent / "fixtures" / "catalog.json"
@@ -727,6 +760,15 @@ class RoleBenchTests(unittest.TestCase):
         self.assertEqual(run.call_args.args[0][run.call_args.args[0].index("--thinking") + 1], "high")
         self.assertEqual(run.call_args.kwargs["errors"], "replace")
 
+    @patch("rolebench.subprocess.run", side_effect=OSError("omp is missing"))
+    def test_run_one_marks_provider_call_started_only_after_spawn(self, run):
+        assignment = {"id": "a", "mode": "role-isolated", "role": "task", "candidate": "p/a", "mapping": {"task": "p/a"}}
+        task = {"id": "task-001", "role": "task", "prompt": "do it"}
+        row = rolebench.run_one("omp", assignment, task, 1, Path("."), 5, Path("."), "direct", None)
+        self.assertFalse(row["provider_call_started"])
+        self.assertEqual(row["error_type"], "executor_setup")
+        run.assert_called_once()
+
     @patch("rolebench.subprocess.run")
     def test_delegated_run_uses_project_probe_agent(self, run):
         run.return_value = SimpleNamespace(returncode=0, stdout=json.dumps({"text": "<task-result status=\"completed\">PASS</task-result>"}), stderr="")
@@ -937,6 +979,18 @@ class RoleBenchTests(unittest.TestCase):
             self.assertGreater(summary["judge_cost_usd"], 0)
             self.assertEqual(summary["estimated_cost_usd"], summary["model_cost_usd"] + summary["judge_cost_usd"])
 
+    def test_fixed_judge_unknown_price_blocks_execution_without_cap(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            args = self.make_run_args(root, judge_model="judge/model")
+            task = {"id": "task-1", "role": "task", "prompt": "do", "dimension_targets": ["correctness"]}
+            with patch.object(rolebench, "load_tasks", return_value=[task]):
+                with patch.object(rolebench, "run_one") as run:
+                    self.assertEqual(rolebench.run_command(args), 2)
+            run.assert_not_called()
+            summary = json.loads((root / "run" / "summary.json").read_text(encoding="utf-8"))
+            self.assertEqual(summary["reason"], "judge_cost_unknown")
+
     def test_recommendation_preview_does_not_write_unexecuted_result(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1053,17 +1107,19 @@ class RoleBenchTests(unittest.TestCase):
             root = Path(directory)
             (root / "manifest.json").write_text(json.dumps({"generated_at": "now", "mode": "all-same", "roles": ["task"], "assignments": [], "evaluation": {"fixed_judge": {"enabled": True, "rubric_version": "rolebench-v2-test"}}}), encoding="utf-8")
             (root / "judge_evaluations.jsonl").write_text(json.dumps({"role": "task", "task_id": "task-1", "model": "p/a", "outcome": "pass", "hard_gate_status": "pass", "rubric_version": "rolebench-v2-test", "summary": "supported"}) + "\n", encoding="utf-8")
-            (root / "recommendations.json").write_text(json.dumps({"status": "complete", "roles": [{"role": "task", "model": "p/a", "status": "recommended", "reason": "hard gates passed"}]}), encoding="utf-8")
+            (root / "recommendations.json").write_text(json.dumps({"status": "blocked", "roles": [{"role": "task", "model": None, "status": "blocked", "reason": "no eligible candidate"}], "candidates": [{"role": "task", "model": "p/a", "eligible": False, "judge_hard_dimensions": ["correctness"], "blocked_reasons": ["task-2 is incomplete"], "evidence": ["results.jsonl", "judge_evaluations.jsonl"]}]}), encoding="utf-8")
             output = root / "report.md"
             self.assertEqual(rolebench.main(["report", "--run", str(root), "--output", str(output)]), 0)
             report = output.read_text(encoding="utf-8")
             self.assertIn("## Fixed Judge", report)
             self.assertIn("## Recommendations", report)
             self.assertIn("rolebench-v2-test", report)
+            self.assertIn("task-2 is incomplete", report)
+            self.assertIn("[judge_evaluations.jsonl](judge_evaluations.jsonl)", report)
             json_output = root / "report.json"
             self.assertEqual(rolebench.main(["report", "--run", str(root), "--format", "json", "--output", str(json_output)]), 0)
             payload = json.loads(json_output.read_text(encoding="utf-8"))
-            self.assertEqual(payload["recommendations"]["status"], "complete")
+            self.assertEqual(payload["recommendations"]["status"], "blocked")
             self.assertEqual(len(payload["judge_evaluations"]), 1)
 
     def test_fake_executor_end_to_end(self):
