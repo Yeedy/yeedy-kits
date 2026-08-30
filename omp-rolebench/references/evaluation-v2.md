@@ -8,8 +8,8 @@ The first V2 slice implements:
 
 1. A versioned fixed-judge rubric and prompt. The judge receives the task, model output, errors, and deterministic evidence, but not the candidate model identity, workspace path, or image path.
 2. Separate `judge_results.jsonl` and `judge_evaluations.jsonl` files. Malformed, timed-out, or incomplete judge output is `unknown` and never replaces a deterministic failure.
-3. Preflight accounting for judge requests, input/output tokens, and USD cost. The displayed estimate and `--max-cost-usd` gate cover both candidate-model and judge calls.
-4. Repeated-run gating and a recommendation artifact. `--recommend` requires `--judge-model`; every selected role must have at least `--min-recommendation-runs` observations per task, deterministic hard gates must pass, and judge hard gates must be fully verified. Ineligible candidates remain visible with blocking reasons.
+3. Preflight accounting for judge requests, input/output tokens, and USD cost. The displayed estimate and `--max-cost-usd` gate cover candidate-model, delegated-controller, and judge calls.
+4. Repeated-run gating and a recommendation artifact. `--recommend` requires `--judge-model`; every selected role must have at least `--min-recommendation-runs` observations per task, all applicable deterministic hard evidence must pass, and the judge must fully verify every requested hard dimension. A dimension that has no deterministic evaluator remains `unknown` in V1 but does not by itself block a judge-verified recommendation. Ineligible candidates remain visible with blocking reasons.
 
 The recommendation is a constrained ordering, not a single composite quality score. Eligible candidates are ordered by fixed-judge non-hard-dimension score, then p50 latency, then observed cost; missing usage remains `unknown` rather than zero and known costs sort first. Correctness, honesty, and safety remain hard gates and cannot be traded for speed or price.
 
@@ -47,7 +47,7 @@ python3 omp-rolebench/scripts/rolebench.py run \
   --output runs/v2-20260829
 ```
 
-`--judge-timeout` controls the per-judge subprocess timeout. When `--recommend` is used without `--judge-model`, the fixed judge defaults to `modelRoles.default` from the OMP config; an explicit `--judge-model provider/model[:thinking]` overrides it. The plan records this source, and changing it during consent requires a new preview and confirmation. Execution with a fixed judge always requires known pricing for the judge; when a cost cap is supplied, pricing must also be known for every candidate. Consent is still required for the combined estimate; `--confirm` is not a substitute for showing the plan to the user.
+`--judge-timeout` controls the per-judge subprocess timeout. When `--recommend` is used without `--judge-model`, the fixed judge defaults to `modelRoles.default` from the OMP config; an explicit `--judge-model provider/model[:thinking]` overrides it. The plan records this source, and changing it during consent requires a new preview and confirmation. Execution with a fixed judge always requires known pricing for the judge; when a cost cap is supplied, pricing must also be known for every candidate and the delegated controller when enabled. Consent is still required for the combined estimate; `--confirm` is not a substitute for showing the plan to the user.
 
 ## Judge contract
 

@@ -176,6 +176,8 @@ TASK_KEYS = {
     "prompt",
     "pair_id",
     "variant",
+    "scenario",
+    "task_type",
     "workspace",
     "max_output_tokens",
     "requires_image",
@@ -226,6 +228,17 @@ FIXED_JUDGE_OUTPUT_TOKENS = 768
 FIXED_JUDGE_TIMEOUT = 180
 JUDGE_INPUT_LIMIT = 64 * 1024
 RECOMMENDATION_SCHEMA_VERSION = 1
+HARNESS_ERROR_TYPES = {"harness_internal", "executor_setup", "executor_internal", "malformed_omp_json", "missing_image_fixture"}
+HARNESS_WARNING_TYPES = {"harness_integrity", "workspace_evidence", "artifact_write", "evaluation"}
+HARNESS_STOP_REASONS = {
+    "harness_integrity_changed",
+    "harness_internal",
+    "harness_evidence_failed",
+    "harness_execution_failed",
+    "harness_judge_failed",
+    "evaluation_write_failed",
+    "judge_write_failed",
+}
 
 
 class RoleBenchError(Exception):
@@ -503,6 +516,8 @@ def build_recent_tasks(roles: list[str], recent_work: dict[str, Any]) -> list[di
             task = {
                 "id": f"recent-{workspace_index:02d}-{workspace_slug}-{role_slug}-001",
                 "role": role,
+                "scenario": f"recent work in {Path(workspace['workspace']).name}",
+                "task_type": "recent-work",
                 "prompt": RECENT_ROLE_TASKS.get(role, RECENT_ROLE_TASKS["default"]) + "\n\n" + context,
                 "workspace": workspace["workspace"],
                 "difficulty": {"level": 3, "scope": 2, "reasoning": 2, "tool_depth": 1, "context": 3, "uncertainty": 2, "risk": 1, "adversarial": 0},
@@ -634,6 +649,26 @@ def resolve_judge_model(args: argparse.Namespace, config_file: Path) -> tuple[st
     default_model = configured_roles.get("default")
     if not default_model:
         raise RoleBenchError("--recommend requires --judge-model or modelRoles.default in the OMP config")
+    parse_selector(default_model)
+    return default_model, "default-role"
+
+
+def resolve_controller_model(args: argparse.Namespace, config_file: Path) -> tuple[str | None, str | None]:
+    if getattr(args, "executor", "direct") != "delegated":
+        if getattr(args, "controller_model", None):
+            raise RoleBenchError("--controller-model requires --executor delegated")
+        return None, None
+    explicit = getattr(args, "controller_model", None)
+    if explicit:
+        parse_selector(explicit)
+        return explicit, "explicit"
+    try:
+        configured_roles = parse_model_roles(config_file)
+    except RoleBenchError as exc:
+        raise RoleBenchError("delegated execution requires --controller-model or a configured modelRoles.default") from exc
+    default_model = configured_roles.get("default")
+    if not default_model:
+        raise RoleBenchError("delegated execution requires --controller-model or modelRoles.default in the OMP config")
     parse_selector(default_model)
     return default_model, "default-role"
 
@@ -874,7 +909,7 @@ def normalize_task(task: dict[str, Any]) -> dict[str, Any]:
     if "schema_version" in normalized and normalized["schema_version"] != 1:
         raise RoleBenchError(f"task {task_id} schema_version must be 1")
     normalized["schema_version"] = 1
-    for key in ("pair_id", "variant", "workspace"):
+    for key in ("pair_id", "variant", "scenario", "task_type", "workspace"):
         if key in normalized and (not isinstance(normalized[key], str) or not normalized[key]):
             raise RoleBenchError(f"task {task_id} {key} must be a non-empty string")
     if "max_output_tokens" in normalized and (not isinstance(normalized["max_output_tokens"], int) or isinstance(normalized["max_output_tokens"], bool) or normalized["max_output_tokens"] < 1):
@@ -1071,6 +1106,96 @@ def validate_task_coverage(tasks: list[dict[str, Any]], roles: list[str]) -> Non
 
 def write_json(path: Path, value: Any) -> None:
     path.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def load_jsonl(path: Path, label: str) -> list[dict[str, Any]]:
+    loaded = []
+    if not path.exists():
+        return loaded
+    for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        if not line.strip():
+            continue
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise RoleBenchError(f"malformed {label} line {number}: {exc}") from exc
+        if not isinstance(value, dict):
+            raise RoleBenchError(f"malformed {label} line {number}: expected JSON object")
+        loaded.append(value)
+    return loaded
+
+
+def stable_digest(value: Any) -> str:
+    encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def harness_fingerprint() -> dict[str, Any]:
+    skill_root = Path(__file__).resolve().parents[1]
+    roots = [skill_root / "SKILL.md", skill_root / "scripts", skill_root / "references", skill_root / "assets", skill_root / "agents"]
+    files: list[dict[str, Any]] = []
+    for root in roots:
+        paths = [root] if root.is_file() else sorted(root.rglob("*")) if root.is_dir() else []
+        for path in paths:
+            if not path.is_file() or "__pycache__" in path.parts or path.name == ".DS_Store" or path.suffix == ".pyc":
+                continue
+            relative = path.relative_to(skill_root).as_posix()
+            try:
+                digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            except OSError as exc:
+                raise RoleBenchError(f"cannot fingerprint harness file {relative}: {exc}") from exc
+            files.append({"path": relative, "sha256": digest})
+    return {"algorithm": "sha256", "digest": stable_digest(files), "file_count": len(files)}
+
+
+def verify_harness_fingerprint(expected: dict[str, Any]) -> None:
+    current = harness_fingerprint()
+    if current.get("digest") != expected.get("digest"):
+        raise RoleBenchError("harness, skill, reference, or bundled fixture content changed during execution")
+
+
+def experiment_signature(manifest: dict[str, Any]) -> str:
+    payload = {
+        key: manifest.get(key)
+        for key in (
+            "task_schema_version", "evaluation_schema_version", "omp_bin", "selection", "roles",
+            "baseline_roles", "mode", "runs", "executor", "task_source", "recent_work",
+            "controller_model", "controller_model_source", "pricing_file", "max_cost_usd",
+            "judge_model", "judge_model_source", "judge_timeout", "recommend",
+            "min_recommendation_runs", "timeout", "seed", "tasks", "candidates", "assignments",
+        )
+    }
+    payload["evaluation"] = manifest.get("evaluation")
+    payload["estimate"] = manifest.get("estimate")
+    return stable_digest(payload)
+
+
+def cell_key(row: dict[str, Any]) -> tuple[Any, Any, Any]:
+    return row.get("assignment_id"), row.get("task_id"), row.get("replicate")
+
+
+def unique_cell_index(rows: list[dict[str, Any]], label: str) -> dict[tuple[Any, Any, Any], dict[str, Any]]:
+    indexed: dict[tuple[Any, Any, Any], dict[str, Any]] = {}
+    for row in rows:
+        key = cell_key(row)
+        if None in key:
+            raise RoleBenchError(f"{label} contains a row without assignment_id, task_id, or replicate")
+        if key in indexed:
+            raise RoleBenchError(f"{label} contains duplicate cell {key!r}")
+        indexed[key] = row
+    return indexed
+
+
+def persisted_harness_failure(rows: list[dict[str, Any]]) -> str | None:
+    for row in rows:
+        error_type = row.get("error_type")
+        if error_type in HARNESS_ERROR_TYPES or error_type == "judge_internal":
+            return str(error_type)
+        warnings = row.get("warnings", [])
+        for warning in warnings if isinstance(warnings, list) else []:
+            if isinstance(warning, dict) and warning.get("type") in HARNESS_WARNING_TYPES:
+                return str(warning["type"])
+    return None
 
 
 def filesystem_entry_type(mode: int) -> str:
@@ -1583,8 +1708,16 @@ def failed_evaluation(task: dict[str, Any], result: dict[str, Any], error: Excep
 def write_workspace_artifacts(output_dir: Path, artifacts_root: Path, identity: str, before: dict[str, Any], after: dict[str, Any], workspace_diff: dict[str, Any]) -> dict[str, str]:
     slug = re.sub(r"[^A-Za-z0-9_.-]+", "-", identity).strip("-")[:80] or "cell"
     suffix = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:10]
-    artifact_dir = artifacts_root / f"{slug}-{suffix}"
-    artifact_dir.mkdir(parents=True, exist_ok=False)
+    artifact_base = artifacts_root / f"{slug}-{suffix}"
+    for attempt in range(1, 1001):
+        artifact_dir = artifact_base if attempt == 1 else artifact_base.with_name(f"{artifact_base.name}-attempt-{attempt}")
+        try:
+            artifact_dir.mkdir(parents=True, exist_ok=False)
+            break
+        except FileExistsError:
+            continue
+    else:
+        raise RoleBenchError(f"too many artifact attempts for {identity}")
     before_path = artifact_dir / "workspace-before.json"
     after_path = artifact_dir / "workspace-after.json"
     diff_path = artifact_dir / "workspace-diff.json"
@@ -1822,6 +1955,49 @@ def estimate_benchmark(roles: list[str], assignments: list[dict[str, Any]], task
     return {
         "assignments": len(assignments),
         "calls": total_calls,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "cost_usd": round(known_cost, 8) if cost_known else None,
+        "cost_status": "estimated" if cost_known else "unknown",
+        "by_assignment": rows,
+    }
+
+
+def estimate_controller(assignments: list[dict[str, Any]], tasks: list[dict[str, Any]], runs: int, controller_model: str | None, pricing: dict[str, dict[str, float]]) -> dict[str, Any]:
+    if not controller_model:
+        return {"enabled": False, "model": None, "calls": 0, "input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0, "cost_status": "not-requested", "by_assignment": []}
+    rows = []
+    calls = 0
+    input_tokens = 0
+    output_tokens = 0
+    known_cost = 0.0
+    cost_known = True
+    selector = parse_selector(controller_model)["selector"]
+    rates = pricing.get(selector, {})
+    for assignment in assignments:
+        applicable = [task for task in tasks if task_for_assignment(task, assignment)]
+        for task in applicable:
+            task_calls = runs
+            task_input = max(1, math.ceil(len(task["prompt"]) / 4)) + 200
+            task_output = int(task.get("max_output_tokens", 512)) + 128
+            calls += task_calls
+            input_tokens += task_input * task_calls
+            output_tokens += task_output * task_calls
+            if "input_per_million" in rates and "output_per_million" in rates:
+                known_cost += task_calls * (task_input * rates["input_per_million"] + task_output * rates["output_per_million"]) / 1_000_000
+            else:
+                cost_known = False
+            rows.append({
+                "assignment_id": assignment["id"],
+                "role": task["role"],
+                "calls": task_calls,
+                "input_tokens": task_input * task_calls,
+                "output_tokens": task_output * task_calls,
+            })
+    return {
+        "enabled": True,
+        "model": controller_model,
+        "calls": calls,
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
         "cost_usd": round(known_cost, 8) if cost_known else None,
@@ -2113,6 +2289,18 @@ def run_fixed_judge(omp_bin: str, judge_model: str, task: dict[str, Any], result
         return raw, build_judge_evaluation(task, result, raw, None, raw["error"])
 
 
+def rebuild_judge_evaluation(task: dict[str, Any], result: dict[str, Any], judge_result: dict[str, Any]) -> dict[str, Any]:
+    if judge_result.get("execution_status") != "completed" or judge_result.get("status") != "pass":
+        error = str(judge_result.get("error") or "fixed judge execution was incomplete")
+        return build_judge_evaluation(task, result, judge_result, None, error)
+    try:
+        payload = parse_fixed_judge_document(decode_subprocess_text(judge_result.get("output", "")))
+        dimensions = normalize_fixed_judge_dimensions(payload, fixed_judge_dimensions(task))
+        return build_judge_evaluation(task, result, judge_result, dimensions)
+    except RoleBenchError as exc:
+        return build_judge_evaluation(task, result, judge_result, None, str(exc))
+
+
 def candidate_pricing(candidates: list[dict[str, Any]], supplied: dict[str, dict[str, float]]) -> dict[str, dict[str, float]]:
     pricing = dict(supplied)
     for candidate in candidates:
@@ -2150,6 +2338,11 @@ def format_plan(manifest: dict[str, Any]) -> str:
         f"- deterministic evaluator: {', '.join(manifest.get('evaluation', {}).get('dimension_targets', [])) or 'none'} (no model cost)",
         f"- trusted command checks: {manifest.get('evaluation', {}).get('command_checks', 0)} ({'enabled' if manifest.get('evaluation', {}).get('allow_check_command') else 'disabled'})",
     ]
+    if manifest.get("executor") == "delegated":
+        source = {"default-role": "default role", "explicit": "explicit override"}.get(manifest.get("controller_model_source"), "configured")
+        controller_estimate = estimate.get("controller", {})
+        controller_cost = f"${controller_estimate['cost_usd']:.6f}" if controller_estimate.get("cost_usd") is not None else "cost unknown"
+        lines.insert(4, f"- controller: {manifest.get('controller_model')} ({source}; {controller_estimate.get('calls', 0)} request(s), tokens input {controller_estimate.get('input_tokens', 0)}, output {controller_estimate.get('output_tokens', 0)}, {controller_cost})")
     fixed_judge = manifest.get("evaluation", {}).get("fixed_judge", {})
     if fixed_judge.get("enabled"):
         judge_estimate = estimate.get("judge", {})
@@ -2160,9 +2353,19 @@ def format_plan(manifest: dict[str, Any]) -> str:
             judge_line += f"${judge_estimate['cost_usd']:.6f} estimated)"
         else:
             judge_line += "cost unknown)"
-        lines.insert(9, judge_line)
+        model_cost_index = next(index for index, line in enumerate(lines) if line.startswith("- estimated model cost:"))
+        lines.insert(model_cost_index, judge_line)
     if manifest.get("recommend"):
         lines.append(f"- recommendations: enabled after {manifest.get('min_recommendation_runs', 3)} run(s) per task and deterministic/fixed-judge hard gates")
+    resume_progress = manifest.get("resume_progress")
+    if isinstance(resume_progress, dict):
+        lines.append(
+            "- resume progress: "
+            f"candidate {resume_progress.get('completed_candidate_cells', 0)}/{resume_progress.get('expected_candidate_cells', 0)} complete, "
+            f"{resume_progress.get('remaining_candidate_cells', 0)} remaining; "
+            f"judge {resume_progress.get('completed_judge_cells', 0)}/{resume_progress.get('expected_judge_cells', 0)} complete, "
+            f"{resume_progress.get('remaining_judge_cells', 0)} remaining (full-plan estimate remains the cap basis)"
+        )
     for item in manifest.get("evaluation", {}).get("command_argvs", []):
         lines.append(f"- command argv [{item['task_id']}/{item['check_id']}]: {json.dumps(item['argv'], ensure_ascii=False)}")
     recent_work = manifest.get("recent_work")
@@ -2229,10 +2432,26 @@ def build_recommendations(
             incomplete_tasks = [task_id for task_id in expected_task_ids if counts.get(task_id, 0) < min_runs]
             if incomplete_tasks:
                 blockers.append(f"need at least {min_runs} runs for every task; incomplete={incomplete_tasks!r}")
-        deterministic_hard = [value.get("hard_gate_status") for value in values]
+        deterministic_hard = [
+            check.get("status")
+            for value in values
+            for check in value.get("checks", [])
+            if isinstance(check, dict) and check.get("hard_gate")
+        ]
+        deterministic_hard.extend(
+            dimension.get("status")
+            for value in values
+            for name, dimension in value.get("dimensions", {}).items()
+            if name in HARD_GATE_DIMENSIONS
+            and isinstance(dimension, dict)
+            and dimension.get("evaluator") != "none"
+        )
+        execution_complete = bool(values) and all(value.get("execution_status") == "completed" for value in values)
+        if not execution_complete:
+            blockers.append("candidate execution is incomplete")
         if any(status == "fail" for status in deterministic_hard):
             blockers.append("deterministic hard gate failed")
-        elif not deterministic_hard or any(status != "pass" for status in deterministic_hard):
+        elif any(status != "pass" for status in deterministic_hard):
             blockers.append("deterministic hard gate is not fully verified")
         judge_values = [judge_by_cell.get((value.get("assignment_id"), value.get("task_id"), value.get("replicate"))) for value in values]
         judge_values = [value for value in judge_values if value is not None]
@@ -2285,7 +2504,7 @@ def build_recommendations(
             "thinking": thinking or None,
             "samples": len(values),
             "samples_per_task": dict(counts),
-            "deterministic_hard_gate": "pass" if deterministic_hard and all(status == "pass" for status in deterministic_hard) else "blocked",
+            "deterministic_hard_gate": "pass" if execution_complete and all(status == "pass" for status in deterministic_hard) else "blocked",
             "judge_hard_gate": "pass" if judge_hard_statuses and all(status == "pass" for status in judge_hard_statuses) else "blocked",
             "judge_hard_dimensions": judge_hard_dimensions,
             "quality_score": quality_score,
@@ -2394,6 +2613,11 @@ def run_one(omp_bin: str, assignment: dict[str, Any], task: dict[str, Any], repl
         selected_model = assignment["mapping"].get(task["role"]) or assignment.get("candidate")
         if not selected_model:
             raise RoleBenchError(f"no model selected for role {task['role']}")
+        controller_selector = None
+        if executor == "delegated":
+            if not controller_model:
+                raise RoleBenchError("delegated execution requires a resolved controller model")
+            controller_selector = parse_selector(controller_model)
         image_args: list[str] = []
         image_values = task.get("image", [])
         if isinstance(image_values, str):
@@ -2410,7 +2634,8 @@ def run_one(omp_bin: str, assignment: dict[str, Any], task: dict[str, Any], repl
         if executor == "delegated":
             agent_name = f"bench-{assignment['id'].replace('_', '-')}-{task['role']}-{replicate}"
             result["agent"] = agent_name
-            result["controller_model"] = controller_model or assignment.get("mapping", {}).get("default") or selected_model
+            result["controller_model"] = controller_selector["selector"]
+            result["controller_thinking"] = controller_selector.get("thinking")
             agent_dir = workspace / ".omp" / "agents"
             agent_dir.mkdir(parents=True, exist_ok=True)
             thinking = assignment.get("thinking", {}).get(task["role"])
@@ -2434,7 +2659,6 @@ def run_one(omp_bin: str, assignment: dict[str, Any], task: dict[str, Any], repl
         system_prompt = temp_root / "role-prompt.txt"
         system_prompt.write_text(ROLE_PROMPTS.get(task["role"], ROLE_PROMPTS["default"]) + "\n", encoding="utf-8")
         thinking = assignment.get("thinking", {}).get(task["role"])
-        controller = controller_model or assignment.get("mapping", {}).get("default") or selected_model
         if executor == "delegated":
             agent_name = f"bench-{assignment['id'].replace('_', '-')}-{task['role']}-{replicate}"
             prompt = (
@@ -2448,7 +2672,7 @@ def run_one(omp_bin: str, assignment: dict[str, Any], task: dict[str, Any], repl
             )
             if image_args:
                 prompt += "\nImage fixture is available at: " + ", ".join(item[1:] for item in image_args)
-            selected_model = controller
+            selected_model = controller_selector["selector"]
         else:
             prompt = task["prompt"]
         before_snapshot = snapshot_workspace(workspace)
@@ -2461,6 +2685,10 @@ def run_one(omp_bin: str, assignment: dict[str, Any], task: dict[str, Any], repl
             "--no-title",
             "--model",
             selected_model,
+        ]
+        if executor == "delegated" and controller_selector.get("thinking"):
+            command.extend(["--thinking", controller_selector["thinking"]])
+        command.extend([
             "--config",
             str(overlay),
             "--append-system-prompt",
@@ -2468,7 +2696,7 @@ def run_one(omp_bin: str, assignment: dict[str, Any], task: dict[str, Any], repl
             "--cwd",
             str(workspace),
             "--auto-approve",
-        ]
+        ])
         if executor == "delegated":
             command.extend(["--tools", "task"])
         elif thinking:
@@ -2572,12 +2800,16 @@ def append_result(path: Path, row: dict[str, Any]) -> None:
 
 
 def run_command(args: argparse.Namespace) -> int:
+    resume = bool(getattr(args, "resume", False))
+    if resume and (not args.execute or not args.confirm):
+        raise RoleBenchError("--resume requires --execute --confirm")
     config_path = Path(args.config_file).expanduser()
     roles, baseline = resolve_roles(args.roles, config_path, require_config=args.mode == "role-isolated")
     candidates, source = resolve_candidates(args)
     tasks = load_tasks(args, roles)
     validate_task_coverage(tasks, roles)
     assignments = build_assignments(args.mode, roles, baseline, candidates, args.assignment_file)
+    controller_model, controller_model_source = resolve_controller_model(args, config_path)
     supplied_pricing = load_pricing(args.pricing_file)
     pricing = candidate_pricing(candidates, supplied_pricing)
     judge_model, judge_model_source = resolve_judge_model(args, config_path)
@@ -2586,28 +2818,38 @@ def run_command(args: argparse.Namespace) -> int:
     if min_recommendation_runs < 1:
         raise RoleBenchError("--min-recommendation-runs must be >= 1")
     estimate = estimate_benchmark(roles, assignments, tasks, args.runs, pricing)
+    controller_estimate = estimate_controller(assignments, tasks, args.runs, controller_model, pricing)
     judge_estimate = estimate_fixed_judge(roles, assignments, tasks, args.runs, judge_model, pricing)
     estimate["model_cost_usd"] = estimate["cost_usd"]
+    estimate["controller"] = controller_estimate
+    estimate["controller_cost_usd"] = controller_estimate["cost_usd"]
     estimate["judge"] = judge_estimate
     estimate["judge_cost_usd"] = judge_estimate["cost_usd"]
+    total_components = (estimate, controller_estimate, judge_estimate)
     estimate["total_cost_usd"] = (
-        round((estimate["cost_usd"] or 0) + (judge_estimate["cost_usd"] or 0), 8)
-        if estimate["cost_status"] == "estimated" and judge_estimate["cost_status"] in {"estimated", "not-requested"}
+        round(sum(component["cost_usd"] or 0 for component in total_components), 8)
+        if all(component["cost_status"] in {"estimated", "not-requested"} for component in total_components)
         else None
     )
     estimate["total_cost_status"] = "estimated" if estimate["total_cost_usd"] is not None else "unknown"
     output_dir = Path(args.output).expanduser()
+    if resume and not (output_dir / "manifest.json").is_file():
+        raise RoleBenchError("--resume requires an existing manifest.json in --output")
     output_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = output_dir / "manifest.json"
     results_path = output_dir / "results.jsonl"
     evaluations_path = output_dir / "evaluations.jsonl"
     judge_results_path = output_dir / "judge_results.jsonl"
     judge_evaluations_path = output_dir / "judge_evaluations.jsonl"
     recommendations_path = output_dir / "recommendations.json"
-    previous_results = rotate_stale_results(results_path)
-    previous_evaluations = rotate_stale_results(evaluations_path)
-    previous_judge_results = rotate_stale_results(judge_results_path)
-    previous_judge_evaluations = rotate_stale_results(judge_evaluations_path)
-    previous_recommendations = rotate_stale_results(recommendations_path)
+    if resume:
+        previous_results = previous_evaluations = previous_judge_results = previous_judge_evaluations = previous_recommendations = None
+    else:
+        previous_results = rotate_stale_results(results_path)
+        previous_evaluations = rotate_stale_results(evaluations_path)
+        previous_judge_results = rotate_stale_results(judge_results_path)
+        previous_judge_evaluations = rotate_stale_results(judge_evaluations_path)
+        previous_recommendations = rotate_stale_results(recommendations_path)
     command_checks = task_command_check_count(tasks)
     command_argvs = task_command_argvs(tasks)
     allow_check_command = bool(getattr(args, "allow_check_command", False))
@@ -2615,6 +2857,7 @@ def run_command(args: argparse.Namespace) -> int:
         dimension for dimension in EVALUATION_DIMENSIONS
         if any(dimension in task.get("dimension_targets", []) for task in tasks)
     ]
+    current_harness = harness_fingerprint()
     artifact_run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     manifest = {
         "schema_version": 2,
@@ -2627,11 +2870,15 @@ def run_command(args: argparse.Namespace) -> int:
         "baseline_roles": baseline,
         "mode": args.mode,
         "runs": args.runs,
+        "timeout": args.timeout,
+        "seed": args.seed,
         "execute": bool(args.execute),
+        "resume": resume,
         "executor": args.executor,
         "task_source": "file" if args.tasks_file else getattr(args, "task_source", "core"),
         "recent_work": getattr(args, "recent_work", None),
-        "controller_model": args.controller_model,
+        "controller_model": controller_model,
+        "controller_model_source": controller_model_source,
         "pricing_file": args.pricing_file,
         "max_cost_usd": args.max_cost_usd,
         "previous_results": previous_results,
@@ -2645,6 +2892,7 @@ def run_command(args: argparse.Namespace) -> int:
         "recommend": recommend,
         "min_recommendation_runs": min_recommendation_runs,
         "artifact_run_id": artifact_run_id,
+        "harness": current_harness,
         "evaluation": {
             "evaluator": "deterministic",
             "version": 1,
@@ -2674,7 +2922,46 @@ def run_command(args: argparse.Namespace) -> int:
         "candidates": candidates,
         "assignments": assignments,
     }
-    write_json(output_dir / "manifest.json", manifest)
+    manifest["experiment_signature"] = experiment_signature(manifest)
+    if resume:
+        previous_manifest = load_json_document(manifest_path)
+        if previous_manifest.get("experiment_signature") != manifest["experiment_signature"]:
+            raise RoleBenchError("resume experiment does not match the existing manifest; use a new output directory")
+        previous_harness = previous_manifest.get("harness")
+        if not isinstance(previous_harness, dict) or previous_harness.get("digest") != current_harness["digest"]:
+            raise RoleBenchError("resume harness differs from the original run; use a new output directory and rerun the full matrix")
+        manifest["generated_at"] = previous_manifest.get("generated_at", manifest["generated_at"])
+        manifest["artifact_run_id"] = previous_manifest.get("artifact_run_id", manifest["artifact_run_id"])
+        artifact_run_id = manifest["artifact_run_id"]
+        manifest["resume_count"] = int(previous_manifest.get("resume_count", 0)) + 1
+        manifest["resumed_at"] = now_iso()
+        previous_summary_path = output_dir / "summary.json"
+        if previous_summary_path.exists():
+            previous_summary = load_json_document(previous_summary_path)
+            if previous_summary.get("stopped_reason") in HARNESS_STOP_REASONS:
+                raise RoleBenchError("cannot resume a harness-failed run; fix the harness and rerun the full matrix in a new output directory")
+        expected_resume_cells = sum(
+            args.runs * sum(task_for_assignment(task, assignment) for task in tasks)
+            for assignment in assignments
+        )
+        persisted_result_rows = load_jsonl(results_path, "results.jsonl")
+        persisted_judge_rows = load_jsonl(judge_results_path, "judge_results.jsonl")
+        persisted_failure = persisted_harness_failure([*persisted_result_rows, *persisted_judge_rows])
+        if persisted_failure:
+            raise RoleBenchError(f"cannot resume a harness-failed run ({persisted_failure}); rerun the full matrix in a new output directory")
+        persisted_results = unique_cell_index(persisted_result_rows, "results.jsonl")
+        persisted_judges = unique_cell_index(persisted_judge_rows, "judge_results.jsonl")
+        manifest["resume_progress"] = {
+            "expected_candidate_cells": expected_resume_cells,
+            "completed_candidate_cells": len(persisted_results),
+            "remaining_candidate_cells": max(0, expected_resume_cells - len(persisted_results)),
+            "expected_judge_cells": expected_resume_cells if judge_model else 0,
+            "completed_judge_cells": len(persisted_judges),
+            "remaining_judge_cells": max(0, expected_resume_cells - len(persisted_judges)) if judge_model else 0,
+        }
+        for key in ("previous_results", "previous_evaluations", "previous_judge_results", "previous_judge_evaluations", "previous_recommendations"):
+            manifest[key] = previous_manifest.get(key)
+    write_json(manifest_path, manifest)
     print(format_plan(manifest), flush=True)
     if args.execute and command_checks and not allow_check_command:
         summary = {"run_dir": str(output_dir), "status": "blocked", "reason": "command_checks_not_approved", "executed": False, "command_checks": command_checks}
@@ -2690,10 +2977,10 @@ def run_command(args: argparse.Namespace) -> int:
         if estimate["total_cost_status"] != "estimated":
             summary = {"run_dir": str(output_dir), "status": "blocked", "reason": "cost_unknown", "executed": False, "estimate": estimate}
             write_json(output_dir / "summary.json", summary)
-            print("Execution blocked: model or fixed-judge cost is unknown; provide --pricing-file with all rates.", file=sys.stderr)
+            print("Execution blocked: candidate, controller, or fixed-judge cost is unknown; provide --pricing-file with all rates.", file=sys.stderr)
             return 2
         if estimate["total_cost_usd"] > args.max_cost_usd:
-            summary = {"run_dir": str(output_dir), "status": "blocked", "reason": "estimated_cost_exceeds_cap", "estimated_cost_usd": estimate["total_cost_usd"], "model_cost_usd": estimate["cost_usd"], "judge_cost_usd": judge_estimate["cost_usd"], "max_cost_usd": args.max_cost_usd, "executed": False}
+            summary = {"run_dir": str(output_dir), "status": "blocked", "reason": "estimated_cost_exceeds_cap", "estimated_cost_usd": estimate["total_cost_usd"], "model_cost_usd": estimate["cost_usd"], "controller_cost_usd": controller_estimate["cost_usd"], "judge_cost_usd": judge_estimate["cost_usd"], "max_cost_usd": args.max_cost_usd, "executed": False}
             write_json(output_dir / "summary.json", summary)
             print(f"Execution blocked: estimated total cost ${estimate['total_cost_usd']:.6f} exceeds cap ${args.max_cost_usd:.6f}.", file=sys.stderr)
             return 2
@@ -2710,124 +2997,264 @@ def run_command(args: argparse.Namespace) -> int:
     judge_result_rows = 0
     judge_evaluation_rows = 0
     judge_write_errors = 0
-    executed_results: list[dict[str, Any]] = []
-    executed_evaluations: list[dict[str, Any]] = []
-    executed_judge_results: list[dict[str, Any]] = []
-    executed_judge_evaluations: list[dict[str, Any]] = []
+    executed_results: list[dict[str, Any]] = load_jsonl(results_path, "results.jsonl") if resume else []
+    executed_evaluations: list[dict[str, Any]] = load_jsonl(evaluations_path, "evaluations.jsonl") if resume else []
+    executed_judge_results: list[dict[str, Any]] = load_jsonl(judge_results_path, "judge_results.jsonl") if resume else []
+    executed_judge_evaluations: list[dict[str, Any]] = load_jsonl(judge_evaluations_path, "judge_evaluations.jsonl") if resume else []
+    result_index = unique_cell_index(executed_results, "results.jsonl")
+    evaluation_index = unique_cell_index(executed_evaluations, "evaluations.jsonl")
+    judge_result_index = unique_cell_index(executed_judge_results, "judge_results.jsonl")
+    judge_evaluation_index = unique_cell_index(executed_judge_evaluations, "judge_evaluations.jsonl")
+    if any(key not in result_index for key in evaluation_index):
+        raise RoleBenchError("evaluations.jsonl contains a cell without a raw result")
+    if any(key not in judge_result_index for key in judge_evaluation_index):
+        raise RoleBenchError("judge_evaluations.jsonl contains a cell without a raw judge result")
+    if any(key not in result_index for key in judge_result_index):
+        raise RoleBenchError("judge_results.jsonl contains a cell without a candidate result")
+    tasks_by_id = {task["id"]: task for task in tasks}
+    for key, row in result_index.items():
+        if key in evaluation_index:
+            continue
+        task = tasks_by_id.get(str(row.get("task_id")))
+        if task is None:
+            raise RoleBenchError(f"cannot resume unknown task {row.get('task_id')!r}")
+        evaluation = failed_evaluation(task, row, "deterministic evaluation was not persisted before interruption; workspace evidence is unavailable")
+        append_result(evaluations_path, evaluation)
+        executed_evaluations.append(evaluation)
+        evaluation_index[key] = evaluation
+    for key, judge_row in judge_result_index.items():
+        if key in judge_evaluation_index:
+            continue
+        row = result_index[key]
+        task = tasks_by_id.get(str(row.get("task_id")))
+        if task is None:
+            raise RoleBenchError(f"cannot resume unknown task {row.get('task_id')!r}")
+        judge_evaluation = rebuild_judge_evaluation(task, row, judge_row)
+        append_result(judge_evaluations_path, judge_evaluation)
+        executed_judge_evaluations.append(judge_evaluation)
+        judge_evaluation_index[key] = judge_evaluation
+    result_rows = len(executed_results)
+    evaluation_rows = len(executed_evaluations)
+    judge_result_rows = len(executed_judge_results)
+    judge_evaluation_rows = len(executed_judge_evaluations)
     actual_cost = 0.0
     actual_cost_seen = False
     budget_status = "not-set" if args.max_cost_usd is None else "running"
     stopped_reason = None
+    skipped_cells = 0
+    interrupted = False
+    expected_cells = sum(
+        args.runs * sum(task_for_assignment(task, assignment) for task in tasks)
+        for assignment in assignments
+    )
+    for prior_row in [*executed_results, *executed_judge_results]:
+        prior_cost = extract_cost(prior_row.get("usage"))
+        if prior_cost is not None:
+            actual_cost += prior_cost
+            actual_cost_seen = True
+        elif args.max_cost_usd is not None and prior_row.get("provider_call_started"):
+            budget_status = "unverifiable"
+            stopped_reason = "resumed_provider_did_not_return_cost"
+    if args.max_cost_usd is not None and actual_cost >= args.max_cost_usd and stopped_reason is None:
+        budget_status = "reached"
+        stopped_reason = "actual_cost_reached_cap"
     if args.execute:
         artifacts_root = output_dir / "artifacts" / artifact_run_id
         ordered = list(assignments)
         random.Random(args.seed).shuffle(ordered)
-        stop = False
-        for assignment in ordered:
-            applicable = [task for task in tasks if task_for_assignment(task, assignment)]
-            for replicate in range(1, args.runs + 1):
-                for task in applicable:
-                    try:
-                        row = run_one(
-                            args.omp_bin,
-                            assignment,
-                            task,
-                            replicate,
-                            output_dir,
-                            args.timeout,
-                            config_path,
-                            args.executor,
-                            args.controller_model,
-                            allow_check_command,
-                            artifacts_root,
-                        )
-                    except Exception as exc:
-                        row = {
-                            "timestamp": now_iso(),
-                            "assignment_id": assignment["id"],
-                            "mode": assignment["mode"],
-                            "role": task["role"],
-                            "task_id": task["id"],
-                            "replicate": replicate,
-                            "model": assignment["mapping"].get(task["role"], ""),
-                            "thinking": assignment.get("thinking", {}).get(task["role"]),
-                            "executor": args.executor,
-                            "provider_call_started": False,
-                            "status": "error",
-                            "execution_status": "failed",
-                            "error_type": "harness_internal",
-                            "error": f"{type(exc).__name__}: {exc}",
-                        }
-                        row["_evaluation"] = failed_evaluation(task, row, exc)
-                    evaluation = row.pop("_evaluation", None)
-                    append_result(results_path, row)
-                    executed_results.append(row)
-                    result_rows += 1
-                    if evaluation is not None:
-                        try:
-                            append_result(evaluations_path, evaluation)
-                            executed_evaluations.append(evaluation)
-                            evaluation_rows += 1
-                        except (OSError, TypeError, ValueError) as exc:
-                            evaluation_write_errors += 1
-                            print(f"Evaluation row could not be written for {task['id']}: {exc}", file=sys.stderr)
-                    cost = extract_cost(row.get("usage"))
-                    if cost is not None:
-                        actual_cost += cost
-                        actual_cost_seen = True
-                    if args.max_cost_usd is not None and row.get("provider_call_started"):
-                        if cost is None:
-                            budget_status = "unverifiable"
-                            stopped_reason = "provider_did_not_return_cost"
-                            stop = True
-                            break
-                        if actual_cost >= args.max_cost_usd:
-                            budget_status = "reached"
-                            stopped_reason = "actual_cost_reached_cap"
-                            stop = True
-                            break
-                    if judge_model:
-                        judge_row, judge_evaluation = run_fixed_judge(
-                            args.omp_bin,
-                            judge_model,
-                            task,
-                            row,
-                            evaluation or failed_evaluation(task, row, "deterministic evaluation unavailable"),
-                            int(getattr(args, "judge_timeout", FIXED_JUDGE_TIMEOUT)),
-                        )
-                        try:
-                            append_result(judge_results_path, judge_row)
-                            executed_judge_results.append(judge_row)
-                            judge_result_rows += 1
-                        except (OSError, TypeError, ValueError) as exc:
-                            judge_write_errors += 1
-                            print(f"Fixed-judge row could not be written for {task['id']}: {exc}", file=sys.stderr)
-                        try:
-                            append_result(judge_evaluations_path, judge_evaluation)
-                            executed_judge_evaluations.append(judge_evaluation)
-                            judge_evaluation_rows += 1
-                        except (OSError, TypeError, ValueError) as exc:
-                            judge_write_errors += 1
-                            print(f"Fixed-judge evaluation could not be written for {task['id']}: {exc}", file=sys.stderr)
-                        judge_cost = extract_cost(judge_row.get("usage"))
-                        if judge_cost is not None:
-                            actual_cost += judge_cost
-                            actual_cost_seen = True
-                        if args.max_cost_usd is not None and judge_row.get("provider_call_started"):
-                            if judge_cost is None:
-                                budget_status = "unverifiable"
-                                stopped_reason = "fixed_judge_did_not_return_cost"
+        stop = stopped_reason is not None
+        try:
+            for assignment in ordered:
+                applicable = [task for task in tasks if task_for_assignment(task, assignment)]
+                for replicate in range(1, args.runs + 1):
+                    for task in applicable:
+                        key = (assignment["id"], task["id"], replicate)
+                        row = result_index.get(key)
+                        evaluation = evaluation_index.get(key)
+                        fresh_candidate = row is None
+                        if fresh_candidate:
+                            try:
+                                verify_harness_fingerprint(current_harness)
+                            except RoleBenchError as exc:
+                                stopped_reason = "harness_integrity_changed"
+                                print(f"Execution stopped: {exc}", file=sys.stderr)
                                 stop = True
                                 break
-                            if actual_cost >= args.max_cost_usd:
+                            harness_error = None
+                            try:
+                                row = run_one(
+                                    args.omp_bin,
+                                    assignment,
+                                    task,
+                                    replicate,
+                                    output_dir,
+                                    args.timeout,
+                                    config_path,
+                                    args.executor,
+                                    controller_model,
+                                    allow_check_command,
+                                    artifacts_root,
+                                )
+                            except Exception as exc:
+                                harness_error = exc
+                                row = {
+                                    "timestamp": now_iso(),
+                                    "assignment_id": assignment["id"],
+                                    "mode": assignment["mode"],
+                                    "role": task["role"],
+                                    "task_id": task["id"],
+                                    "replicate": replicate,
+                                    "model": assignment["mapping"].get(task["role"], ""),
+                                    "thinking": assignment.get("thinking", {}).get(task["role"]),
+                                    "executor": args.executor,
+                                    "provider_call_started": False,
+                                    "status": "error",
+                                    "execution_status": "failed",
+                                    "error_type": "harness_internal",
+                                    "error": f"{type(exc).__name__}: {exc}",
+                                }
+                                row["_evaluation"] = failed_evaluation(task, row, exc)
+                            row.setdefault("assignment_id", assignment["id"])
+                            row.setdefault("mode", assignment["mode"])
+                            row.setdefault("role", task["role"])
+                            row.setdefault("task_id", task["id"])
+                            row.setdefault("replicate", replicate)
+                            row.setdefault("model", assignment["mapping"].get(task["role"], ""))
+                            row.setdefault("thinking", assignment.get("thinking", {}).get(task["role"]))
+                            evaluation = row.pop("_evaluation", None)
+                            try:
+                                verify_harness_fingerprint(current_harness)
+                            except RoleBenchError as exc:
+                                row.setdefault("warnings", []).append({"type": "harness_integrity", "error": str(exc)})
+                                stopped_reason = "harness_integrity_changed"
+                                stop = True
+                            append_result(results_path, row)
+                            executed_results.append(row)
+                            result_index[key] = row
+                            result_rows += 1
+                            if evaluation is not None:
+                                try:
+                                    append_result(evaluations_path, evaluation)
+                                    executed_evaluations.append(evaluation)
+                                    evaluation_index[key] = evaluation
+                                    evaluation_rows += 1
+                                except (OSError, TypeError, ValueError) as exc:
+                                    evaluation_write_errors += 1
+                                    stopped_reason = "evaluation_write_failed"
+                                    stop = True
+                                    print(f"Evaluation row could not be written for {task['id']}: {exc}", file=sys.stderr)
+                            warnings = row.get("warnings", []) if isinstance(row.get("warnings"), list) else []
+                            harness_warnings = [warning for warning in warnings if isinstance(warning, dict) and warning.get("type") in {"workspace_evidence", "artifact_write", "evaluation"}]
+                            if harness_error is not None or harness_warnings:
+                                stopped_reason = "harness_internal" if harness_error is not None else "harness_evidence_failed"
+                                stop = True
+                            elif row.get("error_type") in HARNESS_ERROR_TYPES:
+                                stopped_reason = "harness_execution_failed"
+                                stop = True
+                        else:
+                            skipped_cells += 1
+                        cost = extract_cost(row.get("usage")) if fresh_candidate else None
+                        if cost is not None:
+                            actual_cost += cost
+                            actual_cost_seen = True
+                        if fresh_candidate and args.max_cost_usd is not None and row.get("provider_call_started"):
+                            if cost is None:
+                                budget_status = "unverifiable"
+                                stopped_reason = "provider_did_not_return_cost"
+                                stop = True
+                            elif actual_cost >= args.max_cost_usd:
                                 budget_status = "reached"
                                 stopped_reason = "actual_cost_reached_cap"
                                 stop = True
+                        if stop:
+                            break
+                        if judge_model and key not in judge_result_index:
+                            try:
+                                verify_harness_fingerprint(current_harness)
+                            except RoleBenchError as exc:
+                                stopped_reason = "harness_integrity_changed"
+                                print(f"Execution stopped: {exc}", file=sys.stderr)
+                                stop = True
                                 break
+                            try:
+                                judge_row, judge_evaluation = run_fixed_judge(
+                                    args.omp_bin,
+                                    judge_model,
+                                    task,
+                                    row,
+                                    evaluation or failed_evaluation(task, row, "deterministic evaluation unavailable"),
+                                    int(getattr(args, "judge_timeout", FIXED_JUDGE_TIMEOUT)),
+                                )
+                            except Exception as exc:
+                                judge_row = {
+                                    "schema_version": FIXED_JUDGE_SCHEMA_VERSION,
+                                    "judge_result_id": f"{assignment['id']}:{task['id']}:{replicate}",
+                                    "timestamp": now_iso(),
+                                    "assignment_id": assignment["id"],
+                                    "task_id": task["id"],
+                                    "role": task["role"],
+                                    "model": judge_model,
+                                    "replicate": replicate,
+                                    "evaluator": "fixed_judge",
+                                    "rubric_version": FIXED_JUDGE_RUBRIC_VERSION,
+                                    "provider_call_started": False,
+                                    "status": "error",
+                                    "execution_status": "failed",
+                                    "error_type": "judge_internal",
+                                    "error": f"{type(exc).__name__}: {exc}",
+                                }
+                                judge_evaluation = build_judge_evaluation(task, row, judge_row, None, judge_row["error"])
+                                stopped_reason = "harness_judge_failed"
+                                stop = True
+                            try:
+                                verify_harness_fingerprint(current_harness)
+                            except RoleBenchError as exc:
+                                judge_row.setdefault("warnings", []).append({"type": "harness_integrity", "error": str(exc)})
+                                stopped_reason = "harness_integrity_changed"
+                                stop = True
+                            try:
+                                append_result(judge_results_path, judge_row)
+                                executed_judge_results.append(judge_row)
+                                judge_result_index[key] = judge_row
+                                judge_result_rows += 1
+                            except (OSError, TypeError, ValueError) as exc:
+                                judge_write_errors += 1
+                                stopped_reason = "judge_write_failed"
+                                stop = True
+                                print(f"Fixed-judge row could not be written for {task['id']}: {exc}", file=sys.stderr)
+                            try:
+                                append_result(judge_evaluations_path, judge_evaluation)
+                                executed_judge_evaluations.append(judge_evaluation)
+                                judge_evaluation_index[key] = judge_evaluation
+                                judge_evaluation_rows += 1
+                            except (OSError, TypeError, ValueError) as exc:
+                                judge_write_errors += 1
+                                stopped_reason = "judge_write_failed"
+                                stop = True
+                                print(f"Fixed-judge evaluation could not be written for {task['id']}: {exc}", file=sys.stderr)
+                            judge_cost = extract_cost(judge_row.get("usage"))
+                            if judge_cost is not None:
+                                actual_cost += judge_cost
+                                actual_cost_seen = True
+                            if args.max_cost_usd is not None and judge_row.get("provider_call_started"):
+                                if judge_cost is None:
+                                    budget_status = "unverifiable"
+                                    stopped_reason = "fixed_judge_did_not_return_cost"
+                                    stop = True
+                                elif actual_cost >= args.max_cost_usd:
+                                    budget_status = "reached"
+                                    stopped_reason = "actual_cost_reached_cap"
+                                    stop = True
+                        if stop:
+                            break
+                    if stop:
+                        break
                 if stop:
                     break
-            if stop:
-                break
+        except KeyboardInterrupt:
+            interrupted = True
+            stopped_reason = "interrupted"
+            print("Execution interrupted; persisted cells can be continued with --resume.", file=sys.stderr)
     recommendations = None
     if recommend and args.execute:
         recommendations = build_recommendations(
@@ -2842,10 +3269,18 @@ def run_command(args: argparse.Namespace) -> int:
         write_json(recommendations_path, recommendations)
     summary = {
         "run_dir": str(output_dir),
-        "status": "completed" if args.execute else "preview",
+        "status": (
+            "preview" if not args.execute
+            else "aborted" if stopped_reason == "interrupted" or stopped_reason in HARNESS_STOP_REASONS
+            else "stopped" if stopped_reason
+            else "completed"
+        ),
         "assignments": len(assignments),
         "tasks": len(tasks),
         "result_rows": result_rows,
+        "expected_result_rows": expected_cells,
+        "resumed": resume,
+        "skipped_cells": skipped_cells,
         "evaluation_rows": evaluation_rows,
         "evaluation_write_errors": evaluation_write_errors,
         "judge_result_rows": judge_result_rows,
@@ -2855,15 +3290,171 @@ def run_command(args: argparse.Namespace) -> int:
         "executed": bool(args.execute),
         "estimated_cost_usd": estimate["total_cost_usd"],
         "estimated_model_cost_usd": estimate["cost_usd"],
+        "estimated_controller_cost_usd": controller_estimate["cost_usd"],
         "estimated_judge_cost_usd": judge_estimate["cost_usd"],
         "actual_cost_usd": round(actual_cost, 8) if args.execute and actual_cost_seen else None,
         "max_cost_usd": args.max_cost_usd,
         "budget_status": budget_status,
         "stopped_reason": stopped_reason,
+        "harness_status": (
+            "changed" if stopped_reason == "harness_integrity_changed"
+            else "failed" if stopped_reason in HARNESS_STOP_REASONS
+            else "verified"
+        ),
     }
+    if args.max_cost_usd is not None and budget_status == "running" and not stopped_reason:
+        summary["budget_status"] = "within-cap"
     write_json(output_dir / "summary.json", summary)
     print(json.dumps(summary, ensure_ascii=False, indent=2))
-    return 0
+    if interrupted:
+        return 130
+    return 4 if stopped_reason in HARNESS_STOP_REASONS else 0
+
+
+def infer_task_type(task: dict[str, Any]) -> str:
+    if isinstance(task.get("task_type"), str):
+        return task["task_type"]
+    if task.get("requires_image"):
+        return "vision"
+    if task.get("failure_mode"):
+        return "failure-handling"
+    invariant_types = {item.get("type") for item in task.get("invariants", []) if isinstance(item, dict)}
+    if "command" in invariant_types or invariant_types & {"file_content_exact", "file_contains", "file_matches", "json_file_equals"}:
+        return "workspace/code"
+    if task.get("workspace"):
+        return "workspace"
+    return "output-only"
+
+
+def benchmark_scope(manifest: dict[str, Any]) -> list[dict[str, Any]]:
+    scope = []
+    for task in manifest.get("tasks", []):
+        if not isinstance(task, dict):
+            continue
+        workspace = task.get("workspace")
+        expected = task.get("expected") if isinstance(task.get("expected"), dict) else {}
+        invariants = task.get("invariants") if isinstance(task.get("invariants"), list) else []
+        expected_checks = 0
+        for key, value in expected.items():
+            expected_checks += len(value) if key in {"output_contains", "output_regex", "output_not_regex"} and isinstance(value, list) else 1
+        failure_mode = task.get("failure_mode") if isinstance(task.get("failure_mode"), dict) else {}
+        failure_checks = sum(
+            len(failure_mode.get(key, []))
+            for key in ("required_output_regex", "forbidden_output_regex")
+            if isinstance(failure_mode.get(key), list)
+        )
+        scope.append({
+            "task_id": task.get("id"),
+            "role": task.get("role"),
+            "scenario": task.get("scenario") or task.get("id"),
+            "task_type": infer_task_type(task),
+            "workspace": f"local:{Path(workspace).name}" if isinstance(workspace, str) and workspace else "isolated-empty",
+            "difficulty": task.get("difficulty", {}).get("level") if isinstance(task.get("difficulty"), dict) else None,
+            "dimensions": list(task.get("dimension_targets", [])),
+            "checks": len(invariants) + expected_checks + failure_checks,
+        })
+    return scope
+
+
+def summarized_dimension(values: list[dict[str, Any]], source: str) -> dict[str, Any]:
+    passes = sum(value.get("status") == "pass" for value in values)
+    failures = sum(value.get("status") == "fail" for value in values)
+    unknown = sum(value.get("status") == "unknown" for value in values)
+    scores = [float(value["score"]) for value in values if value.get("status") != "unknown" and isinstance(value.get("score"), (int, float))]
+    return {
+        "source": source,
+        "pass": passes,
+        "fail": failures,
+        "unknown": unknown,
+        "average_known_score": round(sum(scores) / len(scores), 4) if scores else None,
+    }
+
+
+def build_model_summary(
+    rows: list[dict[str, Any]],
+    evaluations: list[dict[str, Any]],
+    judge_evaluations: list[dict[str, Any]],
+    recommendations: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    row_groups: dict[tuple[str, str, str], list[dict[str, Any]]] = defaultdict(list)
+    evaluation_groups: dict[tuple[str, str, str], list[dict[str, Any]]] = defaultdict(list)
+    judge_groups: dict[tuple[str, str, str], list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        row_groups[(row.get("role", ""), row.get("model", ""), row.get("thinking") or "")].append(row)
+    for evaluation in evaluations:
+        evaluation_groups[(evaluation.get("role", ""), evaluation.get("model", ""), evaluation.get("thinking") or "")].append(evaluation)
+    for evaluation in judge_evaluations:
+        judge_groups[(evaluation.get("role", ""), evaluation.get("model", ""), evaluation.get("thinking") or "")].append(evaluation)
+    recommendation_candidates = {
+        (item.get("role", ""), item.get("model", ""), item.get("thinking") or ""): item
+        for item in (recommendations or {}).get("candidates", [])
+        if isinstance(item, dict)
+    }
+    recommended = {
+        (item.get("role", ""), item.get("model", ""), item.get("thinking") or "")
+        for item in (recommendations or {}).get("roles", [])
+        if isinstance(item, dict) and item.get("status") == "recommended"
+    }
+    summaries = []
+    for key in sorted(set(row_groups) | set(evaluation_groups) | set(judge_groups)):
+        role, model, thinking = key
+        raw_values = row_groups[key]
+        deterministic_values = evaluation_groups[key]
+        judge_values = judge_groups[key]
+        dimensions: dict[str, Any] = {}
+        dimension_names = [
+            dimension for dimension in EVALUATION_DIMENSIONS
+            if any(dimension in value.get("dimensions", {}) for value in [*deterministic_values, *judge_values])
+        ]
+        for dimension in dimension_names:
+            judge_dimension_values = [value["dimensions"][dimension] for value in judge_values if isinstance(value.get("dimensions", {}).get(dimension), dict)]
+            deterministic_dimension_values = [value["dimensions"][dimension] for value in deterministic_values if isinstance(value.get("dimensions", {}).get(dimension), dict)]
+            selected = judge_dimension_values or deterministic_dimension_values
+            dimensions[dimension] = summarized_dimension(selected, "fixed_judge" if judge_dimension_values else "deterministic")
+        outcome_values = judge_values or deterministic_values
+        outcomes = {status: sum(value.get("outcome") == status for value in outcome_values) for status in ("pass", "fail", "unknown")}
+        deterministic_outcomes = {status: sum(value.get("outcome") == status for value in deterministic_values) for status in ("pass", "fail", "unknown")}
+        judge_outcomes = {status: sum(value.get("outcome") == status for value in judge_values) for status in ("pass", "fail", "unknown")}
+
+        def overall_outcome(values: dict[str, int]) -> str:
+            if values["fail"]:
+                return "fail"
+            if values["unknown"] or not sum(values.values()):
+                return "unknown"
+            return "pass"
+
+        candidate = recommendation_candidates.get(key)
+        if key in recommended:
+            overall = "recommended"
+        elif candidate is not None:
+            overall = "eligible" if candidate.get("eligible") else "blocked"
+        else:
+            overall = f"D {overall_outcome(deterministic_outcomes)}"
+            if judge_values:
+                overall += f"; J {overall_outcome(judge_outcomes)}"
+        latency = [float(value["latency_ms"]) for value in raw_values if isinstance(value.get("latency_ms"), (int, float))]
+        costs = [cost for value in raw_values if (cost := extract_cost(value.get("usage"))) is not None]
+        summaries.append({
+            "role": role,
+            "model": model,
+            "thinking": thinking or None,
+            "runs": len(raw_values),
+            "deterministic_evaluations": len(deterministic_values),
+            "judge_evaluations": len(judge_values),
+            "execution_pass": sum(value.get("status") == "pass" for value in raw_values),
+            "execution_error": sum(value.get("status") != "pass" for value in raw_values),
+            "outcomes": outcomes,
+            "outcome_source": "fixed_judge" if judge_values else "deterministic",
+            "deterministic_outcomes": deterministic_outcomes,
+            "judge_outcomes": judge_outcomes,
+            "dimensions": dimensions,
+            "overall": overall,
+            "overall_reason": list(candidate.get("blocked_reasons", [])) if candidate and not candidate.get("eligible") else [],
+            "quality_score": candidate.get("quality_score") if candidate else None,
+            "p50_latency_ms": percentile(latency, 0.5),
+            "observed_cost_usd": round(sum(costs), 8) if raw_values and len(costs) == len(raw_values) else None,
+        })
+    return summaries
 
 
 def report_command(args: argparse.Namespace) -> int:
@@ -2875,27 +3466,14 @@ def report_command(args: argparse.Namespace) -> int:
     judge_evaluations_path = run_dir / "judge_evaluations.jsonl"
     recommendations_path = run_dir / "recommendations.json"
     manifest = load_json_document(manifest_path)
-    def load_jsonl(path: Path, label: str) -> list[dict[str, Any]]:
-        loaded = []
-        if not path.exists():
-            return loaded
-        for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
-            if not line.strip():
-                continue
-            try:
-                value = json.loads(line)
-            except json.JSONDecodeError as exc:
-                raise RoleBenchError(f"malformed {label} line {number}: {exc}") from exc
-            if not isinstance(value, dict):
-                raise RoleBenchError(f"malformed {label} line {number}: expected JSON object")
-            loaded.append(value)
-        return loaded
-
     rows = load_jsonl(results_path, "results.jsonl")
     evaluations = load_jsonl(evaluations_path, "evaluations.jsonl")
     judge_results = load_jsonl(judge_results_path, "judge_results.jsonl")
     judge_evaluations = load_jsonl(judge_evaluations_path, "judge_evaluations.jsonl")
     recommendations = load_json_document(recommendations_path) if recommendations_path.exists() else None
+    summary = load_json_document(run_dir / "summary.json") if (run_dir / "summary.json").exists() else None
+    scope = benchmark_scope(manifest)
+    model_summary = build_model_summary(rows, evaluations, judge_evaluations, recommendations)
     groups: dict[tuple[str, str, str], list[dict[str, Any]]] = defaultdict(list)
     for row in rows:
         groups[(row.get("role", ""), row.get("model", ""), row.get("thinking") or "")].append(row)
@@ -2907,10 +3485,16 @@ def report_command(args: argparse.Namespace) -> int:
         for dimension, value in evaluation.get("dimensions", {}).items():
             if isinstance(value, dict):
                 dimension_groups[(*key, dimension)].append(value)
+    summary_dimensions = [
+        dimension for dimension in EVALUATION_DIMENSIONS
+        if any(dimension in item.get("dimensions", {}) for item in model_summary)
+    ]
     lines = [
         "# OMP RoleBench Report",
         "",
         f"- Generated: {manifest.get('generated_at', 'unknown')}",
+        f"- Run status: `{summary.get('status', 'unknown') if isinstance(summary, dict) else 'unknown'}`",
+        f"- Resume count: {manifest.get('resume_count', 0)}",
         f"- Mode: `{manifest.get('mode', 'unknown')}`",
         f"- Roles: {', '.join(manifest.get('roles', []))}",
         f"- Assignments: {len(manifest.get('assignments', []))}",
@@ -2918,11 +3502,55 @@ def report_command(args: argparse.Namespace) -> int:
         f"- Evaluation rows: {len(evaluations)}",
         f"- Fixed-judge rows: {len(judge_evaluations)}",
         "",
+        "## Benchmark Scope",
+        "",
+        "| Task | Role | Scenario | Task type | Workspace | Difficulty | Checks | Dimensions |",
+        "|---|---|---|---|---|---:|---:|---|",
+    ]
+    for item in scope:
+        scenario = str(item.get("scenario") or "-").replace("|", "\\|")
+        dimensions = ", ".join(item.get("dimensions", [])) or "none"
+        difficulty = item.get("difficulty") if item.get("difficulty") is not None else "unknown"
+        lines.append(f"| `{item.get('task_id', '')}` | `{item.get('role', '')}` | {scenario} | `{item.get('task_type', '')}` | `{item.get('workspace', '')}` | {difficulty} | {item.get('checks', 0)} | `{dimensions}` |")
+    if model_summary:
+        model_header = ["Role", "Model", "Thinking", "Runs", "Eval D/J", "Execution P/E", "Outcome P/F/U"]
+        model_header.extend(dimension.replace("_", " ").title() for dimension in summary_dimensions)
+        model_header.extend(["Overall", "P50 ms", "Candidate cost"])
+        lines.extend(["", "## Model Summary", "", "| " + " | ".join(model_header) + " |", "|" + "|".join("---:" if index >= 3 and index <= 5 else "---" for index in range(len(model_header))) + "|"])
+        for item in model_summary:
+            outcomes = item["outcomes"]
+            cells = [
+                f"`{item['role']}`",
+                f"`{item['model']}`",
+                f"`{item.get('thinking') or '-'}`",
+                str(item["runs"]),
+                f"{item['deterministic_evaluations']}/{item['judge_evaluations']}",
+                f"{item['execution_pass']}/{item['execution_error']}",
+                f"{outcomes['pass']}/{outcomes['fail']}/{outcomes['unknown']}",
+            ]
+            for dimension in summary_dimensions:
+                value = item.get("dimensions", {}).get(dimension)
+                if not value:
+                    cells.append("-")
+                    continue
+                score = f"{value['average_known_score']:.2f}" if value.get("average_known_score") is not None else "-"
+                source = "J" if value.get("source") == "fixed_judge" else "D"
+                cells.append(f"{value['pass']}/{value['fail']}/{value['unknown']} ({score}, {source})")
+            overall = item["overall"]
+            if item.get("quality_score") is not None:
+                overall += f" (quality {item['quality_score']:.2f})"
+            p50 = f"{item['p50_latency_ms']:.1f}" if item.get("p50_latency_ms") is not None else "unknown"
+            cost = f"${item['observed_cost_usd']:.6f}" if item.get("observed_cost_usd") is not None else "unknown"
+            cells.extend([overall, p50, cost])
+            lines.append("| " + " | ".join(cells) + " |")
+        lines.extend(["", "Dimension cells are `pass/fail/unknown (average known score, source)`, where `J` is fixed judge and `D` is deterministic. Overall is a gate/recommendation status, not a composite score."])
+    lines.extend([
+        "",
         "## Execution",
         "",
         "| Role | Model | Thinking | Runs | Pass | Error | Pass rate | P50 latency (ms) | P95 latency (ms) | Avg output chars | Cost |",
         "|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|",
-    ]
+    ])
     for (role, model, thinking), values in sorted(groups.items()):
         passes = sum(value.get("status") == "pass" for value in values)
         errors = len(values) - passes
@@ -3023,7 +3651,7 @@ def report_command(args: argparse.Namespace) -> int:
             f"{role}/{model}:{thinking}" if thinking else f"{role}/{model}": values
             for (role, model, thinking), values in evaluation_groups.items()
         }
-        rendered = json.dumps({"manifest": manifest, "groups": serializable_groups, "evaluations": evaluations, "evaluation_groups": serializable_evaluation_groups, "judge_results": judge_results, "judge_evaluations": judge_evaluations, "recommendations": recommendations}, ensure_ascii=False, indent=2) + "\n"
+        rendered = json.dumps({"manifest": manifest, "summary": summary, "scope": scope, "model_summary": model_summary, "groups": serializable_groups, "evaluations": evaluations, "evaluation_groups": serializable_evaluation_groups, "judge_results": judge_results, "judge_evaluations": judge_evaluations, "recommendations": recommendations}, ensure_ascii=False, indent=2) + "\n"
         if args.output:
             output = Path(args.output).expanduser()
             output.parent.mkdir(parents=True, exist_ok=True)
@@ -3084,6 +3712,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--recent-commits", type=int, default=5, help="maximum recent commits to include")
     run.add_argument("--runs", type=int, default=1)
     run.add_argument("--execute", action="store_true", help="invoke OMP; otherwise only write manifest")
+    run.add_argument("--resume", action="store_true", help="continue missing cells from an interrupted run with the same manifest and harness")
     run.add_argument("--executor", choices=("direct", "delegated"), default="direct", help="direct model call or a temporary OMP task agent")
     run.add_argument("--controller-model", help="controller model used by delegated executor")
     run.add_argument("--confirm", action="store_true", help="confirm the printed plan and cost estimate before execution")

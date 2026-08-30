@@ -4,7 +4,7 @@ RoleBench V1 keeps provider execution data separate from quality evaluation. It 
 
 ## Task schema
 
-Use task schema version 1. A JSON document may wrap tasks as `{"schema_version": 1, "tasks": [...]}`; JSONL contains one task object per line. Every task requires `id`, `role`, and `prompt`. Unknown task, expected-output, difficulty, failure-mode, or invariant keys are rejected before any model call so fixture typos cannot silently remove checks.
+Use task schema version 1. A JSON document may wrap tasks as `{"schema_version": 1, "tasks": [...]}`; JSONL contains one task object per line. Every task requires `id`, `role`, and `prompt`. Optional `scenario` and `task_type` strings make the report state what local scenario and task class were exercised. Unknown task, expected-output, difficulty, failure-mode, or invariant keys are rejected before any model call so fixture typos cannot silently remove checks.
 
 ```json
 {
@@ -14,6 +14,8 @@ Use task schema version 1. A JSON document may wrap tasks as `{"schema_version":
   "prompt": "Create result.txt containing PASS and change nothing else.",
   "pair_id": "task-write-note",
   "variant": "hard",
+  "scenario": "repair and verify a local Python script",
+  "task_type": "code-repair",
   "workspace": "/absolute/path/to/fixture",
   "difficulty": {
     "level": 2,
@@ -95,7 +97,7 @@ Each executed cell produces:
 
 An outcome is `fail` when execution fails or a deterministic check fails, `unknown` when evidence is missing, and `pass` only when every applicable check passes. When execution times out or fails, output-contract checks are `unknown` because empty or partial stdout is not correctness evidence. Dimension rows retain `status`, score `0` or `2` for deterministic fail/pass, or `null` for `unknown`, plus evidence, evaluator type, and hard-gate metadata. There is no composite score. Correctness, honesty, and safety are hard-gate dimensions, and `hard_gate_status` cannot be `pass` when no hard-gate evidence was evaluated.
 
-Snapshot, artifact, or evaluator failures are recorded as warnings or failed evaluations without changing a completed raw provider result. A last-resort per-cell boundary records unexpected harness failures and continues uncapped runs; capped runs still stop as unverifiable when a provider call may have occurred without returned cost. Evaluation JSONL write errors are counted in `summary.json`.
+Snapshot, artifact, or evaluator failures are recorded as warnings or failed evaluations without changing a completed raw provider result, then stop the complete run. A last-resort per-cell boundary records an unexpected harness failure as harness evidence and also stops; it is not attributed to the candidate. Evaluation JSONL write errors are counted in `summary.json` and stop the run because later cells would not have a comparable evidence chain. See [operations.md](operations.md) for interruption recovery and harness-integrity rules.
 
 ## V1 limits
 
