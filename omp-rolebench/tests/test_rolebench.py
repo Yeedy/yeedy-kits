@@ -147,6 +147,7 @@ class RoleBenchTests(unittest.TestCase):
         prompt = rolebench.build_fixed_judge_prompt(task, result, deterministic)
         self.assertIn(rolebench.FIXED_JUDGE_RUBRIC_VERSION, prompt)
         self.assertIn("evidence_quality", prompt)
+        self.assertIn("do not inspect a workspace or attempt any tool calls", prompt)
         self.assertNotIn("secret/provider", prompt)
         self.assertNotIn("/sensitive/workspace", prompt)
         self.assertNotIn("/sensitive/image.png", prompt)
@@ -250,6 +251,7 @@ class RoleBenchTests(unittest.TestCase):
         self.assertEqual(command[thinking_index + 1], "high")
         self.assertEqual(cwd_index, thinking_index + 2)
         self.assertTrue(command[cwd_index + 1])
+        self.assertEqual(command[cwd_index + 2], "--no-tools")
 
     @patch("rolebench.subprocess.run")
     def test_fixed_judge_reads_final_assistant_event_and_list_dimensions(self, run):
@@ -260,7 +262,12 @@ class RoleBenchTests(unittest.TestCase):
         }
         events = [
             {"type": "message_end", "message": {"role": "user", "content": [{"type": "text", "text": "PROMPT"}], "usage": {"cost": {"total": 0}}}},
-            {"type": "message_end", "message": {"role": "assistant", "content": [{"type": "text", "text": "```json\n" + json.dumps(judge_payload) + "\n```"}], "usage": {"input": 5, "output": 2, "totalTokens": 7, "cost": {"total": 0.01}}}},
+            {"type": "message_start", "message": {"role": "assistant", "content": [{"type": "thinking", "thinking": "private"}]}},
+            {"type": "message_update", "assistantMessageEvent": {"type": "text_start", "contentIndex": 1}},
+            {"type": "message_update", "assistantMessageEvent": {"type": "text_delta", "contentIndex": 1, "delta": "```json\n"}},
+            {"type": "message_update", "assistantMessageEvent": {"type": "text_delta", "contentIndex": 1, "delta": json.dumps(judge_payload)}},
+            {"type": "message_update", "assistantMessageEvent": {"type": "text_end", "contentIndex": 1, "content": "```json\n" + json.dumps(judge_payload) + "\n```"}},
+            {"type": "message_end", "message": {"role": "assistant", "content": [{"type": "thinking", "thinking": "private"}], "usage": {"input": 5, "output": 2, "totalTokens": 7, "cost": {"total": 0.01}}}},
         ]
         run.return_value = SimpleNamespace(returncode=0, stdout="\n".join(json.dumps(event) for event in events), stderr="")
         task = {"id": "task-judge", "role": "task", "prompt": "do", "dimension_targets": ["correctness"]}
@@ -271,6 +278,26 @@ class RoleBenchTests(unittest.TestCase):
         self.assertNotIn("PROMPT", raw["output"])
         self.assertEqual(rolebench.extract_cost(raw["usage"]), 0.01)
         self.assertEqual(evaluation["dimensions"]["correctness"]["status"], "pass")
+
+    def test_omp_event_stream_prefers_last_finalized_text_segment(self):
+        final = '{"dimensions":{"correctness":{"status":"pass","score":2,"evidence":["matched"]}}}'
+        payload = [
+            {"type": "message_start", "message": {"role": "assistant", "content": []}},
+            {"type": "message_update", "assistantMessageEvent": {"type": "text_end", "contentIndex": 0, "content": "I will inspect the workspace."}},
+            {"type": "message_update", "assistantMessageEvent": {"type": "text_end", "contentIndex": 2, "content": final}},
+            {
+                "type": "message_end",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "text", "text": "I will inspect the workspace."},
+                        {"type": "toolCall", "name": "read"},
+                        {"type": "text", "text": final},
+                    ],
+                },
+            },
+        ]
+        self.assertEqual(rolebench.extract_output(payload), final)
 
     @patch("rolebench.subprocess.run", side_effect=OSError("omp is missing"))
     def test_fixed_judge_marks_call_started_only_before_subprocess(self, run):

@@ -44,9 +44,9 @@ This is change detection, not host isolation. OMP tools and explicitly approved 
 
 ## OMP compatibility
 
-The harness requires OMP print mode with `-p`, `--mode json`, `--no-session`, `--no-title`, `--model`, `--config`, `--append-system-prompt`, `--cwd`, `--auto-approve`, `--thinking`, and delegated `--tools task`. Model discovery requires `omp models --json`.
+The harness requires OMP print mode with `-p`, `--mode json`, `--no-session`, `--no-title`, `--model`, `--config`, `--append-system-prompt`, `--cwd`, `--auto-approve`, `--thinking`, fixed-judge `--no-tools`, and delegated `--tools task`. Model discovery requires `omp models --json`.
 
-OMP event extraction selects the last completed assistant text and aggregates usage only when every completed assistant message contains a usage object. Missing usage stays unknown. Before a paid benchmark after an OMP upgrade:
+OMP event extraction selects the final text segment from the last completed assistant turn, including finalized `message_update` text when `message_end` contains merged earlier chatter. It aggregates usage only when every completed assistant message contains a usage object. Missing usage stays unknown. Before a paid benchmark after an OMP upgrade:
 
 1. Run `omp --version` and inspect `omp -p --help` for the required flags.
 2. Run `rolebench.py discover --omp-bin omp` and confirm the catalog normalizes to provider/model selectors.

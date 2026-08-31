@@ -51,7 +51,7 @@ python3 omp-rolebench/scripts/rolebench.py run \
 
 ## Judge contract
 
-The current rubric version is recorded as `rolebench-v2-20260829`. The prompt requires JSON with a `dimensions` object. Each requested dimension has:
+The current rubric version is recorded as `rolebench-v2-20260831`. The prompt requires JSON with a `dimensions` object. Each requested dimension has:
 
 ```json
 {
@@ -61,7 +61,7 @@ The current rubric version is recorded as `rolebench-v2-20260829`. The prompt re
 }
 ```
 
-RoleBench reads only the final completed assistant text from the OMP event stream. It accepts the equivalent k3 layouts observed in real runs: a dimension object, a dimension list keyed by `name` or `dimension`, a requested-dimension map under `evaluation`, or requested dimensions at the top level. These layouts are normalized to the canonical dimension object; duplicate or malformed entries still fail visibly. Scores become `2` for pass, `0` for fail, and `null` for unknown. Missing dimensions, malformed evidence, invalid JSON, non-zero exit, and timeout all become `unknown`. The fixed judge is an external evaluator, not a self-reporting field from the candidate model. Its prompt is versioned in code and its raw stdout/stderr are retained for audit.
+RoleBench runs the fixed judge with `--no-tools` in an empty temporary working directory. The prompt packet contains the complete task, candidate output, and deterministic evidence needed for evaluation; the judge must not investigate the workspace or run tools. RoleBench reads the final text segment from the last completed assistant turn in the OMP event stream. When a provider emits finalized text through `message_update.assistantMessageEvent.text_end`, that segment takes precedence over a `message_end` payload that may merge earlier tool chatter. It accepts the equivalent k3 layouts observed in real runs: a dimension object, a dimension list keyed by `name` or `dimension`, a requested-dimension map under `evaluation`, or requested dimensions at the top level. These layouts are normalized to the canonical dimension object; duplicate or malformed entries still fail visibly. Scores become `2` for pass, `0` for fail, and `null` for unknown. Missing dimensions, malformed evidence, invalid JSON, non-zero exit, and timeout all become `unknown`. The fixed judge is an external evaluator, not a self-reporting field from the candidate model. Its prompt is versioned in code and its raw stdout/stderr are retained for audit.
 
 ## Artifacts and reports
 

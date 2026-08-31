@@ -223,7 +223,7 @@ EVIDENCE_TEXT_LIMIT = 1000
 SAFE_COMMAND_ENV_KEYS = ("PATH", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "TMPDIR", "SYSTEMROOT", "PATHEXT")
 REGEX_WORKER = "import json,re,sys; pattern,text=json.load(sys.stdin); sys.exit(0 if re.search(pattern,text) else 1)"
 FIXED_JUDGE_SCHEMA_VERSION = 1
-FIXED_JUDGE_RUBRIC_VERSION = "rolebench-v2-20260829"
+FIXED_JUDGE_RUBRIC_VERSION = "rolebench-v2-20260831"
 FIXED_JUDGE_OUTPUT_TOKENS = 768
 FIXED_JUDGE_TIMEOUT = 180
 JUDGE_INPUT_LIMIT = 64 * 1024
@@ -1734,25 +1734,33 @@ def write_workspace_artifacts(output_dir: Path, artifacts_root: Path, identity: 
     }
 
 
-def omp_completed_messages(payload: Any) -> list[dict[str, Any]] | None:
+def omp_event_stream(payload: Any) -> list[Any] | None:
     if isinstance(payload, list):
         events = payload
-    elif isinstance(payload, dict) and payload.get("type") in {"message_start", "message_end"}:
+    elif isinstance(payload, dict) and payload.get("type") in {"message_start", "message_update", "message_end"}:
         events = [payload]
     elif isinstance(payload, dict) and isinstance(payload.get("events"), list):
         events = payload["events"]
     else:
         return None
-    saw_message_event = False
+    return events if any(
+        isinstance(event, dict) and event.get("type") in {"message_start", "message_update", "message_end"}
+        for event in events
+    ) else None
+
+
+def omp_completed_messages(payload: Any) -> list[dict[str, Any]] | None:
+    events = omp_event_stream(payload)
+    if events is None:
+        return None
     messages = []
     for event in events:
-        if not isinstance(event, dict) or event.get("type") not in {"message_start", "message_end"}:
+        if not isinstance(event, dict) or event.get("type") != "message_end":
             continue
-        saw_message_event = True
         message = event.get("message")
-        if event.get("type") == "message_end" and isinstance(message, dict):
+        if isinstance(message, dict):
             messages.append(message)
-    return messages if saw_message_event else None
+    return messages
 
 
 def message_text(message: dict[str, Any]) -> str:
@@ -1770,10 +1778,53 @@ def message_text(message: dict[str, Any]) -> str:
     return "".join(chunks)
 
 
+def omp_assistant_outputs(payload: Any) -> list[str] | None:
+    events = omp_event_stream(payload)
+    if events is None:
+        return None
+    answers = []
+    finalized_segments: list[str] = []
+    segment_deltas: dict[Any, list[str]] = {}
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        event_type = event.get("type")
+        message = event.get("message")
+        if event_type == "message_start" and isinstance(message, dict) and message.get("role") == "assistant":
+            finalized_segments = []
+            segment_deltas = {}
+            continue
+        if event_type == "message_update":
+            update = event.get("assistantMessageEvent")
+            if not isinstance(update, dict):
+                continue
+            content_index = update.get("contentIndex", 0)
+            update_type = update.get("type")
+            if update_type == "text_start":
+                segment_deltas[content_index] = []
+            elif update_type == "text_delta" and isinstance(update.get("delta"), str):
+                segment_deltas.setdefault(content_index, []).append(update["delta"])
+            elif update_type == "text_end":
+                content = update.get("content")
+                if not isinstance(content, str):
+                    content = "".join(segment_deltas.get(content_index, []))
+                if content.strip():
+                    finalized_segments.append(content)
+            continue
+        if event_type == "message_end" and isinstance(message, dict) and message.get("role") == "assistant":
+            answer = next((segment for segment in reversed(finalized_segments) if segment.strip()), "")
+            if not answer:
+                answer = message_text(message)
+            if answer.strip():
+                answers.append(answer)
+            finalized_segments = []
+            segment_deltas = {}
+    return answers
+
+
 def extract_output(payload: Any) -> str:
-    completed_messages = omp_completed_messages(payload)
-    if completed_messages is not None:
-        answers = [message_text(message) for message in completed_messages if message.get("role") == "assistant"]
+    answers = omp_assistant_outputs(payload)
+    if answers is not None:
         return next((answer for answer in reversed(answers) if answer.strip()), "")
     if isinstance(payload, str):
         return payload
@@ -2045,6 +2096,7 @@ def build_fixed_judge_prompt(task: dict[str, Any], result: dict[str, Any], deter
     return (
         "You are the fixed semantic evaluator for OMP RoleBench. "
         f"Rubric version: {FIXED_JUDGE_RUBRIC_VERSION}. Return JSON only, with no markdown. "
+        "Use only the evidence packet below; do not inspect a workspace or attempt any tool calls. "
         "Evaluate the work against the task and available evidence, never infer hidden actions, "
         "and mark unsupported claims unknown. For each requested dimension return status pass, fail, "
         "or unknown; score must be 0 for fail, 2 for pass, and null for unknown; evidence must be a "
@@ -2237,7 +2289,7 @@ def run_fixed_judge(omp_bin: str, judge_model: str, task: dict[str, Any], result
             ]
             if judge_selector.get("thinking"):
                 judge_command.extend(["--thinking", judge_selector["thinking"]])
-            judge_command.extend(["--cwd", directory, "--auto-approve", prompt])
+            judge_command.extend(["--cwd", directory, "--no-tools", "--auto-approve", prompt])
             raw["provider_call_started"] = True
             try:
                 completed = subprocess.run(
