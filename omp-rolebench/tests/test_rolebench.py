@@ -299,6 +299,26 @@ class RoleBenchTests(unittest.TestCase):
         ]
         self.assertEqual(rolebench.extract_output(payload), final)
 
+    def test_omp_event_stream_joins_deltas_when_text_end_omits_content(self):
+        payload = [
+            {"type": "message_start", "message": {"role": "assistant", "content": []}},
+            {"type": "message_update", "assistantMessageEvent": {"type": "text_start", "contentIndex": 0}},
+            {"type": "message_update", "assistantMessageEvent": {"type": "text_delta", "contentIndex": 0, "delta": "hel"}},
+            {"type": "message_update", "assistantMessageEvent": {"type": "text_delta", "contentIndex": 0, "delta": "lo"}},
+            {"type": "message_update", "assistantMessageEvent": {"type": "text_end", "contentIndex": 0}},
+            {"type": "message_end", "message": {"role": "assistant", "content": []}},
+        ]
+        self.assertEqual(rolebench.extract_output(payload), "hello")
+
+    def test_omp_event_stream_discards_aborted_assistant_turn_segments(self):
+        payload = [
+            {"type": "message_start", "message": {"role": "assistant", "content": []}},
+            {"type": "message_update", "assistantMessageEvent": {"type": "text_end", "contentIndex": 0, "content": "OLD"}},
+            {"type": "message_start", "message": {"role": "assistant", "content": []}},
+            {"type": "message_end", "message": {"role": "assistant", "content": [{"type": "text", "text": "NEW"}]}},
+        ]
+        self.assertEqual(rolebench.extract_output(payload), "NEW")
+
     @patch("rolebench.subprocess.run", side_effect=OSError("omp is missing"))
     def test_fixed_judge_marks_call_started_only_before_subprocess(self, run):
         task = {"id": "task-judge", "role": "task", "prompt": "do", "dimension_targets": ["correctness"]}
