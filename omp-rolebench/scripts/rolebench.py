@@ -2793,6 +2793,35 @@ def rotate_stale_results(path: Path) -> str | None:
     return str(rotated)
 
 
+def persist_summary_and_reports(output_dir: Path, summary: dict[str, Any]) -> bool:
+    """Persist a run summary and render the reports that belong to that run."""
+    summary_path = output_dir / "summary.json"
+    report_info = {
+        "markdown": str(output_dir / "report.md"),
+        "json": str(output_dir / "report.json"),
+        "status": "pending",
+    }
+    summary["reports"] = report_info
+    write_json(summary_path, summary)
+    try:
+        report_command(argparse.Namespace(
+            run=str(output_dir), format="markdown", output=report_info["markdown"], quiet=True,
+        ))
+        report_info["status"] = "generated"
+        write_json(summary_path, summary)
+        report_command(argparse.Namespace(
+            run=str(output_dir), format="json", output=report_info["json"], quiet=True,
+        ))
+    except Exception as exc:
+        report_info["status"] = "failed"
+        report_info["error"] = f"{type(exc).__name__}: {exc}"
+        write_json(summary_path, summary)
+        print(f"Run report could not be written: {exc}", file=sys.stderr)
+        return False
+    write_json(summary_path, summary)
+    return True
+
+
 def append_result(path: Path, row: dict[str, Any]) -> None:
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(row, ensure_ascii=False) + "\n")
@@ -2842,14 +2871,19 @@ def run_command(args: argparse.Namespace) -> int:
     judge_results_path = output_dir / "judge_results.jsonl"
     judge_evaluations_path = output_dir / "judge_evaluations.jsonl"
     recommendations_path = output_dir / "recommendations.json"
+    report_markdown_path = output_dir / "report.md"
+    report_json_path = output_dir / "report.json"
     if resume:
         previous_results = previous_evaluations = previous_judge_results = previous_judge_evaluations = previous_recommendations = None
+        previous_report_markdown = previous_report_json = None
     else:
         previous_results = rotate_stale_results(results_path)
         previous_evaluations = rotate_stale_results(evaluations_path)
         previous_judge_results = rotate_stale_results(judge_results_path)
         previous_judge_evaluations = rotate_stale_results(judge_evaluations_path)
         previous_recommendations = rotate_stale_results(recommendations_path)
+        previous_report_markdown = rotate_stale_results(report_markdown_path)
+        previous_report_json = rotate_stale_results(report_json_path)
     command_checks = task_command_check_count(tasks)
     command_argvs = task_command_argvs(tasks)
     allow_check_command = bool(getattr(args, "allow_check_command", False))
@@ -2886,6 +2920,8 @@ def run_command(args: argparse.Namespace) -> int:
         "previous_judge_results": previous_judge_results,
         "previous_judge_evaluations": previous_judge_evaluations,
         "previous_recommendations": previous_recommendations,
+        "previous_report_markdown": previous_report_markdown,
+        "previous_report_json": previous_report_json,
         "judge_model": judge_model,
         "judge_model_source": judge_model_source,
         "judge_timeout": getattr(args, "judge_timeout", FIXED_JUDGE_TIMEOUT),
@@ -2959,38 +2995,38 @@ def run_command(args: argparse.Namespace) -> int:
             "completed_judge_cells": len(persisted_judges),
             "remaining_judge_cells": max(0, expected_resume_cells - len(persisted_judges)) if judge_model else 0,
         }
-        for key in ("previous_results", "previous_evaluations", "previous_judge_results", "previous_judge_evaluations", "previous_recommendations"):
+        for key in ("previous_results", "previous_evaluations", "previous_judge_results", "previous_judge_evaluations", "previous_recommendations", "previous_report_markdown", "previous_report_json"):
             manifest[key] = previous_manifest.get(key)
     write_json(manifest_path, manifest)
     print(format_plan(manifest), flush=True)
     if args.execute and command_checks and not allow_check_command:
         summary = {"run_dir": str(output_dir), "status": "blocked", "reason": "command_checks_not_approved", "executed": False, "command_checks": command_checks}
-        write_json(output_dir / "summary.json", summary)
+        report_ok = persist_summary_and_reports(output_dir, summary)
         print("Execution blocked: task fixtures contain command checks; review argv and add --allow-check-command.", file=sys.stderr)
-        return 2
+        return 2 if report_ok else 4
     if args.execute and judge_model and judge_estimate["cost_status"] != "estimated":
         summary = {"run_dir": str(output_dir), "status": "blocked", "reason": "judge_cost_unknown", "executed": False, "estimate": estimate}
-        write_json(output_dir / "summary.json", summary)
+        report_ok = persist_summary_and_reports(output_dir, summary)
         print("Execution blocked: fixed-judge cost is unknown; provide --pricing-file with the judge rate.", file=sys.stderr)
-        return 2
+        return 2 if report_ok else 4
     if args.max_cost_usd is not None:
         if estimate["total_cost_status"] != "estimated":
             summary = {"run_dir": str(output_dir), "status": "blocked", "reason": "cost_unknown", "executed": False, "estimate": estimate}
-            write_json(output_dir / "summary.json", summary)
+            report_ok = persist_summary_and_reports(output_dir, summary)
             print("Execution blocked: candidate, controller, or fixed-judge cost is unknown; provide --pricing-file with all rates.", file=sys.stderr)
-            return 2
+            return 2 if report_ok else 4
         if estimate["total_cost_usd"] > args.max_cost_usd:
             summary = {"run_dir": str(output_dir), "status": "blocked", "reason": "estimated_cost_exceeds_cap", "estimated_cost_usd": estimate["total_cost_usd"], "model_cost_usd": estimate["cost_usd"], "controller_cost_usd": controller_estimate["cost_usd"], "judge_cost_usd": judge_estimate["cost_usd"], "max_cost_usd": args.max_cost_usd, "executed": False}
-            write_json(output_dir / "summary.json", summary)
+            report_ok = persist_summary_and_reports(output_dir, summary)
             print(f"Execution blocked: estimated total cost ${estimate['total_cost_usd']:.6f} exceeds cap ${args.max_cost_usd:.6f}.", file=sys.stderr)
-            return 2
+            return 2 if report_ok else 4
     if args.confirm and not args.execute:
         raise RoleBenchError("--confirm requires --execute")
     if args.execute and not args.confirm:
         summary = {"run_dir": str(output_dir), "status": "awaiting_consent", "reason": "missing_confirm", "executed": False, "estimate": estimate}
-        write_json(output_dir / "summary.json", summary)
+        report_ok = persist_summary_and_reports(output_dir, summary)
         print("Execution blocked: obtain user consent, then rerun with --execute --confirm.", file=sys.stderr)
-        return 3
+        return 3 if report_ok else 4
     result_rows = 0
     evaluation_rows = 0
     evaluation_write_errors = 0
@@ -3304,11 +3340,11 @@ def run_command(args: argparse.Namespace) -> int:
     }
     if args.max_cost_usd is not None and budget_status == "running" and not stopped_reason:
         summary["budget_status"] = "within-cap"
-    write_json(output_dir / "summary.json", summary)
+    report_ok = persist_summary_and_reports(output_dir, summary)
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     if interrupted:
         return 130
-    return 4 if stopped_reason in HARNESS_STOP_REASONS else 0
+    return 4 if stopped_reason in HARNESS_STOP_REASONS or not report_ok else 0
 
 
 def infer_task_type(task: dict[str, Any]) -> str:
@@ -3656,14 +3692,16 @@ def report_command(args: argparse.Namespace) -> int:
             output = Path(args.output).expanduser()
             output.parent.mkdir(parents=True, exist_ok=True)
             output.write_text(rendered, encoding="utf-8")
-            print(output)
+            if not getattr(args, "quiet", False):
+                print(output)
         else:
             print(rendered, end="")
     elif args.output:
         output = Path(args.output).expanduser()
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(report, encoding="utf-8")
-        print(output)
+        if not getattr(args, "quiet", False):
+            print(output)
     else:
         print(report, end="")
     return 0

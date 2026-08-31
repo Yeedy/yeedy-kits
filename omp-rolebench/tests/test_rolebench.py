@@ -1473,6 +1473,10 @@ class RoleBenchTests(unittest.TestCase):
             self.assertFalse((root / "run" / "recommendations.json").exists())
             summary = json.loads((root / "run" / "summary.json").read_text(encoding="utf-8"))
             self.assertEqual(summary["recommendations"], "not-executed")
+            self.assertEqual(summary["reports"]["status"], "generated")
+            report = (root / "run" / "report.md").read_text(encoding="utf-8")
+            self.assertIn("## Benchmark Scope", report)
+            self.assertIn("task-1", report)
 
     def test_cli_rejects_invalid_run_limits(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1506,16 +1510,26 @@ class RoleBenchTests(unittest.TestCase):
             old_judge = output / "judge_results.jsonl"
             old_evaluation = output / "judge_evaluations.jsonl"
             old_recommendation = output / "recommendations.json"
+            old_report_markdown = output / "report.md"
+            old_report_json = output / "report.json"
             old_judge.write_text('{"model":"judge/old"}\n', encoding="utf-8")
             old_evaluation.write_text('{"evaluator":"fixed_judge"}\n', encoding="utf-8")
             old_recommendation.write_text('{"status":"complete"}\n', encoding="utf-8")
+            old_report_markdown.write_text("old report\n", encoding="utf-8")
+            old_report_json.write_text('{"old":true}\n', encoding="utf-8")
             self.assertEqual(rolebench.main(["run", "--models", "p/new", "--roles", "task", "--config-file", str(config), "--output", str(output)]), 0)
             self.assertFalse(old_judge.exists())
             self.assertFalse(old_evaluation.exists())
             self.assertFalse(old_recommendation.exists())
+            self.assertTrue(old_report_markdown.exists())
+            self.assertTrue(old_report_json.exists())
+            self.assertIn("# OMP RoleBench Report", old_report_markdown.read_text(encoding="utf-8"))
+            self.assertIn('"manifest"', old_report_json.read_text(encoding="utf-8"))
             self.assertEqual(len(list(output.glob("judge_results.jsonl.previous-*"))), 1)
             self.assertEqual(len(list(output.glob("judge_evaluations.jsonl.previous-*"))), 1)
             self.assertEqual(len(list(output.glob("recommendations.json.previous-*"))), 1)
+            self.assertEqual(len(list(output.glob("report.md.previous-*"))), 1)
+            self.assertEqual(len(list(output.glob("report.json.previous-*"))), 1)
 
     def test_discover_uses_catalog_fixture(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1653,6 +1667,29 @@ class RoleBenchTests(unittest.TestCase):
                 self.assertTrue((output / artifact).is_file())
             before_artifact = json.loads((output / evaluation["artifacts"]["workspace_before"]).read_text(encoding="utf-8"))
             self.assertFalse(any(path.startswith("run/") for path in before_artifact["files"]))
+            summary = json.loads((output / "summary.json").read_text(encoding="utf-8"))
+            self.assertEqual(summary["reports"]["status"], "generated")
+            self.assertEqual(summary["reports"]["markdown"], str(output / "report.md"))
+            report = (output / "report.md").read_text(encoding="utf-8")
+            self.assertIn("## Benchmark Scope", report)
+            self.assertIn("## Model Summary", report)
+            self.assertIn("Correctness", report)
+            report_json = json.loads((output / "report.json").read_text(encoding="utf-8"))
+            self.assertEqual(report_json["scope"][0]["task_id"], "task-1")
+            self.assertIn("correctness", report_json["model_summary"][0]["dimensions"])
+
+    @patch.object(rolebench, "report_command", side_effect=OSError("disk full"))
+    def test_report_failure_is_recorded_without_reclassifying_run(self, report):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            args = self.make_run_args(root, execute=False, confirm=False)
+            with patch.object(rolebench, "load_tasks", return_value=[{"id": "task-1", "role": "task", "prompt": "do", "dimension_targets": ["correctness"]}]):
+                self.assertEqual(rolebench.run_command(args), 4)
+            summary = json.loads((root / "run" / "summary.json").read_text(encoding="utf-8"))
+            self.assertEqual(summary["status"], "preview")
+            self.assertIsNone(summary["stopped_reason"])
+            self.assertEqual(summary["reports"]["status"], "failed")
+            self.assertIn("disk full", summary["reports"]["error"])
 
     def test_command_checks_require_explicit_trust_and_run_after_approval(self):
         with tempfile.TemporaryDirectory() as directory:
