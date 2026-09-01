@@ -3,6 +3,8 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -46,6 +48,7 @@ class RoleBenchTests(unittest.TestCase):
             "recent_days": 14,
             "recent_commits": 5,
             "runs": 1,
+            "jobs": 1,
             "execute": True,
             "resume": False,
             "executor": "direct",
@@ -232,7 +235,16 @@ class RoleBenchTests(unittest.TestCase):
             "dimensions": {"correctness": {"status": "pass", "score": 2, "evidence": ["output matched"]}},
             "summary": "matched the declared contract",
         }
-        run.return_value = SimpleNamespace(returncode=0, stdout=json.dumps({"text": json.dumps(judge_payload)}), stderr="")
+        captured = {}
+
+        def complete(command, **_kwargs):
+            config = Path(command[command.index("--config") + 1])
+            cwd = Path(command[command.index("--cwd") + 1])
+            captured["config"] = config.read_text(encoding="utf-8")
+            captured["same_root"] = config.parent == cwd
+            return SimpleNamespace(returncode=0, stdout=json.dumps({"text": json.dumps(judge_payload)}), stderr="")
+
+        run.side_effect = complete
         task = {"id": "task-judge", "role": "task", "prompt": "do", "dimension_targets": ["correctness"]}
         result = {"assignment_id": "a", "task_id": "task-judge", "role": "task", "model": "secret/provider", "replicate": 1, "execution_status": "completed", "output": "PASS"}
         deterministic = {"execution_status": "completed", "outcome": "pass", "hard_gate_status": "pass", "checks": []}
@@ -247,11 +259,40 @@ class RoleBenchTests(unittest.TestCase):
         command = run.call_args.args[0]
         self.assertIn("judge/model", command)
         thinking_index = command.index("--thinking")
+        config_index = command.index("--config")
         cwd_index = command.index("--cwd")
         self.assertEqual(command[thinking_index + 1], "high")
-        self.assertEqual(cwd_index, thinking_index + 2)
+        self.assertEqual(config_index, thinking_index + 2)
+        self.assertEqual(cwd_index, config_index + 2)
         self.assertTrue(command[cwd_index + 1])
         self.assertEqual(command[cwd_index + 2], "--no-tools")
+        self.assertIn("--no-extensions", command)
+        self.assertIn("--no-skills", command)
+        self.assertIn("--no-rules", command)
+        self.assertTrue(captured["same_root"])
+        self.assertIn('default: "judge/model"', captured["config"])
+
+    @patch("rolebench.subprocess.run")
+    def test_fixed_judge_rebuild_uses_the_exact_accepted_payload(self, run):
+        judge_payload = {
+            "text": "human-readable summary",
+            "dimensions": {
+                "correctness": {"status": "pass", "score": 2, "evidence": ["matched"]},
+            },
+            "summary": "accepted",
+        }
+        run.return_value = SimpleNamespace(returncode=0, stdout=json.dumps(judge_payload), stderr="")
+        task = {"id": "task-judge", "role": "task", "prompt": "do", "dimension_targets": ["correctness"]}
+        result = {"assignment_id": "a", "task_id": "task-judge", "role": "task", "model": "p/a", "replicate": 1, "execution_status": "completed", "output": "PASS"}
+        deterministic = {"execution_status": "completed", "outcome": "pass", "hard_gate_status": "pass", "checks": []}
+        raw, evaluation = rolebench.run_fixed_judge("omp", "judge/model", task, result, deterministic, timeout=5)
+        rebuilt = rolebench.rebuild_judge_evaluation(task, result, raw)
+        self.assertEqual(raw["output"], "human-readable summary")
+        self.assertEqual(raw["evaluation_payload"], judge_payload)
+        self.assertEqual(
+            rolebench.judge_evaluation_audit_payload(rebuilt),
+            rolebench.judge_evaluation_audit_payload(evaluation),
+        )
 
     @patch("rolebench.subprocess.run")
     def test_fixed_judge_reads_final_assistant_event_and_list_dimensions(self, run):
@@ -1190,12 +1231,12 @@ class RoleBenchTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             task = {"id": "task-1", "role": "task", "prompt": "do", "dimension_targets": ["correctness"]}
-            first_evaluation = {"assignment_id": "assignment-001-01", "task_id": "task-1", "replicate": 1, "role": "task", "model": "p/a", "execution_status": "completed", "outcome": "pass", "hard_gate_status": "pass", "checks": [], "dimensions": {}}
+            first_evaluation = {"schema_version": 1, "assignment_id": "assignment-001-01", "task_id": "task-1", "replicate": 1, "role": "task", "model": "p/a", "thinking": None, "execution_status": "completed", "outcome": "pass", "hard_gate_status": "pass", "checks": [], "dimensions": {}}
             first = {"status": "pass", "execution_status": "completed", "provider_call_started": True, "output": "first", "_evaluation": first_evaluation}
             with patch.object(rolebench, "load_tasks", return_value=[task]):
                 with patch.object(rolebench, "run_one", side_effect=[first, KeyboardInterrupt]):
                     self.assertEqual(rolebench.run_command(self.make_run_args(root, runs=2)), 130)
-            second_evaluation = {"assignment_id": "assignment-001-01", "task_id": "task-1", "replicate": 2, "role": "task", "model": "p/a", "execution_status": "completed", "outcome": "pass", "hard_gate_status": "pass", "checks": [], "dimensions": {}}
+            second_evaluation = {"schema_version": 1, "assignment_id": "assignment-001-01", "task_id": "task-1", "replicate": 2, "role": "task", "model": "p/a", "thinking": None, "execution_status": "completed", "outcome": "pass", "hard_gate_status": "pass", "checks": [], "dimensions": {}}
             second = {"status": "pass", "execution_status": "completed", "provider_call_started": True, "output": "second", "_evaluation": second_evaluation}
             with patch.object(rolebench, "load_tasks", return_value=[task]):
                 with patch.object(rolebench, "run_one", return_value=second) as run:
@@ -1219,11 +1260,13 @@ class RoleBenchTests(unittest.TestCase):
             }), encoding="utf-8")
             task = {"id": "task-1", "role": "task", "prompt": "do", "dimension_targets": ["correctness"]}
             evaluation = {
+                "schema_version": 1,
                 "assignment_id": "assignment-001-01",
                 "task_id": "task-1",
                 "replicate": 1,
                 "role": "task",
                 "model": "p/a",
+                "thinking": None,
                 "execution_status": "completed",
                 "outcome": "pass",
                 "hard_gate_status": "pass",
@@ -1531,7 +1574,7 @@ class RoleBenchTests(unittest.TestCase):
             config = root / "config.yml"
             config.write_text("modelRoles:\n  task: p/base\n", encoding="utf-8")
             common = ["run", "--models", "p/a", "--roles", "task", "--config-file", str(config), "--output", str(root / "run")]
-            for option, value in (("--runs", "0"), ("--timeout", "0"), ("--max-cost-usd", "-1")):
+            for option, value in (("--runs", "0"), ("--jobs", "0"), ("--timeout", "0"), ("--max-cost-usd", "-1")):
                 self.assertEqual(rolebench.main(common + [option, value]), 2)
 
     def test_stale_results_are_rotated_on_rerun(self):
@@ -1810,6 +1853,944 @@ class RoleBenchTests(unittest.TestCase):
             run.assert_not_called()
             summary = json.loads((output / "summary.json").read_text(encoding="utf-8"))
             self.assertEqual(summary["reason"], "estimated_cost_exceeds_cap")
+
+    def test_parallel_direct_cells_respect_global_jobs_and_persist_unique_rows(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            lock = threading.Lock()
+            gate = threading.Barrier(3)
+            active = 0
+            peak = 0
+
+            def candidate(*_args):
+                nonlocal active, peak
+                with lock:
+                    active += 1
+                    peak = max(peak, active)
+                gate.wait(timeout=2)
+                time.sleep(0.02)
+                with lock:
+                    active -= 1
+                return {"status": "pass", "execution_status": "completed", "provider_call_started": False, "output": "done"}
+
+            task = {"id": "task-1", "role": "task", "prompt": "do", "dimension_targets": ["correctness"]}
+            with patch.object(rolebench, "load_tasks", return_value=[task]):
+                with patch.object(rolebench, "run_one", side_effect=candidate) as run:
+                    self.assertEqual(rolebench.run_command(self.make_run_args(root, runs=3, jobs=3)), 0)
+            rows = rolebench.load_jsonl(root / "run" / "results.jsonl", "results.jsonl")
+            identities = {(row["assignment_id"], row["task_id"], row["replicate"]) for row in rows}
+            summary = json.loads((root / "run" / "summary.json").read_text(encoding="utf-8"))
+            self.assertEqual(run.call_count, 3)
+            self.assertEqual(peak, 3)
+            self.assertEqual(len(rows), 3)
+            self.assertEqual(len(identities), 3)
+            self.assertEqual(summary["jobs"], 3)
+            self.assertEqual(summary["effective_jobs"], 3)
+            self.assertIn("Latency mode: `concurrent`", (root / "run" / "report.md").read_text(encoding="utf-8"))
+
+    def test_parallel_schedule_is_seed_stable_and_round_robins_assignments(self):
+        assignments = [
+            {"id": "a", "mode": "role-isolated", "role": "task", "mapping": {"task": "p/a"}},
+            {"id": "b", "mode": "role-isolated", "role": "task", "mapping": {"task": "p/b"}},
+        ]
+        tasks = [{"id": "task-1", "role": "task"}]
+        first = rolebench.build_cell_schedule(assignments, tasks, 3, seed=7, jobs=2)
+        second = rolebench.build_cell_schedule(assignments, tasks, 3, seed=7, jobs=2)
+        ids = [cell["assignment"]["id"] for cell in first]
+        self.assertEqual(ids, [cell["assignment"]["id"] for cell in second])
+        self.assertNotEqual(ids[0], ids[1])
+        self.assertEqual(ids[::2], [ids[0]] * 3)
+        self.assertEqual(ids[1::2], [ids[1]] * 3)
+
+    def test_parallel_judge_starts_only_after_candidate_result_is_persisted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pricing = root / "pricing.json"
+            pricing.write_text(json.dumps({
+                "p/a": {"input_per_million": 1, "output_per_million": 1},
+                "judge/model": {"input_per_million": 1, "output_per_million": 1},
+            }), encoding="utf-8")
+            persisted_before_judge = []
+
+            def judge(_omp_bin, judge_model, task, result, _evaluation, _timeout):
+                rows = rolebench.load_jsonl(root / "run" / "results.jsonl", "results.jsonl")
+                key = (result["assignment_id"], result["task_id"], result["replicate"])
+                persisted_before_judge.append(any(rolebench.cell_key(row) == key for row in rows))
+                raw = {
+                    "assignment_id": result["assignment_id"],
+                    "task_id": task["id"],
+                    "replicate": result["replicate"],
+                    "role": task["role"],
+                    "model": judge_model,
+                    "provider_call_started": False,
+                    "status": "pass",
+                    "execution_status": "completed",
+                }
+                evaluation = {
+                    "assignment_id": result["assignment_id"],
+                    "task_id": task["id"],
+                    "replicate": result["replicate"],
+                    "role": task["role"],
+                    "model": result["model"],
+                    "execution_status": "completed",
+                    "outcome": "pass",
+                    "hard_gate_status": "pass",
+                    "checks": [],
+                    "dimensions": {},
+                }
+                return raw, evaluation
+
+            task = {"id": "task-1", "role": "task", "prompt": "do", "dimension_targets": ["correctness"]}
+            candidate = {"status": "pass", "execution_status": "completed", "provider_call_started": False, "output": "done"}
+            args = self.make_run_args(root, runs=2, jobs=2, pricing_file=str(pricing), judge_model="judge/model")
+            with patch.object(rolebench, "load_tasks", return_value=[task]):
+                with patch.object(rolebench, "run_one", return_value=candidate):
+                    with patch.object(rolebench, "run_fixed_judge", side_effect=judge):
+                        self.assertEqual(rolebench.run_command(args), 0)
+            self.assertEqual(persisted_before_judge, [True, True])
+            self.assertEqual(len(rolebench.load_jsonl(root / "run" / "judge_results.jsonl", "judge_results.jsonl")), 2)
+
+    def test_jobs_one_preserves_candidate_then_judge_order_per_cell(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pricing = root / "pricing.json"
+            pricing.write_text(json.dumps({
+                "p/a": {"input_per_million": 1, "output_per_million": 1},
+                "judge/model": {"input_per_million": 1, "output_per_million": 1},
+            }), encoding="utf-8")
+            calls = []
+
+            def candidate(_omp_bin, _assignment, _task, replicate, *_args):
+                calls.append(("candidate", replicate))
+                return {"status": "pass", "execution_status": "completed", "provider_call_started": False, "output": "done"}
+
+            def judge(_omp_bin, judge_model, task, result, _evaluation, _timeout):
+                calls.append(("judge", result["replicate"]))
+                raw = {
+                    "schema_version": rolebench.FIXED_JUDGE_SCHEMA_VERSION,
+                    "judge_result_id": f"{result['assignment_id']}:{task['id']}:{result['replicate']}",
+                    "assignment_id": result["assignment_id"],
+                    "task_id": task["id"],
+                    "role": task["role"],
+                    "model": judge_model,
+                    "thinking": None,
+                    "replicate": result["replicate"],
+                    "evaluator": "fixed_judge",
+                    "rubric_version": rolebench.FIXED_JUDGE_RUBRIC_VERSION,
+                    "provider_call_started": False,
+                    "status": "pass",
+                    "execution_status": "completed",
+                }
+                evaluation = {
+                    "assignment_id": result["assignment_id"],
+                    "task_id": task["id"],
+                    "replicate": result["replicate"],
+                    "role": task["role"],
+                    "model": result["model"],
+                    "execution_status": "completed",
+                    "outcome": "pass",
+                    "hard_gate_status": "pass",
+                    "checks": [],
+                    "dimensions": {},
+                }
+                return raw, evaluation
+
+            task = {"id": "task-1", "role": "task", "prompt": "do", "dimension_targets": ["correctness"]}
+            args = self.make_run_args(root, runs=2, jobs=1, pricing_file=str(pricing), judge_model="judge/model")
+            with patch.object(rolebench, "load_tasks", return_value=[task]):
+                with patch.object(rolebench, "run_one", side_effect=candidate):
+                    with patch.object(rolebench, "run_fixed_judge", side_effect=judge):
+                        self.assertEqual(rolebench.run_command(args), 0)
+            self.assertEqual(calls, [("candidate", 1), ("judge", 1), ("candidate", 2), ("judge", 2)])
+
+    def test_parallel_budget_stop_drains_only_already_in_flight_cells(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pricing = root / "pricing.json"
+            pricing.write_text(json.dumps({"p/a": {"input_per_million": 1, "output_per_million": 1}}), encoding="utf-8")
+            gate = threading.Barrier(2)
+
+            def candidate(*_args):
+                gate.wait(timeout=2)
+                return {
+                    "status": "pass",
+                    "execution_status": "completed",
+                    "provider_call_started": True,
+                    "output": "done",
+                    "usage": {"cost": {"total": 0.6}},
+                }
+
+            task = {"id": "task-1", "role": "task", "prompt": "do"}
+            args = self.make_run_args(root, runs=4, jobs=2, pricing_file=str(pricing), max_cost_usd=0.5)
+            with patch.object(rolebench, "load_tasks", return_value=[task]):
+                with patch.object(rolebench, "run_one", side_effect=candidate) as run:
+                    self.assertEqual(rolebench.run_command(args), 0)
+            summary = json.loads((root / "run" / "summary.json").read_text(encoding="utf-8"))
+            self.assertEqual(run.call_count, 2)
+            self.assertEqual(summary["result_rows"], 2)
+            self.assertEqual(summary["budget_status"], "reached")
+            self.assertEqual(summary["actual_cost_usd"], 1.2)
+
+    def test_parallel_execution_rejects_delegated_and_resume_job_changes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with self.assertRaisesRegex(rolebench.RoleBenchError, "only with --executor direct"):
+                rolebench.run_command(self.make_run_args(root, jobs=2, executor="delegated"))
+            task = {"id": "task-1", "role": "task", "prompt": "do"}
+            row = {"status": "pass", "execution_status": "completed", "provider_call_started": False, "output": "done"}
+            with patch.object(rolebench, "load_tasks", return_value=[task]):
+                with patch.object(rolebench, "run_one", return_value=row):
+                    self.assertEqual(rolebench.run_command(self.make_run_args(root)), 0)
+            with patch.object(rolebench, "load_tasks", return_value=[task]):
+                with self.assertRaisesRegex(rolebench.RoleBenchError, "experiment does not match"):
+                    rolebench.run_command(self.make_run_args(root, jobs=2, resume=True))
+
+    def test_resume_rejects_audit_rows_outside_expected_cell_matrix(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            task = {"id": "task-1", "role": "task", "prompt": "do"}
+            row = {"status": "pass", "execution_status": "completed", "provider_call_started": False, "output": "done"}
+            with patch.object(rolebench, "load_tasks", return_value=[task]):
+                with patch.object(rolebench, "run_one", return_value=row):
+                    self.assertEqual(rolebench.run_command(self.make_run_args(root)), 0)
+            results_path = root / "run" / "results.jsonl"
+            persisted = json.loads(results_path.read_text(encoding="utf-8"))
+            persisted["assignment_id"] = "unexpected-assignment"
+            results_path.write_text(json.dumps(persisted) + "\n", encoding="utf-8")
+            with patch.object(rolebench, "load_tasks", return_value=[task]):
+                with self.assertRaisesRegex(rolebench.RoleBenchError, "do not belong to the expected matrix"):
+                    rolebench.run_command(self.make_run_args(root, resume=True))
+
+    def test_resume_rejects_candidate_metadata_from_another_assignment(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            task = {"id": "task-1", "role": "task", "prompt": "do"}
+            row = {"status": "pass", "execution_status": "completed", "provider_call_started": False, "output": "done"}
+            with patch.object(rolebench, "load_tasks", return_value=[task]):
+                with patch.object(rolebench, "run_one", return_value=row):
+                    self.assertEqual(rolebench.run_command(self.make_run_args(root)), 0)
+            results_path = root / "run" / "results.jsonl"
+            persisted = json.loads(results_path.read_text(encoding="utf-8"))
+            persisted["model"] = "p/wrong"
+            results_path.write_text(json.dumps(persisted) + "\n", encoding="utf-8")
+            with patch.object(rolebench, "load_tasks", return_value=[task]):
+                with self.assertRaisesRegex(rolebench.RoleBenchError, "candidate result row metadata"):
+                    rolebench.run_command(self.make_run_args(root, resume=True))
+
+    def test_resume_rejects_tampered_deterministic_evaluation_metadata(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            task = {"id": "task-1", "role": "task", "prompt": "do", "dimension_targets": ["correctness"]}
+            evaluation = {
+                "schema_version": 1,
+                "evaluation_status": "completed",
+                "assignment_id": "assignment-001-01",
+                "task_id": "task-1",
+                "replicate": 1,
+                "role": "task",
+                "model": "p/a",
+                "thinking": None,
+                "execution_status": "completed",
+                "outcome": "pass",
+                "hard_gate_status": "pass",
+                "checks": [],
+                "dimensions": {},
+            }
+            row = {"status": "pass", "execution_status": "completed", "provider_call_started": False, "output": "done", "_evaluation": evaluation}
+            with patch.object(rolebench, "load_tasks", return_value=[task]):
+                with patch.object(rolebench, "run_one", return_value=row):
+                    self.assertEqual(rolebench.run_command(self.make_run_args(root)), 0)
+            path = root / "run" / "evaluations.jsonl"
+            persisted = json.loads(path.read_text(encoding="utf-8"))
+            persisted["model"] = "stale/model"
+            path.write_text(json.dumps(persisted) + "\n", encoding="utf-8")
+            with patch.object(rolebench, "load_tasks", return_value=[task]):
+                with self.assertRaisesRegex(rolebench.RoleBenchError, "deterministic evaluation row metadata"):
+                    rolebench.run_command(self.make_run_args(root, resume=True))
+
+    def test_resume_rejects_tampered_raw_result_when_evaluation_is_missing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            task = {"id": "task-1", "role": "task", "prompt": "do", "dimension_targets": ["correctness"]}
+            evaluation = {
+                "schema_version": 1,
+                "evaluation_status": "completed",
+                "assignment_id": "assignment-001-01",
+                "task_id": "task-1",
+                "replicate": 1,
+                "role": "task",
+                "model": "p/a",
+                "thinking": None,
+                "execution_status": "completed",
+                "outcome": "pass",
+                "hard_gate_status": "pass",
+                "checks": [],
+                "dimensions": {},
+            }
+            row = {"status": "pass", "execution_status": "completed", "provider_call_started": False, "output": "done", "_evaluation": evaluation}
+            with patch.object(rolebench, "load_tasks", return_value=[task]):
+                with patch.object(rolebench, "run_one", return_value=row):
+                    self.assertEqual(rolebench.run_command(self.make_run_args(root)), 0)
+            output = root / "run"
+            (output / "evaluations.jsonl").unlink()
+            path = output / "results.jsonl"
+            persisted = json.loads(path.read_text(encoding="utf-8"))
+            persisted["output"] = "tampered"
+            persisted["usage"] = {"cost": {"total": 999}}
+            path.write_text(json.dumps(persisted) + "\n", encoding="utf-8")
+            manifest_before = (output / "manifest.json").read_bytes()
+            with patch.object(rolebench, "load_tasks", return_value=[task]):
+                with patch.object(rolebench, "run_one") as run:
+                    with self.assertRaisesRegex(rolebench.RoleBenchError, "candidate result row content digest"):
+                        rolebench.run_command(self.make_run_args(root, resume=True))
+            run.assert_not_called()
+            self.assertEqual((output / "manifest.json").read_bytes(), manifest_before)
+
+    def test_resume_rejects_changed_source_workspace_before_provider_call(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "fixture"
+            source.mkdir()
+            (source / "input.txt").write_text("before", encoding="utf-8")
+            task = {"id": "task-1", "role": "task", "prompt": "do", "workspace": str(source)}
+            row = {"status": "pass", "execution_status": "completed", "provider_call_started": False, "output": "done"}
+            with patch.object(rolebench, "load_tasks", return_value=[task]):
+                with patch.object(rolebench, "run_one", return_value=row):
+                    self.assertEqual(rolebench.run_command(self.make_run_args(root)), 0)
+            (source / "input.txt").write_text("changed", encoding="utf-8")
+            with patch.object(rolebench, "load_tasks", return_value=[task]):
+                with patch.object(rolebench, "run_one") as run:
+                    with self.assertRaisesRegex(rolebench.RoleBenchError, "source workspace or image content differs"):
+                        rolebench.run_command(self.make_run_args(root, resume=True))
+            run.assert_not_called()
+
+    def test_resume_source_fingerprint_ignores_nested_output_and_follows_directory_symlink(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "fixture"
+            source.mkdir()
+            target = root / "linked"
+            target.mkdir()
+            (target / "input.txt").write_text("before", encoding="utf-8")
+            (source / "linked").symlink_to(target, target_is_directory=True)
+            output = source / "run"
+            output.mkdir()
+            (source / "output-alias").symlink_to(output, target_is_directory=True)
+            task = {"id": "task-1", "role": "task", "prompt": "do", "workspace": str(source)}
+            row = {"status": "pass", "execution_status": "completed", "provider_call_started": False, "output": "done"}
+            args = self.make_run_args(root, output=str(output))
+            with patch.object(rolebench, "load_tasks", return_value=[task]):
+                with patch.object(rolebench, "run_one", return_value=row):
+                    self.assertEqual(rolebench.run_command(args), 0)
+            (target / "input.txt").write_text("changed", encoding="utf-8")
+            with patch.object(rolebench, "load_tasks", return_value=[task]):
+                with patch.object(rolebench, "run_one") as run:
+                    with self.assertRaisesRegex(rolebench.RoleBenchError, "source workspace or image content differs"):
+                        rolebench.run_command(self.make_run_args(root, output=str(output), resume=True))
+            run.assert_not_called()
+
+    def test_resume_rejects_stale_judge_model_and_rubric(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pricing = root / "pricing.json"
+            pricing.write_text(json.dumps({
+                "p/a": {"input_per_million": 1, "output_per_million": 1},
+                "judge/model": {"input_per_million": 1, "output_per_million": 1},
+            }), encoding="utf-8")
+            task = {"id": "task-1", "role": "task", "prompt": "do", "dimension_targets": ["correctness"]}
+            candidate = {"status": "pass", "execution_status": "completed", "provider_call_started": False, "output": "done"}
+            judge_row = {
+                "schema_version": rolebench.FIXED_JUDGE_SCHEMA_VERSION,
+                "judge_result_id": "assignment-001-01:task-1:1",
+                "assignment_id": "assignment-001-01",
+                "task_id": "task-1",
+                "role": "task",
+                "model": "judge/model",
+                "thinking": None,
+                "replicate": 1,
+                "evaluator": "fixed_judge",
+                "rubric_version": rolebench.FIXED_JUDGE_RUBRIC_VERSION,
+                "provider_call_started": False,
+                "status": "pass",
+                "execution_status": "completed",
+                "output": '{"dimensions":{"correctness":{"status":"pass","score":2,"evidence":"ok"}}}',
+            }
+            judge_evaluation = {
+                "assignment_id": "assignment-001-01",
+                "task_id": "task-1",
+                "replicate": 1,
+                "role": "task",
+                "model": "p/a",
+                "execution_status": "completed",
+                "outcome": "pass",
+                "hard_gate_status": "pass",
+                "dimensions": {"correctness": {"status": "pass", "score": 2, "evidence": "ok", "evaluator": "fixed_judge"}},
+            }
+            args = self.make_run_args(root, pricing_file=str(pricing), judge_model="judge/model")
+            with patch.object(rolebench, "load_tasks", return_value=[task]):
+                with patch.object(rolebench, "run_one", return_value=candidate):
+                    with patch.object(rolebench, "run_fixed_judge", return_value=(judge_row, judge_evaluation)):
+                        self.assertEqual(rolebench.run_command(args), 0)
+            judge_path = root / "run" / "judge_results.jsonl"
+            persisted = json.loads(judge_path.read_text(encoding="utf-8"))
+            persisted["model"] = "judge/wrong"
+            persisted["rubric_version"] = "stale-rubric"
+            judge_path.write_text(json.dumps(persisted) + "\n", encoding="utf-8")
+            with patch.object(rolebench, "load_tasks", return_value=[task]):
+                with self.assertRaisesRegex(rolebench.RoleBenchError, "fixed-judge result row metadata"):
+                    rolebench.run_command(self.make_run_args(root, pricing_file=str(pricing), judge_model="judge/model", resume=True))
+
+    def test_resume_rejects_judge_evaluation_that_disagrees_with_raw_response(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pricing = root / "pricing.json"
+            pricing.write_text(json.dumps({
+                "p/a": {"input_per_million": 1, "output_per_million": 1},
+                "judge/model": {"input_per_million": 1, "output_per_million": 1},
+            }), encoding="utf-8")
+            task = {"id": "task-1", "role": "task", "prompt": "do", "dimension_targets": ["correctness"]}
+            candidate_evaluation = {
+                "schema_version": 1,
+                "evaluation_status": "completed",
+                "assignment_id": "assignment-001-01",
+                "task_id": "task-1",
+                "replicate": 1,
+                "role": "task",
+                "model": "p/a",
+                "thinking": None,
+                "execution_status": "completed",
+                "outcome": "pass",
+                "hard_gate_status": "pass",
+                "checks": [],
+                "dimensions": {},
+            }
+            candidate = {"status": "pass", "execution_status": "completed", "provider_call_started": False, "output": "done", "_evaluation": candidate_evaluation}
+
+            def judge(_omp_bin, judge_model, fixture, result, _evaluation, _timeout):
+                dimensions = {"correctness": {"status": "pass", "score": 2, "evidence": ["ok"]}}
+                raw = {
+                    "schema_version": rolebench.FIXED_JUDGE_SCHEMA_VERSION,
+                    "judge_result_id": f"{result['assignment_id']}:{result['task_id']}:{result['replicate']}",
+                    "assignment_id": result["assignment_id"],
+                    "task_id": result["task_id"],
+                    "role": result["role"],
+                    "model": judge_model,
+                    "thinking": None,
+                    "replicate": result["replicate"],
+                    "evaluator": "fixed_judge",
+                    "rubric_version": rolebench.FIXED_JUDGE_RUBRIC_VERSION,
+                    "provider_call_started": False,
+                    "status": "pass",
+                    "execution_status": "completed",
+                    "output": json.dumps({"dimensions": dimensions}),
+                }
+                return raw, rolebench.build_judge_evaluation(fixture, result, raw, dimensions)
+
+            args = self.make_run_args(root, pricing_file=str(pricing), judge_model="judge/model")
+            with patch.object(rolebench, "load_tasks", return_value=[task]):
+                with patch.object(rolebench, "run_one", return_value=candidate):
+                    with patch.object(rolebench, "run_fixed_judge", side_effect=judge):
+                        self.assertEqual(rolebench.run_command(args), 0)
+            path = root / "run" / "judge_evaluations.jsonl"
+            persisted = json.loads(path.read_text(encoding="utf-8"))
+            persisted["dimensions"]["correctness"]["score"] = 0
+            path.write_text(json.dumps(persisted) + "\n", encoding="utf-8")
+            with patch.object(rolebench, "load_tasks", return_value=[task]):
+                with self.assertRaisesRegex(rolebench.RoleBenchError, "row content digest does not match"):
+                    rolebench.run_command(self.make_run_args(root, pricing_file=str(pricing), judge_model="judge/model", resume=True))
+
+    def test_resume_keeps_run_wide_parallel_latency_context(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            task = {"id": "task-1", "role": "task", "prompt": "do"}
+            calls = 0
+            lock = threading.Lock()
+
+            def interrupted_candidate(*_args):
+                nonlocal calls
+                with lock:
+                    calls += 1
+                    call = calls
+                if call == 4:
+                    raise KeyboardInterrupt()
+                return {"status": "pass", "execution_status": "completed", "provider_call_started": False, "output": f"done-{call}"}
+
+            with patch.object(rolebench, "load_tasks", return_value=[task]):
+                with patch.object(rolebench, "run_one", side_effect=interrupted_candidate):
+                    self.assertEqual(rolebench.run_command(self.make_run_args(root, runs=4, jobs=3)), 130)
+            self.assertEqual(len(rolebench.load_jsonl(root / "run" / "results.jsonl", "results.jsonl")), 3)
+            with patch.object(rolebench, "load_tasks", return_value=[task]):
+                with patch.object(rolebench, "run_one", return_value={"status": "pass", "execution_status": "completed", "provider_call_started": False, "output": "last"}):
+                    self.assertEqual(rolebench.run_command(self.make_run_args(root, runs=4, jobs=3, resume=True)), 0)
+            manifest = json.loads((root / "run" / "manifest.json").read_text(encoding="utf-8"))
+            summary = json.loads((root / "run" / "summary.json").read_text(encoding="utf-8"))
+            report = (root / "run" / "report.md").read_text(encoding="utf-8")
+            self.assertEqual(manifest["parallelism"]["effective_jobs"], 3)
+            self.assertEqual(manifest["parallelism"]["resume_segment"]["effective_jobs"], 1)
+            self.assertEqual(summary["effective_jobs"], 3)
+            self.assertEqual(summary["execution_effective_jobs"], 1)
+            self.assertIn("Latency mode: `concurrent`", report)
+            self.assertIn("up to 3 in-flight calls", report)
+
+    @patch("rolebench.subprocess.run")
+    def test_run_one_records_cleanup_failure_without_overwriting_result(self, run):
+        run.return_value = SimpleNamespace(returncode=0, stdout=json.dumps({"output": "done"}), stderr="")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            assignment = {"id": "a", "mode": "role-isolated", "role": "task", "candidate": "p/a", "mapping": {"task": "p/a"}}
+            task = {"id": "task-1", "role": "task", "prompt": "do"}
+            with patch.object(rolebench, "remove_temp_root", side_effect=OSError("busy")):
+                result = rolebench.run_one("omp", assignment, task, 1, root / "output", 30, root / "config.yml", "direct", None)
+            warning = next(item for item in result["warnings"] if item["type"] == "workspace_cleanup_failed")
+            self.assertEqual(result["status"], "pass")
+            self.assertEqual(result["output"], "done")
+            self.assertIn("omp-rolebench-", warning["path"])
+            rolebench.shutil.rmtree(warning["path"], ignore_errors=True)
+
+    def test_run_one_releases_workspace_after_success_timeout_and_interrupt(self):
+        assignment = {"id": "a", "mode": "role-isolated", "role": "task", "candidate": "p/a", "mapping": {"task": "p/a"}}
+        task = {"id": "task-1", "role": "task", "prompt": "do"}
+        cases = [
+            SimpleNamespace(returncode=0, stdout=json.dumps({"output": "done"}), stderr=""),
+            subprocess.TimeoutExpired(["omp"], 30),
+            KeyboardInterrupt(),
+        ]
+        for index, outcome in enumerate(cases):
+            workspace = Path(tempfile.mkdtemp(prefix="omp-rolebench-"))
+            try:
+                with self.subTest(index=index):
+                    with tempfile.TemporaryDirectory() as directory:
+                        root = Path(directory)
+                        with patch.object(rolebench.tempfile, "mkdtemp", return_value=str(workspace)):
+                            with patch.object(rolebench.subprocess, "run", side_effect=outcome if isinstance(outcome, BaseException) else None, return_value=None if isinstance(outcome, BaseException) else outcome):
+                                if isinstance(outcome, KeyboardInterrupt):
+                                    with self.assertRaises(KeyboardInterrupt):
+                                        rolebench.run_one("omp", assignment, task, 1, root / "output", 30, root / "config.yml", "direct", None)
+                                else:
+                                    rolebench.run_one("omp", assignment, task, 1, root / "output", 30, root / "config.yml", "direct", None)
+                        self.assertFalse(workspace.exists())
+            finally:
+                rolebench.shutil.rmtree(workspace, ignore_errors=True)
+
+    def test_run_one_releases_workspace_when_evidence_capture_is_interrupted(self):
+        workspace = Path(tempfile.mkdtemp(prefix="omp-rolebench-"))
+        assignment = {"id": "a", "mode": "role-isolated", "role": "task", "candidate": "p/a", "mapping": {"task": "p/a"}}
+        task = {"id": "task-1", "role": "task", "prompt": "do"}
+        completed = SimpleNamespace(returncode=0, stdout=json.dumps({"output": "done"}), stderr="")
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                with patch.object(rolebench.tempfile, "mkdtemp", return_value=str(workspace)):
+                    with patch.object(rolebench.subprocess, "run", return_value=completed):
+                        with patch.object(rolebench, "snapshot_workspace", side_effect=[{"files": {}}, KeyboardInterrupt()]):
+                            with self.assertRaises(KeyboardInterrupt):
+                                rolebench.run_one("omp", assignment, task, 1, root / "output", 30, root / "config.yml", "direct", None)
+                self.assertFalse(workspace.exists())
+        finally:
+            rolebench.shutil.rmtree(workspace, ignore_errors=True)
+
+    def test_cleanup_failure_during_interrupt_preserves_paid_result_for_coordinator(self):
+        workspace = Path(tempfile.mkdtemp(prefix="omp-rolebench-"))
+        assignment = {"id": "a", "mode": "role-isolated", "role": "task", "candidate": "p/a", "mapping": {"task": "p/a"}}
+        task = {"id": "task-1", "role": "task", "prompt": "do"}
+        completed = SimpleNamespace(returncode=0, stdout=json.dumps({"output": "done"}), stderr="")
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                with patch.object(rolebench, "verify_harness_fingerprint"):
+                    with patch.object(rolebench.tempfile, "mkdtemp", return_value=str(workspace)):
+                        with patch.object(rolebench.subprocess, "run", return_value=completed):
+                            with patch.object(rolebench, "snapshot_workspace", side_effect=[{"files": {}}, KeyboardInterrupt()]):
+                                with patch.object(rolebench, "remove_temp_root", side_effect=OSError("busy")):
+                                    outcome = rolebench.execute_candidate_cell(
+                                        "omp", assignment, task, 1, root / "output", 30, root / "config.yml",
+                                        "direct", None, False, root / "artifacts", {"digest": "same"},
+                                    )
+            self.assertEqual(outcome["row"]["status"], "pass")
+            self.assertTrue(outcome["row"]["provider_call_started"])
+            self.assertEqual(outcome["stop_reason"], "workspace_cleanup_failed")
+            self.assertEqual(outcome["row"]["warnings"][-1]["path"], str(workspace))
+        finally:
+            rolebench.shutil.rmtree(workspace, ignore_errors=True)
+
+    def test_cleanup_failure_stops_scheduling_and_reports_unreleased_path(self):
+        workspace = Path(tempfile.mkdtemp(prefix="omp-rolebench-"))
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                workspace_identity = rolebench.cleanup_identity_payload(rolebench.temp_root_identity(workspace))
+                row = {
+                    "status": "pass",
+                    "execution_status": "completed",
+                    "provider_call_started": False,
+                    "output": "done",
+                    "warnings": [{"type": "workspace_cleanup_failed", "path": str(workspace), "identity": workspace_identity, "error": "busy"}],
+                }
+                task = {"id": "task-1", "role": "task", "prompt": "do"}
+                with patch.object(rolebench, "load_tasks", return_value=[task]):
+                    with patch.object(rolebench, "run_one", return_value=row) as run:
+                        with patch.object(rolebench, "remove_temp_root", side_effect=OSError("still busy")):
+                            self.assertEqual(rolebench.run_command(self.make_run_args(root, runs=2)), 4)
+                summary = json.loads((root / "run" / "summary.json").read_text(encoding="utf-8"))
+                self.assertEqual(run.call_count, 1)
+                self.assertEqual(summary["stopped_reason"], "workspace_cleanup_failed")
+                self.assertEqual(summary["workspace_cleanup"]["unreleased_paths"], [str(workspace)])
+                self.assertEqual(summary["workspace_cleanup"]["status"], "failed")
+        finally:
+            rolebench.shutil.rmtree(workspace, ignore_errors=True)
+
+    def test_candidate_raw_write_failure_keeps_observed_cost_and_skips_evaluation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            task = {"id": "task-1", "role": "task", "prompt": "do"}
+            evaluation = {"assignment_id": "x", "task_id": "task-1", "replicate": 1}
+            row = {
+                "status": "pass",
+                "execution_status": "completed",
+                "provider_call_started": True,
+                "output": "done",
+                "usage": {"cost": {"total": 0.2}},
+                "_evaluation": evaluation,
+            }
+            original_append = rolebench.append_result
+
+            def append(path, value):
+                if path.name == "results.jsonl":
+                    raise OSError("disk full")
+                original_append(path, value)
+
+            with patch.object(rolebench, "load_tasks", return_value=[task]):
+                with patch.object(rolebench, "run_one", return_value=row):
+                    with patch.object(rolebench, "append_result", side_effect=append):
+                        self.assertEqual(rolebench.run_command(self.make_run_args(root)), 4)
+            summary = json.loads((root / "run" / "summary.json").read_text(encoding="utf-8"))
+            self.assertEqual(summary["actual_cost_usd"], 0.2)
+            self.assertEqual(summary["stopped_reason"], "result_write_failed")
+            self.assertFalse((root / "run" / "evaluations.jsonl").exists())
+
+    def test_judge_raw_write_failure_does_not_create_orphan_evaluation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pricing = root / "pricing.json"
+            pricing.write_text(json.dumps({
+                "p/a": {"input_per_million": 1, "output_per_million": 1},
+                "judge/model": {"input_per_million": 1, "output_per_million": 1},
+            }), encoding="utf-8")
+            task = {"id": "task-1", "role": "task", "prompt": "do", "dimension_targets": ["correctness"]}
+            candidate_evaluation = {"assignment_id": "x", "task_id": "task-1", "replicate": 1, "checks": [], "dimensions": {}}
+            candidate = {"status": "pass", "execution_status": "completed", "provider_call_started": False, "output": "done", "_evaluation": candidate_evaluation}
+            judge_row = {"status": "pass", "execution_status": "completed", "provider_call_started": True, "usage": {"cost": {"total": 0.3}}}
+            judge_evaluation = {"assignment_id": "x", "task_id": "task-1", "replicate": 1, "checks": [], "dimensions": {}}
+            original_append = rolebench.append_result
+
+            def append(path, value):
+                if path.name == "judge_results.jsonl":
+                    raise OSError("disk full")
+                original_append(path, value)
+
+            args = self.make_run_args(root, pricing_file=str(pricing), judge_model="judge/model")
+            with patch.object(rolebench, "load_tasks", return_value=[task]):
+                with patch.object(rolebench, "run_one", return_value=candidate):
+                    with patch.object(rolebench, "run_fixed_judge", return_value=(judge_row, judge_evaluation)):
+                        with patch.object(rolebench, "append_result", side_effect=append):
+                            self.assertEqual(rolebench.run_command(args), 4)
+            summary = json.loads((root / "run" / "summary.json").read_text(encoding="utf-8"))
+            self.assertEqual(summary["actual_cost_usd"], 0.3)
+            self.assertEqual(summary["stopped_reason"], "judge_write_failed")
+            self.assertFalse((root / "run" / "judge_evaluations.jsonl").exists())
+
+    def test_remove_temp_root_refuses_replaced_symlink(self):
+        target = Path(tempfile.mkdtemp(prefix="omp-rolebench-"))
+        original = Path(tempfile.mkdtemp(prefix="omp-rolebench-"))
+        original_identity = rolebench.temp_root_identity(original)
+        marker = target / "keep.txt"
+        marker.write_text("keep", encoding="utf-8")
+        rolebench.shutil.rmtree(original)
+        original.symlink_to(target, target_is_directory=True)
+        try:
+            with self.assertRaisesRegex(rolebench.RoleBenchError, "replaced temporary path"):
+                rolebench.remove_temp_root(original, original_identity)
+            self.assertEqual(marker.read_text(encoding="utf-8"), "keep")
+        finally:
+            original.unlink(missing_ok=True)
+            rolebench.shutil.rmtree(target, ignore_errors=True)
+
+    def test_remove_temp_root_refuses_replaced_directory(self):
+        original = Path(tempfile.mkdtemp(prefix="omp-rolebench-"))
+        moved = original.with_name(original.name + "-moved")
+        identity = rolebench.temp_root_identity(original)
+        original.rename(moved)
+        original.mkdir()
+        marker = original / "keep.txt"
+        marker.write_text("keep", encoding="utf-8")
+        try:
+            with self.assertRaisesRegex(rolebench.RoleBenchError, "replaced temporary directory"):
+                rolebench.remove_temp_root(original, identity)
+            self.assertEqual(marker.read_text(encoding="utf-8"), "keep")
+        finally:
+            rolebench.shutil.rmtree(original, ignore_errors=True)
+            rolebench.shutil.rmtree(moved, ignore_errors=True)
+
+    def test_remove_temp_root_reports_a_moved_workspace_as_unreleased(self):
+        original = Path(tempfile.mkdtemp(prefix="omp-rolebench-"))
+        moved = original.with_name(original.name + "-moved")
+        identity = rolebench.temp_root_identity(original)
+        original.rename(moved)
+        try:
+            with self.assertRaisesRegex(rolebench.RoleBenchError, "disappeared before cleanup"):
+                rolebench.remove_temp_root(original, identity)
+            self.assertTrue(moved.is_dir())
+        finally:
+            rolebench.shutil.rmtree(moved, ignore_errors=True)
+
+    def test_workspace_size_follows_directory_symlinks_like_copytree(self):
+        with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as external:
+            root = Path(directory)
+            external_root = Path(external)
+            payload = external_root / "payload.bin"
+            payload.write_bytes(b"x" * (128 * 1024))
+            (root / "linked").symlink_to(external_root, target_is_directory=True)
+            self.assertEqual(rolebench.copied_tree_size(root, root / "output"), 128 * 1024)
+
+    def test_provider_parallelism_accounts_for_candidate_judge_dependency(self):
+        self.assertEqual(
+            rolebench.provider_parallelism_plan(2, candidate_calls=1, ready_judge_calls=0, judge_enabled=True),
+            {"effective_jobs": 1, "provider_calls": 2, "estimated_provider_waves": 2},
+        )
+        self.assertEqual(
+            rolebench.provider_parallelism_plan(2, candidate_calls=1, ready_judge_calls=1, judge_enabled=True),
+            {"effective_jobs": 2, "provider_calls": 3, "estimated_provider_waves": 2},
+        )
+        self.assertEqual(
+            rolebench.provider_parallelism_plan(2, candidate_calls=3, ready_judge_calls=0, judge_enabled=True),
+            {"effective_jobs": 2, "provider_calls": 6, "estimated_provider_waves": 3},
+        )
+
+    def test_resume_without_judge_rejects_residual_judge_rows(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            task = {"id": "task-1", "role": "task", "prompt": "do"}
+            with patch.object(rolebench, "load_tasks", return_value=[task]):
+                self.assertEqual(rolebench.run_command(self.make_run_args(root, execute=False, confirm=False)), 0)
+            manifest = json.loads((root / "run" / "manifest.json").read_text(encoding="utf-8"))
+            assignment_id = manifest["assignments"][0]["id"]
+            candidate = {
+                "assignment_id": assignment_id,
+                "task_id": "task-1",
+                "replicate": 1,
+                "provider_call_started": False,
+                "status": "pass",
+                "execution_status": "completed",
+            }
+            judge = {**candidate, "model": "unexpected/judge", "evaluator": "fixed_judge"}
+            rolebench.append_result(root / "run" / "results.jsonl", candidate)
+            rolebench.append_result(root / "run" / "judge_results.jsonl", judge)
+            with patch.object(rolebench, "load_tasks", return_value=[task]):
+                with self.assertRaisesRegex(rolebench.RoleBenchError, "audit rows do not belong"):
+                    rolebench.run_command(self.make_run_args(root, resume=True))
+
+    def test_coordinator_preserves_completed_rows_when_persistence_is_interrupted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            task = {"id": "task-1", "role": "task", "prompt": "do"}
+            row = {
+                "status": "pass",
+                "execution_status": "completed",
+                "provider_call_started": True,
+                "output": "done",
+                "usage": {"cost": {"total": 0.2}},
+            }
+            original_append = rolebench.append_result
+            interrupted = False
+
+            def append(path, value):
+                nonlocal interrupted
+                if path.name == "results.jsonl" and not interrupted:
+                    interrupted = True
+                    raise KeyboardInterrupt()
+                original_append(path, value)
+
+            with patch.object(rolebench, "load_tasks", return_value=[task]):
+                with patch.object(rolebench, "run_one", return_value=row):
+                    with patch.object(rolebench, "append_result", side_effect=append):
+                        self.assertEqual(rolebench.run_command(self.make_run_args(root, runs=2, jobs=2)), 130)
+            results = rolebench.load_jsonl(root / "run" / "results.jsonl", "results.jsonl")
+            summary = json.loads((root / "run" / "summary.json").read_text(encoding="utf-8"))
+            self.assertEqual(len(results), 2)
+            self.assertEqual(summary["actual_cost_usd"], 0.4)
+            self.assertEqual(summary["stopped_reason"], "interrupted")
+
+    def test_submit_interrupt_drains_and_persists_registered_future(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            task = {"id": "task-1", "role": "task", "prompt": "do"}
+            row = {
+                "status": "pass",
+                "execution_status": "completed",
+                "provider_call_started": True,
+                "output": "done",
+                "usage": {"cost": {"total": 0.2}},
+            }
+            original_submit = rolebench.ThreadPoolExecutor.submit
+            submit_count = 0
+
+            def submit(pool, *args, **kwargs):
+                nonlocal submit_count
+                submit_count += 1
+                if submit_count == 2:
+                    raise KeyboardInterrupt()
+                return original_submit(pool, *args, **kwargs)
+
+            with patch.object(rolebench, "load_tasks", return_value=[task]):
+                with patch.object(rolebench, "run_one", return_value=row):
+                    with patch.object(rolebench.ThreadPoolExecutor, "submit", new=submit):
+                        self.assertEqual(rolebench.run_command(self.make_run_args(root, runs=2, jobs=2)), 130)
+            results = rolebench.load_jsonl(root / "run" / "results.jsonl", "results.jsonl")
+            summary = json.loads((root / "run" / "summary.json").read_text(encoding="utf-8"))
+            self.assertEqual(len(results), 1)
+            self.assertEqual(summary["actual_cost_usd"], 0.2)
+            self.assertEqual(summary["stopped_reason"], "interrupted")
+
+    def test_cleanup_retry_interrupt_still_writes_summary(self):
+        workspace = Path(tempfile.mkdtemp(prefix="omp-rolebench-"))
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                task = {"id": "task-1", "role": "task", "prompt": "do"}
+                workspace_identity = rolebench.cleanup_identity_payload(rolebench.temp_root_identity(workspace))
+                row = {
+                    "status": "pass",
+                    "execution_status": "completed",
+                    "provider_call_started": False,
+                    "output": "done",
+                    "warnings": [{"type": "workspace_cleanup_failed", "path": str(workspace), "identity": workspace_identity, "error": "busy"}],
+                }
+                with patch.object(rolebench, "load_tasks", return_value=[task]):
+                    with patch.object(rolebench, "run_one", return_value=row):
+                        with patch.object(rolebench, "remove_temp_root", side_effect=KeyboardInterrupt()):
+                            self.assertEqual(rolebench.run_command(self.make_run_args(root)), 130)
+                summary = json.loads((root / "run" / "summary.json").read_text(encoding="utf-8"))
+                self.assertEqual(summary["stopped_reason"], "interrupted")
+                self.assertEqual(summary["workspace_cleanup"]["unreleased_paths"], [str(workspace)])
+        finally:
+            rolebench.shutil.rmtree(workspace, ignore_errors=True)
+
+    def test_judge_internal_error_preserves_started_call_and_cost(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pricing = root / "pricing.json"
+            pricing.write_text(json.dumps({
+                "p/a": {"input_per_million": 1, "output_per_million": 1},
+                "judge/model": {"input_per_million": 1, "output_per_million": 1},
+            }), encoding="utf-8")
+            task = {"id": "task-1", "role": "task", "prompt": "do", "dimension_targets": ["correctness"]}
+            candidate = {"status": "pass", "execution_status": "completed", "provider_call_started": False, "output": "done"}
+            judge_payload = {
+                "dimensions": {"correctness": {"status": "pass", "score": 2, "evidence": "ok"}},
+                "usage": {"cost": {"total": 0.4}},
+            }
+            completed = SimpleNamespace(returncode=0, stdout=json.dumps(judge_payload), stderr="")
+            args = self.make_run_args(root, pricing_file=str(pricing), judge_model="judge/model", max_cost_usd=1)
+            with patch.object(rolebench, "load_tasks", return_value=[task]):
+                with patch.object(rolebench, "run_one", return_value=candidate):
+                    with patch.object(rolebench.subprocess, "run", return_value=completed):
+                        with patch.object(rolebench, "build_judge_evaluation", side_effect=RuntimeError("evaluation broke")):
+                            self.assertEqual(rolebench.run_command(args), 4)
+            judge_rows = rolebench.load_jsonl(root / "run" / "judge_results.jsonl", "judge_results.jsonl")
+            summary = json.loads((root / "run" / "summary.json").read_text(encoding="utf-8"))
+            self.assertTrue(judge_rows[0]["provider_call_started"])
+            self.assertEqual(judge_rows[0]["usage"]["cost"]["total"], 0.4)
+            self.assertEqual(judge_rows[0]["error_type"], "judge_internal")
+            self.assertEqual(summary["actual_cost_usd"], 0.4)
+            self.assertEqual(summary["stopped_reason"], "harness_judge_failed")
+
+    def test_judge_cleanup_failure_preserves_response_usage_and_path(self):
+        task = {"id": "task-1", "role": "task", "prompt": "do", "dimension_targets": ["correctness"]}
+        result = {
+            "assignment_id": "a",
+            "task_id": "task-1",
+            "role": "task",
+            "model": "p/a",
+            "replicate": 1,
+            "execution_status": "completed",
+            "output": "done",
+        }
+        deterministic = {"checks": [], "dimensions": {}}
+        payload = {
+            "dimensions": {"correctness": {"status": "pass", "score": 2, "evidence": "ok"}},
+            "usage": {"cost": {"total": 0.4}},
+        }
+        completed = SimpleNamespace(returncode=0, stdout=json.dumps(payload), stderr="")
+        warning_path = None
+        try:
+            with patch.object(rolebench.subprocess, "run", return_value=completed):
+                with patch.object(rolebench, "remove_temp_root", side_effect=OSError("busy")):
+                    raw, evaluation = rolebench.run_fixed_judge("omp", "judge/model", task, result, deterministic)
+            warning = raw["warnings"][0]
+            warning_path = warning["path"]
+            self.assertEqual(raw["stdout"], json.dumps(payload))
+            self.assertEqual(raw["usage"]["cost"]["total"], 0.4)
+            self.assertTrue(raw["provider_call_started"])
+            self.assertEqual(warning["type"], "workspace_cleanup_failed")
+            self.assertEqual(evaluation["evaluation_status"], "completed")
+        finally:
+            if warning_path:
+                rolebench.shutil.rmtree(warning_path, ignore_errors=True)
+
+    def test_judge_cleanup_failure_is_retried_after_drain(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pricing = root / "pricing.json"
+            pricing.write_text(json.dumps({
+                "p/a": {"input_per_million": 1, "output_per_million": 1},
+                "judge/model": {"input_per_million": 1, "output_per_million": 1},
+            }), encoding="utf-8")
+            task = {"id": "task-1", "role": "task", "prompt": "do", "dimension_targets": ["correctness"]}
+            candidate = {"status": "pass", "execution_status": "completed", "provider_call_started": False, "output": "done"}
+            payload = {
+                "dimensions": {"correctness": {"status": "pass", "score": 2, "evidence": "ok"}},
+                "usage": {"cost": {"total": 0.4}},
+            }
+            completed = SimpleNamespace(returncode=0, stdout=json.dumps(payload), stderr="")
+            original_remove = rolebench.remove_temp_root
+            failed_path = None
+
+            def remove(path, expected_identity):
+                nonlocal failed_path
+                if "omp-rolebench-judge-" in path.name and failed_path is None:
+                    failed_path = path
+                    raise OSError("busy")
+                original_remove(path, expected_identity)
+
+            args = self.make_run_args(root, pricing_file=str(pricing), judge_model="judge/model")
+            with patch.object(rolebench, "load_tasks", return_value=[task]):
+                with patch.object(rolebench, "run_one", return_value=candidate):
+                    with patch.object(rolebench.subprocess, "run", return_value=completed):
+                        with patch.object(rolebench, "remove_temp_root", side_effect=remove):
+                            self.assertEqual(rolebench.run_command(args), 4)
+            summary = json.loads((root / "run" / "summary.json").read_text(encoding="utf-8"))
+            judge_rows = rolebench.load_jsonl(root / "run" / "judge_results.jsonl", "judge_results.jsonl")
+            self.assertEqual(judge_rows[0]["usage"]["cost"]["total"], 0.4)
+            self.assertEqual(summary["workspace_cleanup"]["status"], "recovered-after-failure")
+            self.assertEqual(summary["workspace_cleanup"]["unreleased_paths"], [])
+            self.assertIsNotNone(failed_path)
+            self.assertFalse(failed_path.exists())
+
+    def test_reports_expose_workspace_and_budget_boundaries(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            task = {"id": "task-1", "role": "task", "prompt": "do"}
+            row = {"status": "pass", "execution_status": "completed", "provider_call_started": False, "output": "done"}
+            with patch.object(rolebench, "load_tasks", return_value=[task]):
+                with patch.object(rolebench, "run_one", return_value=row):
+                    self.assertEqual(rolebench.run_command(self.make_run_args(root, runs=2, jobs=2, max_cost_usd=1)), 2)
+            report = (root / "run" / "report.md").read_text(encoding="utf-8")
+            payload = json.loads((root / "run" / "report.json").read_text(encoding="utf-8"))
+            self.assertIn("Workspace estimate", report)
+            self.assertIn("Budget: cap $1.000000", report)
+            self.assertIn("up to 2 in-flight calls", report)
+            self.assertEqual(payload["execution_context"]["max_cost_usd"], 1)
+            self.assertIn("workspace_estimated_peak_bytes", payload["execution_context"])
 
 
 if __name__ == "__main__":

@@ -8,6 +8,7 @@ offline by default; provider calls happen only with --execute.
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import difflib
 import fnmatch
 import hashlib
@@ -16,13 +17,16 @@ import math
 import os
 import random
 import re
+import signal
 import shutil
 import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
@@ -229,20 +233,55 @@ FIXED_JUDGE_TIMEOUT = 180
 JUDGE_INPUT_LIMIT = 64 * 1024
 RECOMMENDATION_SCHEMA_VERSION = 1
 HARNESS_ERROR_TYPES = {"harness_internal", "executor_setup", "executor_internal", "malformed_omp_json", "missing_image_fixture"}
-HARNESS_WARNING_TYPES = {"harness_integrity", "workspace_evidence", "artifact_write", "evaluation"}
+HARNESS_WARNING_TYPES = {"harness_integrity", "workspace_evidence", "artifact_write", "evaluation", "workspace_cleanup_failed"}
 HARNESS_STOP_REASONS = {
     "harness_integrity_changed",
     "harness_internal",
     "harness_evidence_failed",
     "harness_execution_failed",
     "harness_judge_failed",
+    "result_write_failed",
     "evaluation_write_failed",
     "judge_write_failed",
+    "workspace_cleanup_failed",
 }
 
 
 class RoleBenchError(Exception):
     """User-facing validation or execution setup error."""
+
+
+class WorkspaceCleanupError(RoleBenchError):
+    def __init__(self, path: Path, error: Exception, result: dict[str, Any]):
+        self.path = path
+        self.cleanup_error = error
+        self.result = result
+        super().__init__(f"temporary workspace cleanup failed for {path}: {error}")
+
+
+class JudgeHarnessError(RoleBenchError):
+    def __init__(self, raw: dict[str, Any], error: Exception):
+        self.raw = raw
+        self.original_error = error
+        super().__init__(f"{type(error).__name__}: {error}")
+
+
+@contextmanager
+def defer_keyboard_interrupt():
+    """Keep a completed provider outcome intact while the coordinator persists it."""
+    can_mask = (
+        threading.current_thread() is threading.main_thread()
+        and hasattr(signal, "pthread_sigmask")
+        and hasattr(signal, "SIG_BLOCK")
+    )
+    if not can_mask:
+        yield
+        return
+    previous = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT})
+    try:
+        yield
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous)
 
 
 def now_iso() -> str:
@@ -1159,10 +1198,11 @@ def experiment_signature(manifest: dict[str, Any]) -> str:
         key: manifest.get(key)
         for key in (
             "task_schema_version", "evaluation_schema_version", "omp_bin", "selection", "roles",
-            "baseline_roles", "mode", "runs", "executor", "task_source", "recent_work",
+            "baseline_roles", "mode", "runs", "jobs", "executor", "task_source", "recent_work",
             "controller_model", "controller_model_source", "pricing_file", "max_cost_usd",
             "judge_model", "judge_model_source", "judge_timeout", "recommend",
             "min_recommendation_runs", "timeout", "seed", "tasks", "candidates", "assignments",
+            "source_fingerprints",
         )
     }
     payload["evaluation"] = manifest.get("evaluation")
@@ -1184,6 +1224,61 @@ def unique_cell_index(rows: list[dict[str, Any]], label: str) -> dict[tuple[Any,
             raise RoleBenchError(f"{label} contains duplicate cell {key!r}")
         indexed[key] = row
     return indexed
+
+
+def validate_resume_row(row: dict[str, Any], expected: dict[str, Any], label: str) -> None:
+    mismatches = {
+        field: {"expected": value, "actual": row.get(field)}
+        for field, value in expected.items()
+        if row.get(field) != value
+    }
+    if mismatches:
+        raise RoleBenchError(f"{label} row metadata does not match the experiment: {mismatches!r}")
+
+
+def seal_raw_result(row: dict[str, Any]) -> None:
+    row.pop("raw_digest", None)
+    row["raw_digest"] = stable_digest(row)
+
+
+def validate_raw_result_integrity(row: dict[str, Any], label: str) -> None:
+    stored_digest = row.get("raw_digest")
+    unsigned = dict(row)
+    unsigned.pop("raw_digest", None)
+    if not isinstance(stored_digest, str) or stored_digest != stable_digest(unsigned):
+        raise RoleBenchError(f"{label} row content digest does not match")
+
+
+def seal_evaluation(evaluation: dict[str, Any], result: dict[str, Any], judge_result: dict[str, Any] | None = None) -> None:
+    evaluation["result_digest"] = stable_digest(result)
+    if judge_result is not None:
+        evaluation["judge_result_digest"] = stable_digest(judge_result)
+    evaluation.pop("evaluation_digest", None)
+    evaluation["evaluation_digest"] = stable_digest(evaluation)
+
+
+def validate_evaluation_integrity(evaluation: dict[str, Any], result: dict[str, Any], label: str, judge_result: dict[str, Any] | None = None) -> None:
+    expected = {"result_digest": stable_digest(result)}
+    if judge_result is not None:
+        expected["judge_result_digest"] = stable_digest(judge_result)
+    validate_resume_row(evaluation, expected, label)
+    stored_digest = evaluation.get("evaluation_digest")
+    unsigned = dict(evaluation)
+    unsigned.pop("evaluation_digest", None)
+    if not isinstance(stored_digest, str) or stored_digest != stable_digest(unsigned):
+        raise RoleBenchError(f"{label} row content digest does not match")
+
+
+def judge_evaluation_audit_payload(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        field: row.get(field)
+        for field in (
+            "schema_version", "evaluation_status", "evaluator", "rubric_version",
+            "assignment_id", "task_id", "role", "model", "thinking", "replicate",
+            "execution_status", "outcome", "hard_gate_status", "dimensions", "summary",
+            "judge_result_id", "errors",
+        )
+    }
 
 
 def persisted_harness_failure(rows: list[dict[str, Any]]) -> str | None:
@@ -1293,6 +1388,98 @@ def snapshot_workspace(workspace: Path) -> dict[str, Any]:
             except OSError as exc:
                 errors.append(f"{relative}: {exc}")
     return {"complete": not errors and not incomplete, "files": files, "errors": errors, "incomplete": incomplete}
+
+
+def source_fixture_fingerprints(tasks: list[dict[str, Any]], output_dir: Path) -> list[dict[str, Any]]:
+    fingerprints: dict[tuple[str, str], dict[str, Any]] = {}
+
+    def copied_workspace_digest(workspace: Path) -> tuple[str, int]:
+        ignore = output_copy_ignore(workspace, output_dir)
+        entries: list[dict[str, Any]] = []
+
+        def visit(directory: Path, relative_directory: Path, ancestors: frozenset[tuple[int, int]]) -> None:
+            try:
+                directory_stat = directory.stat()
+            except OSError as exc:
+                raise RoleBenchError(f"cannot fingerprint task workspace {workspace}: {exc}") from exc
+            identity = (directory_stat.st_dev, directory_stat.st_ino)
+            if identity in ancestors:
+                raise RoleBenchError(f"workspace contains a directory symlink cycle: {directory}")
+            next_ancestors = ancestors | {identity}
+            try:
+                scanned = list(os.scandir(directory))
+            except OSError as exc:
+                raise RoleBenchError(f"cannot fingerprint task workspace {workspace}: {exc}") from exc
+            ignored = set(ignore(str(directory), [entry.name for entry in scanned])) if ignore else set()
+            for entry in sorted(scanned, key=lambda item: item.name):
+                if entry.name in ignored:
+                    continue
+                path = Path(entry.path)
+                relative = (relative_directory / entry.name).as_posix()
+                try:
+                    metadata = path.stat()
+                    link_target = os.readlink(path) if path.is_symlink() else None
+                except OSError as exc:
+                    raise RoleBenchError(f"cannot fingerprint task workspace {workspace}: {exc}") from exc
+                if stat.S_ISDIR(metadata.st_mode):
+                    entries.append({"path": relative, "type": "directory", "mode": metadata.st_mode & 0o7777, "link_target": link_target})
+                    visit(path, relative_directory / entry.name, next_ancestors)
+                elif stat.S_ISREG(metadata.st_mode):
+                    digest = hashlib.sha256()
+                    try:
+                        with path.open("rb") as handle:
+                            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                                digest.update(chunk)
+                    except OSError as exc:
+                        raise RoleBenchError(f"cannot fingerprint task workspace {workspace}: {exc}") from exc
+                    entries.append({"path": relative, "type": "file", "size": metadata.st_size, "sha256": digest.hexdigest(), "mode": metadata.st_mode & 0o7777, "link_target": link_target})
+                else:
+                    entries.append({"path": relative, "type": filesystem_entry_type(metadata.st_mode), "mode": metadata.st_mode & 0o7777, "link_target": link_target})
+
+        visit(workspace, Path("."), frozenset())
+        return stable_digest(entries), len(entries)
+
+    for task in tasks:
+        workspace_value = task.get("workspace")
+        if workspace_value:
+            workspace = Path(workspace_value).expanduser().resolve()
+            if not workspace.is_dir():
+                raise RoleBenchError(f"task workspace does not exist: {workspace}")
+            key = ("workspace", str(workspace))
+            if key not in fingerprints:
+                digest, file_count = copied_workspace_digest(workspace)
+                fingerprints[key] = {
+                    "kind": "workspace",
+                    "path": str(workspace),
+                    "digest": digest,
+                    "complete": True,
+                    "file_count": file_count,
+                }
+        image_values = task.get("image", [])
+        if isinstance(image_values, str):
+            image_values = [image_values]
+        for image_value in image_values:
+            image = Path(image_value).expanduser().resolve()
+            if not image.is_file():
+                raise RoleBenchError(f"task image does not exist: {image}")
+            key = ("image", str(image))
+            if key in fingerprints:
+                continue
+            digest = hashlib.sha256()
+            try:
+                with image.open("rb") as handle:
+                    for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                        digest.update(chunk)
+                metadata = image.stat()
+            except OSError as exc:
+                raise RoleBenchError(f"cannot fingerprint task image {image}: {exc}") from exc
+            fingerprints[key] = {
+                "kind": "image",
+                "path": str(image),
+                "digest": digest.hexdigest(),
+                "size": metadata.st_size,
+            }
+    return [fingerprints[key] for key in sorted(fingerprints)]
 
 
 def public_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
@@ -2271,12 +2458,29 @@ def run_fixed_judge(omp_bin: str, judge_model: str, task: dict[str, Any], result
         "status": "error",
         "execution_status": "failed",
     }
+
+    def evaluated(dimensions: dict[str, Any] | None, error: str | None = None) -> tuple[dict[str, Any], dict[str, Any]]:
+        try:
+            return raw, build_judge_evaluation(task, result, raw, dimensions, error)
+        except Exception as exc:
+            raw["status"] = "error"
+            raw["error_type"] = "judge_internal"
+            raw["error"] = f"{type(exc).__name__}: {exc}"
+            raise JudgeHarnessError(raw, exc) from exc
+
     try:
         prompt = build_fixed_judge_prompt(task, result, deterministic_evaluation)
         judge_selector = parse_selector(judge_model)
         raw["model"] = judge_selector["selector"]
         raw["thinking"] = judge_selector.get("thinking")
-        with tempfile.TemporaryDirectory(prefix="omp-rolebench-judge-") as directory:
+        directory = Path(tempfile.mkdtemp(prefix="omp-rolebench-judge-"))
+        directory_identity = temp_root_identity(directory)
+        try:
+            overlay = directory / "config.yml"
+            overlay.write_text(
+                "modelRoles:\n  default: " + json.dumps(judge_selector["selector"]) + "\n",
+                encoding="utf-8",
+            )
             judge_command = [
                 omp_bin,
                 "-p",
@@ -2289,7 +2493,12 @@ def run_fixed_judge(omp_bin: str, judge_model: str, task: dict[str, Any], result
             ]
             if judge_selector.get("thinking"):
                 judge_command.extend(["--thinking", judge_selector["thinking"]])
-            judge_command.extend(["--cwd", directory, "--no-tools", "--auto-approve", prompt])
+            judge_command.extend([
+                "--config", str(overlay),
+                "--cwd", str(directory),
+                "--no-tools", "--no-extensions", "--no-skills", "--no-rules",
+                "--auto-approve", prompt,
+            ])
             raw["provider_call_started"] = True
             try:
                 completed = subprocess.run(
@@ -2303,14 +2512,27 @@ def run_fixed_judge(omp_bin: str, judge_model: str, task: dict[str, Any], result
             except (OSError, ValueError):
                 raw["provider_call_started"] = False
                 raise
-        raw["exit_code"] = completed.returncode
-        raw["stdout"] = decode_subprocess_text(completed.stdout)
-        raw["stderr"] = decode_subprocess_text(completed.stderr)
+            raw["exit_code"] = completed.returncode
+            raw["stdout"] = decode_subprocess_text(completed.stdout)
+            raw["stderr"] = decode_subprocess_text(completed.stderr)
+        finally:
+            try:
+                remove_temp_root(directory, directory_identity)
+            except (OSError, RoleBenchError) as exc:
+                raw.setdefault("warnings", []).append({
+                    "type": "workspace_cleanup_failed",
+                    "path": str(directory),
+                    "identity": cleanup_identity_payload(directory_identity),
+                    "error": f"{type(exc).__name__}: {exc}",
+                })
         if completed.returncode != 0:
             raw["error_type"] = "judge_exit"
             raw["error"] = raw["stderr"].strip() or f"fixed judge exited with {completed.returncode}"
-            return raw, build_judge_evaluation(task, result, raw, None, raw["error"])
+            return evaluated(None, raw["error"])
         payload = parse_json_output(raw["stdout"])
+        usage = extract_usage(payload)
+        if usage is not None:
+            raw["usage"] = usage
         judge_text = extract_output(payload)
         requested_dimensions = fixed_judge_dimensions(task)
         direct_judge_payload = isinstance(payload, dict) and (
@@ -2323,22 +2545,26 @@ def run_fixed_judge(omp_bin: str, judge_model: str, task: dict[str, Any], result
             judge_text = json.dumps(candidate, ensure_ascii=False)
         dimensions = normalize_fixed_judge_dimensions(candidate, requested_dimensions)
         raw["output"] = judge_text
-        usage = extract_usage(payload)
-        if usage is not None:
-            raw["usage"] = usage
+        raw["evaluation_payload"] = candidate
         raw["status"] = "pass"
         raw["execution_status"] = "completed"
-        return raw, build_judge_evaluation(task, result, raw, dimensions)
+        return evaluated(dimensions)
     except subprocess.TimeoutExpired as exc:
         raw["error_type"] = "judge_timeout"
         raw["error"] = f"fixed judge exceeded {timeout}s"
         raw["stdout"] = decode_subprocess_text(exc.stdout)
         raw["stderr"] = decode_subprocess_text(exc.stderr)
-        return raw, build_judge_evaluation(task, result, raw, None, raw["error"])
+        return evaluated(None, raw["error"])
+    except JudgeHarnessError:
+        raise
     except (OSError, RoleBenchError, json.JSONDecodeError, RecursionError, TypeError, ValueError) as exc:
         raw["error_type"] = "judge_invalid"
         raw["error"] = str(exc)
-        return raw, build_judge_evaluation(task, result, raw, None, raw["error"])
+        return evaluated(None, raw["error"])
+    except Exception as exc:
+        raw["error_type"] = "judge_internal"
+        raw["error"] = f"{type(exc).__name__}: {exc}"
+        raise JudgeHarnessError(raw, exc) from exc
 
 
 def rebuild_judge_evaluation(task: dict[str, Any], result: dict[str, Any], judge_result: dict[str, Any]) -> dict[str, Any]:
@@ -2346,7 +2572,9 @@ def rebuild_judge_evaluation(task: dict[str, Any], result: dict[str, Any], judge
         error = str(judge_result.get("error") or "fixed judge execution was incomplete")
         return build_judge_evaluation(task, result, judge_result, None, error)
     try:
-        payload = parse_fixed_judge_document(decode_subprocess_text(judge_result.get("output", "")))
+        payload = judge_result.get("evaluation_payload")
+        if not isinstance(payload, dict):
+            raise RoleBenchError("fixed judge raw result is missing evaluation_payload")
         dimensions = normalize_fixed_judge_dimensions(payload, fixed_judge_dimensions(task))
         return build_judge_evaluation(task, result, judge_result, dimensions)
     except RoleBenchError as exc:
@@ -2371,6 +2599,8 @@ def candidate_pricing(candidates: list[dict[str, Any]], supplied: dict[str, dict
 
 def format_plan(manifest: dict[str, Any]) -> str:
     estimate = manifest["estimate"]
+    parallelism = manifest.get("parallelism", {})
+    workspace_capacity = manifest.get("workspace_capacity", {})
     cap = manifest.get("max_cost_usd")
     cost = f"${estimate['cost_usd']:.6f}" if estimate.get("cost_usd") is not None else "unknown"
     cap_text = f"${cap:.6f}" if isinstance(cap, (int, float)) else "未设置"
@@ -2383,6 +2613,11 @@ def format_plan(manifest: dict[str, Any]) -> str:
         f"- task fixtures: {len(manifest['tasks'])}",
         f"- assignments: {estimate['assignments']}",
         f"- requests: {estimate['calls']} ({manifest['runs']} run(s) per task)",
+        f"- parallel cells: {parallelism.get('candidate_cells', estimate['calls'])} candidate, "
+        f"{parallelism.get('judge_cells', 0)} judge; jobs {parallelism.get('requested_jobs', 1)} "
+        f"(effective {parallelism.get('effective_jobs', 1)}), ~{parallelism.get('estimated_provider_waves', estimate['calls'])} provider wave(s)",
+        f"- workspace capacity: max cell {human_bytes(int(workspace_capacity.get('max_cell_bytes', 0)))}, "
+        f"estimated peak {human_bytes(int(workspace_capacity.get('estimated_peak_bytes', 0)))}",
         f"- estimated tokens: input {estimate['input_tokens']}, output {estimate['output_tokens']}",
         f"- estimated model cost: {cost} ({estimate['cost_status']})",
         f"- estimated total cost: {('$%.6f' % estimate['total_cost_usd']) if estimate.get('total_cost_usd') is not None else 'unknown'} ({estimate.get('total_cost_status', estimate['cost_status'])})",
@@ -2409,6 +2644,12 @@ def format_plan(manifest: dict[str, Any]) -> str:
         lines.insert(model_cost_index, judge_line)
     if manifest.get("recommend"):
         lines.append(f"- recommendations: enabled after {manifest.get('min_recommendation_runs', 3)} run(s) per task and deterministic/fixed-judge hard gates")
+    if parallelism.get("effective_jobs", 1) > 1:
+        lines.append(
+            "- concurrency note: the cost cap stops new calls after observed usage reaches the cap; "
+            f"up to {parallelism['effective_jobs']} already in-flight calls may still complete and add cost"
+        )
+        lines.append("- latency note: parallel-run latency includes provider concurrency/load effects; compare only runs with the same jobs setting")
     resume_progress = manifest.get("resume_progress")
     if isinstance(resume_progress, dict):
         lines.append(
@@ -2418,6 +2659,15 @@ def format_plan(manifest: dict[str, Any]) -> str:
             f"judge {resume_progress.get('completed_judge_cells', 0)}/{resume_progress.get('expected_judge_cells', 0)} complete, "
             f"{resume_progress.get('remaining_judge_cells', 0)} remaining (full-plan estimate remains the cap basis)"
         )
+        resume_segment = parallelism.get("resume_segment", {})
+        if isinstance(resume_segment, dict):
+            lines.append(
+                "- resume execution segment: "
+                f"effective jobs {resume_segment.get('effective_jobs', 0)}, "
+                f"{resume_segment.get('remaining_provider_calls', 0)} provider call(s), "
+                f"~{resume_segment.get('estimated_provider_waves', 0)} provider wave(s); "
+                "run-wide concurrency above remains the report/latency basis"
+            )
     for item in manifest.get("evaluation", {}).get("command_argvs", []):
         lines.append(f"- command argv [{item['task_id']}/{item['check_id']}]: {json.dumps(item['argv'], ensure_ascii=False)}")
     recent_work = manifest.get("recent_work")
@@ -2605,8 +2855,9 @@ def build_recommendations(
 
 
 def output_copy_ignore(source: Path, output_dir: Path):
+    output_resolved = output_dir.resolve()
     try:
-        relative = output_dir.resolve().relative_to(source.resolve())
+        relative = output_resolved.relative_to(source.resolve())
     except ValueError:
         return None
     if not relative.parts:
@@ -2615,13 +2866,347 @@ def output_copy_ignore(source: Path, output_dir: Path):
     target = relative.parts[-1]
 
     def ignore(current: str, names: list[str]) -> set[str]:
+        ignored: set[str] = set()
         try:
-            current_relative = Path(current).resolve().relative_to(source.resolve())
+            current_path = Path(current)
+            current_relative = current_path.resolve().relative_to(source.resolve())
         except ValueError:
-            return set()
-        return {target} if current_relative == parent and target in names else set()
+            current_relative = None
+        if current_relative == parent and target in names:
+            ignored.add(target)
+        for name in names:
+            try:
+                resolved = (current_path / name).resolve()
+            except OSError:
+                continue
+            if resolved == output_resolved or output_resolved in resolved.parents:
+                ignored.add(name)
+        return ignored
 
     return ignore
+
+
+def temp_root_identity(path: Path) -> tuple[int, int]:
+    metadata = path.lstat()
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+        raise RoleBenchError(f"temporary root is not a directory: {path}")
+    return metadata.st_dev, metadata.st_ino
+
+
+def cleanup_identity_payload(identity: tuple[int, int]) -> dict[str, int]:
+    return {"device": identity[0], "inode": identity[1]}
+
+
+def cleanup_identity_from_warning(warning: dict[str, Any]) -> tuple[int, int]:
+    value = warning.get("identity")
+    if not isinstance(value, dict) or not isinstance(value.get("device"), int) or not isinstance(value.get("inode"), int):
+        raise RoleBenchError("cleanup warning is missing the temporary-root identity")
+    return value["device"], value["inode"]
+
+
+def remove_temp_root(path: Path, expected_identity: tuple[int, int]) -> None:
+    candidate = Path(os.path.abspath(os.fspath(path)))
+    temp_base = Path(os.path.abspath(tempfile.gettempdir()))
+    if candidate.parent != temp_base or not candidate.name.startswith("omp-rolebench-"):
+        raise RoleBenchError(f"refusing to remove unexpected temporary path: {candidate}")
+    try:
+        metadata = candidate.lstat()
+    except FileNotFoundError:
+        raise RoleBenchError(f"temporary root disappeared before cleanup: {candidate}")
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+        raise RoleBenchError(f"refusing to remove replaced temporary path: {candidate}")
+    if (metadata.st_dev, metadata.st_ino) != expected_identity:
+        raise RoleBenchError(f"refusing to remove replaced temporary directory: {candidate}")
+    shutil.rmtree(candidate)
+
+
+def build_cell_schedule(assignments: list[dict[str, Any]], tasks: list[dict[str, Any]], runs: int, seed: int, jobs: int) -> list[dict[str, Any]]:
+    ordered_assignments = list(assignments)
+    random.Random(seed).shuffle(ordered_assignments)
+    grouped = [
+        deque(
+            {"assignment": assignment, "task": task, "replicate": replicate}
+            for replicate in range(1, runs + 1)
+            for task in tasks
+            if task_for_assignment(task, assignment)
+        )
+        for assignment in ordered_assignments
+    ]
+    if jobs == 1:
+        cells = [cell for group in grouped for cell in group]
+    else:
+        cells = []
+        while any(grouped):
+            for group in grouped:
+                if group:
+                    cells.append(group.popleft())
+    for index, cell in enumerate(cells):
+        cell["schedule_index"] = index
+    return cells
+
+
+def copied_tree_size(source: Path, output_dir: Path) -> int:
+    ignore = output_copy_ignore(source, output_dir)
+    total = 0
+
+    def visit(directory: Path, ancestors: frozenset[tuple[int, int]]) -> None:
+        nonlocal total
+        try:
+            entries = list(os.scandir(directory))
+        except OSError as exc:
+            raise RoleBenchError(f"cannot estimate workspace directory {directory}: {exc}") from exc
+        ignored = set(ignore(str(directory), [entry.name for entry in entries])) if ignore else set()
+        for entry in entries:
+            if entry.name in ignored:
+                continue
+            path = Path(entry.path)
+            try:
+                metadata = entry.stat(follow_symlinks=True)
+            except OSError as exc:
+                raise RoleBenchError(f"cannot estimate workspace file {path}: {exc}") from exc
+            if stat.S_ISREG(metadata.st_mode):
+                total += metadata.st_size
+            elif stat.S_ISDIR(metadata.st_mode):
+                identity = (metadata.st_dev, metadata.st_ino)
+                if identity in ancestors:
+                    raise RoleBenchError(f"workspace contains a directory symlink cycle: {path}")
+                visit(path, ancestors | {identity})
+
+    try:
+        root_metadata = source.stat()
+    except OSError as exc:
+        raise RoleBenchError(f"cannot estimate workspace size for {source}: {exc}") from exc
+    visit(source, frozenset({(root_metadata.st_dev, root_metadata.st_ino)}))
+    return total
+
+
+def provider_parallelism_plan(jobs: int, candidate_calls: int, ready_judge_calls: int, judge_enabled: bool) -> dict[str, int]:
+    if jobs < 1:
+        raise RoleBenchError("parallel jobs must be >= 1")
+    ready_calls = candidate_calls + ready_judge_calls
+    effective_jobs = min(jobs, ready_calls) if ready_calls else 0
+    remaining_candidates = candidate_calls
+    remaining_judges = ready_judge_calls
+    waves = 0
+    while remaining_candidates or remaining_judges:
+        candidate_batch = min(jobs, remaining_candidates)
+        remaining_candidates -= candidate_batch
+        judge_batch = min(jobs - candidate_batch, remaining_judges)
+        remaining_judges -= judge_batch
+        if judge_enabled:
+            remaining_judges += candidate_batch
+        waves += 1
+    provider_calls = candidate_calls + ready_judge_calls + (candidate_calls if judge_enabled else 0)
+    return {
+        "effective_jobs": effective_jobs,
+        "provider_calls": provider_calls,
+        "estimated_provider_waves": waves,
+    }
+
+
+def task_workspace_size(task: dict[str, Any], output_dir: Path) -> int:
+    total = 0
+    source_workspace = task.get("workspace")
+    if source_workspace:
+        source = Path(source_workspace).expanduser().resolve()
+        if not source.is_dir():
+            raise RoleBenchError(f"task workspace does not exist: {source}")
+        total += copied_tree_size(source, output_dir)
+    image_values = task.get("image", [])
+    if isinstance(image_values, str):
+        image_values = [image_values]
+    for image_value in image_values:
+        image = Path(image_value).expanduser().resolve()
+        if not image.is_file():
+            raise RoleBenchError(f"task image does not exist: {image}")
+        total += image.stat().st_size
+    return total
+
+
+def workspace_capacity_plan(cells: list[dict[str, Any]], jobs: int, output_dir: Path) -> dict[str, Any]:
+    sizes_by_task: dict[str, int] = {}
+    cell_sizes = []
+    for cell in cells:
+        task = cell["task"]
+        task_id = task["id"]
+        if task_id not in sizes_by_task:
+            sizes_by_task[task_id] = task_workspace_size(task, output_dir)
+        cell_sizes.append(sizes_by_task[task_id])
+    effective_jobs = min(jobs, len(cells)) if cells else 0
+    return {
+        "cell_count": len(cells),
+        "effective_jobs": effective_jobs,
+        "max_cell_bytes": max(cell_sizes, default=0),
+        "estimated_peak_bytes": sum(sorted(cell_sizes, reverse=True)[:effective_jobs]),
+        "by_task": [
+            {"task_id": task_id, "estimated_bytes": size}
+            for task_id, size in sorted(sizes_by_task.items())
+        ],
+    }
+
+
+def human_bytes(value: int) -> str:
+    amount = float(value)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if amount < 1024 or unit == "TiB":
+            return f"{amount:.0f} {unit}" if unit == "B" else f"{amount:.1f} {unit}"
+        amount /= 1024
+    return f"{value} B"
+
+
+def execute_candidate_cell(
+    omp_bin: str,
+    assignment: dict[str, Any],
+    task: dict[str, Any],
+    replicate: int,
+    output_dir: Path,
+    timeout: int,
+    config_file: Path,
+    executor: str,
+    controller_model: str | None,
+    allow_check_command: bool,
+    artifacts_root: Path,
+    expected_harness: dict[str, Any],
+) -> dict[str, Any]:
+    try:
+        verify_harness_fingerprint(expected_harness)
+    except RoleBenchError as exc:
+        return {"preflight_error": str(exc), "stop_reason": "harness_integrity_changed"}
+    harness_error = None
+    try:
+        row = run_one(
+            omp_bin,
+            assignment,
+            task,
+            replicate,
+            output_dir,
+            timeout,
+            config_file,
+            executor,
+            controller_model,
+            allow_check_command,
+            artifacts_root,
+        )
+    except Exception as exc:
+        harness_error = exc
+        if isinstance(exc, WorkspaceCleanupError):
+            row = exc.result
+        else:
+            row = {
+                "timestamp": now_iso(),
+                "assignment_id": assignment["id"],
+                "mode": assignment["mode"],
+                "role": task["role"],
+                "task_id": task["id"],
+                "replicate": replicate,
+                "model": assignment["mapping"].get(task["role"], ""),
+                "thinking": assignment.get("thinking", {}).get(task["role"]),
+                "executor": executor,
+                "provider_call_started": False,
+                "status": "error",
+                "execution_status": "failed",
+                "error_type": "harness_internal",
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+            row["_evaluation"] = failed_evaluation(task, row, exc)
+    row.setdefault("assignment_id", assignment["id"])
+    row.setdefault("mode", assignment["mode"])
+    row.setdefault("role", task["role"])
+    row.setdefault("task_id", task["id"])
+    row.setdefault("replicate", replicate)
+    row.setdefault("model", assignment["mapping"].get(task["role"], ""))
+    row.setdefault("thinking", assignment.get("thinking", {}).get(task["role"]))
+    row.setdefault("executor", executor)
+    evaluation = row.pop("_evaluation", None)
+    stop_reason = None
+    try:
+        verify_harness_fingerprint(expected_harness)
+    except RoleBenchError as exc:
+        row.setdefault("warnings", []).append({"type": "harness_integrity", "error": str(exc)})
+        stop_reason = "harness_integrity_changed"
+    warning_types = {
+        warning.get("type")
+        for warning in row.get("warnings", [])
+        if isinstance(warning, dict)
+    }
+    if "harness_integrity" in warning_types:
+        stop_reason = "harness_integrity_changed"
+    elif "workspace_cleanup_failed" in warning_types:
+        stop_reason = "workspace_cleanup_failed"
+    elif harness_error is not None:
+        stop_reason = "harness_internal"
+    elif warning_types & {"workspace_evidence", "artifact_write", "evaluation"}:
+        stop_reason = "harness_evidence_failed"
+    elif row.get("error_type") in HARNESS_ERROR_TYPES:
+        stop_reason = "harness_execution_failed"
+    return {"row": row, "evaluation": evaluation, "stop_reason": stop_reason}
+
+
+def execute_judge_cell(
+    omp_bin: str,
+    judge_model: str,
+    assignment: dict[str, Any],
+    task: dict[str, Any],
+    replicate: int,
+    row: dict[str, Any],
+    evaluation: dict[str, Any] | None,
+    timeout: int,
+    expected_harness: dict[str, Any],
+) -> dict[str, Any]:
+    try:
+        verify_harness_fingerprint(expected_harness)
+    except RoleBenchError as exc:
+        return {"preflight_error": str(exc), "stop_reason": "harness_integrity_changed"}
+    stop_reason = None
+    try:
+        judge_row, judge_evaluation = run_fixed_judge(
+            omp_bin,
+            judge_model,
+            task,
+            row,
+            evaluation or failed_evaluation(task, row, "deterministic evaluation unavailable"),
+            timeout,
+        )
+    except JudgeHarnessError as exc:
+        judge_row = exc.raw
+        judge_evaluation = None
+        stop_reason = "harness_judge_failed"
+    except Exception as exc:
+        judge_row = {
+            "schema_version": FIXED_JUDGE_SCHEMA_VERSION,
+            "judge_result_id": f"{assignment['id']}:{task['id']}:{replicate}",
+            "timestamp": now_iso(),
+            "assignment_id": assignment["id"],
+            "task_id": task["id"],
+            "role": task["role"],
+            "model": judge_model,
+            "replicate": replicate,
+            "evaluator": "fixed_judge",
+            "rubric_version": FIXED_JUDGE_RUBRIC_VERSION,
+            "provider_call_started": False,
+            "status": "error",
+            "execution_status": "failed",
+            "error_type": "judge_internal",
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+        try:
+            judge_evaluation = build_judge_evaluation(task, row, judge_row, None, judge_row["error"])
+        except Exception:
+            judge_evaluation = None
+        stop_reason = "harness_judge_failed"
+    try:
+        verify_harness_fingerprint(expected_harness)
+    except RoleBenchError as exc:
+        judge_row.setdefault("warnings", []).append({"type": "harness_integrity", "error": str(exc)})
+        stop_reason = "harness_integrity_changed"
+    warning_types = {
+        warning.get("type")
+        for warning in judge_row.get("warnings", [])
+        if isinstance(warning, dict)
+    }
+    if stop_reason is None and "workspace_cleanup_failed" in warning_types:
+        stop_reason = "workspace_cleanup_failed"
+    return {"row": judge_row, "evaluation": judge_evaluation, "stop_reason": stop_reason}
 
 
 def run_one(omp_bin: str, assignment: dict[str, Any], task: dict[str, Any], replicate: int, output_dir: Path, timeout: int, config_file: Path, executor: str, controller_model: str | None, allow_check_command: bool = False, artifacts_root: Path | None = None) -> dict[str, Any]:
@@ -2650,6 +3235,7 @@ def run_one(omp_bin: str, assignment: dict[str, Any], task: dict[str, Any], repl
         result["latency_ms"] = round((time.perf_counter() - started) * 1000, 2)
         return result
     temp_root = Path(tempfile.mkdtemp(prefix="omp-rolebench-"))
+    temp_identity = temp_root_identity(temp_root)
     workspace: Path | None = None
     before_snapshot: dict[str, Any] | None = None
     try:
@@ -2806,30 +3392,42 @@ def run_one(omp_bin: str, assignment: dict[str, Any], task: dict[str, Any], repl
         artifacts = None
         evaluation_workspace = workspace if before_snapshot is not None and workspace and workspace.is_dir() else None
         try:
-            if evaluation_workspace is not None:
-                after_snapshot = snapshot_workspace(evaluation_workspace)
-                workspace_diff = diff_workspace_snapshots(before_snapshot, after_snapshot)
-                if artifacts_root is not None:
-                    identity = f"{assignment['id']}-{task['id']}-run-{replicate}"
-                    artifacts = write_workspace_artifacts(output_dir, artifacts_root, identity, before_snapshot, after_snapshot, workspace_diff)
-        except Exception as exc:
-            warning_type = "artifact_write" if workspace_diff is not None else "workspace_evidence"
-            result.setdefault("warnings", []).append({"type": warning_type, "error": str(exc)})
-        try:
-            result["_evaluation"] = build_evaluation(
-                task,
-                result,
-                evaluation_workspace,
-                workspace_diff,
-                allow_check_command,
-                artifacts,
-                before_snapshot,
-            )
-        except Exception as exc:
-            result.setdefault("warnings", []).append({"type": "evaluation", "error": str(exc)})
-            result["_evaluation"] = failed_evaluation(task, result, exc, artifacts)
+            try:
+                if evaluation_workspace is not None:
+                    after_snapshot = snapshot_workspace(evaluation_workspace)
+                    workspace_diff = diff_workspace_snapshots(before_snapshot, after_snapshot)
+                    if artifacts_root is not None:
+                        identity = f"{assignment['id']}-{task['id']}-run-{replicate}"
+                        artifacts = write_workspace_artifacts(output_dir, artifacts_root, identity, before_snapshot, after_snapshot, workspace_diff)
+            except Exception as exc:
+                warning_type = "artifact_write" if workspace_diff is not None else "workspace_evidence"
+                result.setdefault("warnings", []).append({"type": warning_type, "error": str(exc)})
+            try:
+                result["_evaluation"] = build_evaluation(
+                    task,
+                    result,
+                    evaluation_workspace,
+                    workspace_diff,
+                    allow_check_command,
+                    artifacts,
+                    before_snapshot,
+                )
+            except Exception as exc:
+                result.setdefault("warnings", []).append({"type": "evaluation", "error": str(exc)})
+                result["_evaluation"] = failed_evaluation(task, result, exc, artifacts)
         finally:
-            shutil.rmtree(temp_root, ignore_errors=True)
+            active_exception = sys.exc_info()[1]
+            try:
+                remove_temp_root(temp_root, temp_identity)
+            except (OSError, RoleBenchError) as exc:
+                result.setdefault("warnings", []).append({
+                    "type": "workspace_cleanup_failed",
+                    "path": str(temp_root),
+                    "identity": cleanup_identity_payload(temp_identity),
+                    "error": str(exc),
+                })
+                if active_exception is not None:
+                    raise WorkspaceCleanupError(temp_root, exc, result) from exc
     return result
 
 
@@ -2882,6 +3480,11 @@ def append_result(path: Path, row: dict[str, Any]) -> None:
 
 def run_command(args: argparse.Namespace) -> int:
     resume = bool(getattr(args, "resume", False))
+    jobs = int(getattr(args, "jobs", 1))
+    if jobs < 1:
+        raise RoleBenchError("--jobs must be >= 1")
+    if jobs > 1 and args.executor != "direct":
+        raise RoleBenchError("--jobs > 1 is supported only with --executor direct")
     if resume and (not args.execute or not args.confirm):
         raise RoleBenchError("--resume requires --execute --confirm")
     config_path = Path(args.config_file).expanduser()
@@ -2917,6 +3520,29 @@ def run_command(args: argparse.Namespace) -> int:
     if resume and not (output_dir / "manifest.json").is_file():
         raise RoleBenchError("--resume requires an existing manifest.json in --output")
     output_dir.mkdir(parents=True, exist_ok=True)
+    cells = build_cell_schedule(assignments, tasks, args.runs, args.seed, jobs)
+    expected_cells = len(cells)
+    expected_cell_keys = {
+        (cell["assignment"]["id"], cell["task"]["id"], cell["replicate"])
+        for cell in cells
+    }
+    expected_cells_by_key = {
+        (cell["assignment"]["id"], cell["task"]["id"], cell["replicate"]): cell
+        for cell in cells
+    }
+    expected_judge_keys = expected_cell_keys if judge_model else set()
+    execution_plan = provider_parallelism_plan(jobs, expected_cells, 0, bool(judge_model))
+    effective_jobs = execution_plan["effective_jobs"]
+    parallelism = {
+        "requested_jobs": jobs,
+        "effective_jobs": effective_jobs,
+        "candidate_cells": expected_cells,
+        "judge_cells": expected_cells if judge_model else 0,
+        "provider_calls": execution_plan["provider_calls"],
+        "estimated_provider_waves": execution_plan["estimated_provider_waves"],
+    }
+    workspace_capacity = workspace_capacity_plan(cells, jobs, output_dir)
+    source_fingerprints = source_fixture_fingerprints(tasks, output_dir)
     manifest_path = output_dir / "manifest.json"
     results_path = output_dir / "results.jsonl"
     evaluations_path = output_dir / "evaluations.jsonl"
@@ -2925,6 +3551,10 @@ def run_command(args: argparse.Namespace) -> int:
     recommendations_path = output_dir / "recommendations.json"
     report_markdown_path = output_dir / "report.md"
     report_json_path = output_dir / "report.json"
+    persisted_result_rows: list[dict[str, Any]] = []
+    persisted_evaluation_rows: list[dict[str, Any]] = []
+    persisted_judge_rows: list[dict[str, Any]] = []
+    persisted_judge_evaluation_rows: list[dict[str, Any]] = []
     if resume:
         previous_results = previous_evaluations = previous_judge_results = previous_judge_evaluations = previous_recommendations = None
         previous_report_markdown = previous_report_json = None
@@ -2946,7 +3576,7 @@ def run_command(args: argparse.Namespace) -> int:
     current_harness = harness_fingerprint()
     artifact_run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     manifest = {
-        "schema_version": 2,
+        "schema_version": 3,
         "task_schema_version": 1,
         "evaluation_schema_version": 1,
         "generated_at": now_iso(),
@@ -2956,6 +3586,7 @@ def run_command(args: argparse.Namespace) -> int:
         "baseline_roles": baseline,
         "mode": args.mode,
         "runs": args.runs,
+        "jobs": jobs,
         "timeout": args.timeout,
         "seed": args.seed,
         "execute": bool(args.execute),
@@ -3000,6 +3631,9 @@ def run_command(args: argparse.Namespace) -> int:
             },
         },
         "estimate": estimate,
+        "parallelism": parallelism,
+        "workspace_capacity": workspace_capacity,
+        "source_fingerprints": source_fingerprints,
         "consent": {
             "required": bool(args.execute),
             "granted": bool(args.execute and args.confirm),
@@ -3013,6 +3647,8 @@ def run_command(args: argparse.Namespace) -> int:
     manifest["experiment_signature"] = experiment_signature(manifest)
     if resume:
         previous_manifest = load_json_document(manifest_path)
+        if previous_manifest.get("source_fingerprints") != source_fingerprints:
+            raise RoleBenchError("resume source workspace or image content differs from the original run; use a new output directory")
         if previous_manifest.get("experiment_signature") != manifest["experiment_signature"]:
             raise RoleBenchError("resume experiment does not match the existing manifest; use a new output directory")
         previous_harness = previous_manifest.get("harness")
@@ -3028,17 +3664,98 @@ def run_command(args: argparse.Namespace) -> int:
             previous_summary = load_json_document(previous_summary_path)
             if previous_summary.get("stopped_reason") in HARNESS_STOP_REASONS:
                 raise RoleBenchError("cannot resume a harness-failed run; fix the harness and rerun the full matrix in a new output directory")
-        expected_resume_cells = sum(
-            args.runs * sum(task_for_assignment(task, assignment) for task in tasks)
-            for assignment in assignments
-        )
+        expected_resume_cells = expected_cells
         persisted_result_rows = load_jsonl(results_path, "results.jsonl")
+        persisted_evaluation_rows = load_jsonl(evaluations_path, "evaluations.jsonl")
         persisted_judge_rows = load_jsonl(judge_results_path, "judge_results.jsonl")
+        persisted_judge_evaluation_rows = load_jsonl(judge_evaluations_path, "judge_evaluations.jsonl")
         persisted_failure = persisted_harness_failure([*persisted_result_rows, *persisted_judge_rows])
         if persisted_failure:
             raise RoleBenchError(f"cannot resume a harness-failed run ({persisted_failure}); rerun the full matrix in a new output directory")
         persisted_results = unique_cell_index(persisted_result_rows, "results.jsonl")
+        persisted_evaluations = unique_cell_index(persisted_evaluation_rows, "evaluations.jsonl")
         persisted_judges = unique_cell_index(persisted_judge_rows, "judge_results.jsonl")
+        persisted_judge_evaluations = unique_cell_index(persisted_judge_evaluation_rows, "judge_evaluations.jsonl")
+        unexpected_results = sorted(set(persisted_results) - expected_cell_keys)
+        unexpected_evaluations = sorted(set(persisted_evaluations) - expected_cell_keys)
+        unexpected_judges = sorted(set(persisted_judges) - expected_judge_keys)
+        unexpected_judge_evaluations = sorted(set(persisted_judge_evaluations) - expected_judge_keys)
+        if unexpected_results or unexpected_evaluations or unexpected_judges or unexpected_judge_evaluations:
+            raise RoleBenchError(
+                "resume audit rows do not belong to the expected matrix; "
+                f"results={unexpected_results!r}, evaluations={unexpected_evaluations!r}, "
+                f"judges={unexpected_judges!r}, judge_evaluations={unexpected_judge_evaluations!r}"
+            )
+        if any(key not in persisted_results for key in persisted_evaluations):
+            raise RoleBenchError("evaluations.jsonl contains a cell without a raw result")
+        if any(key not in persisted_results for key in persisted_judges):
+            raise RoleBenchError("judge_results.jsonl contains a cell without a candidate result")
+        if any(key not in persisted_judges for key in persisted_judge_evaluations):
+            raise RoleBenchError("judge_evaluations.jsonl contains a cell without a raw judge result")
+        for key, row in persisted_results.items():
+            cell = expected_cells_by_key[key]
+            assignment = cell["assignment"]
+            task = cell["task"]
+            validate_resume_row(row, {
+                "mode": assignment["mode"],
+                "role": task["role"],
+                "model": assignment["mapping"].get(task["role"], ""),
+                "thinking": assignment.get("thinking", {}).get(task["role"]),
+                "executor": args.executor,
+            }, "candidate result")
+            validate_raw_result_integrity(row, "candidate result")
+        for key, evaluation in persisted_evaluations.items():
+            cell = expected_cells_by_key[key]
+            assignment = cell["assignment"]
+            task = cell["task"]
+            raw = persisted_results[key]
+            validate_resume_row(evaluation, {
+                "schema_version": 1,
+                "assignment_id": key[0],
+                "task_id": key[1],
+                "replicate": key[2],
+                "role": task["role"],
+                "model": assignment["mapping"].get(task["role"], ""),
+                "thinking": assignment.get("thinking", {}).get(task["role"]),
+                "execution_status": raw.get("execution_status"),
+            }, "deterministic evaluation")
+            validate_evaluation_integrity(evaluation, raw, "deterministic evaluation")
+        if judge_model:
+            judge_selector = parse_selector(judge_model)
+            for key, row in persisted_judges.items():
+                task = expected_cells_by_key[key]["task"]
+                validate_resume_row(row, {
+                    "schema_version": FIXED_JUDGE_SCHEMA_VERSION,
+                    "role": task["role"],
+                    "model": judge_selector["selector"],
+                    "thinking": judge_selector.get("thinking"),
+                    "evaluator": "fixed_judge",
+                    "rubric_version": FIXED_JUDGE_RUBRIC_VERSION,
+                }, "fixed-judge result")
+                validate_raw_result_integrity(row, "fixed-judge result")
+            for key, evaluation in persisted_judge_evaluations.items():
+                cell = expected_cells_by_key[key]
+                assignment = cell["assignment"]
+                task = cell["task"]
+                raw = persisted_results[key]
+                judge_raw = persisted_judges[key]
+                validate_resume_row(evaluation, {
+                    "schema_version": FIXED_JUDGE_SCHEMA_VERSION,
+                    "assignment_id": key[0],
+                    "task_id": key[1],
+                    "replicate": key[2],
+                    "role": task["role"],
+                    "model": assignment["mapping"].get(task["role"], ""),
+                    "thinking": assignment.get("thinking", {}).get(task["role"]),
+                    "evaluator": "fixed_judge",
+                    "rubric_version": FIXED_JUDGE_RUBRIC_VERSION,
+                    "judge_result_id": judge_raw.get("judge_result_id"),
+                }, "fixed-judge evaluation")
+                validate_evaluation_integrity(evaluation, raw, "fixed-judge evaluation", judge_raw)
+                rebuilt = rebuild_judge_evaluation(task, raw, judge_raw)
+                seal_evaluation(rebuilt, raw, judge_raw)
+                if judge_evaluation_audit_payload(evaluation) != judge_evaluation_audit_payload(rebuilt):
+                    raise RoleBenchError(f"fixed-judge evaluation row does not match its raw judge result: {key!r}")
         manifest["resume_progress"] = {
             "expected_candidate_cells": expected_resume_cells,
             "completed_candidate_cells": len(persisted_results),
@@ -3047,35 +3764,57 @@ def run_command(args: argparse.Namespace) -> int:
             "completed_judge_cells": len(persisted_judges),
             "remaining_judge_cells": max(0, expected_resume_cells - len(persisted_judges)) if judge_model else 0,
         }
+        remaining_candidate_keys = expected_cell_keys - set(persisted_results)
+        ready_judge_keys = expected_judge_keys & set(persisted_results) - set(persisted_judges)
+        execution_plan = provider_parallelism_plan(
+            jobs,
+            len(remaining_candidate_keys),
+            len(ready_judge_keys),
+            bool(judge_model),
+        )
+        effective_jobs = execution_plan["effective_jobs"]
+        manifest["parallelism"]["resume_segment"] = {
+            "effective_jobs": effective_jobs,
+            "remaining_provider_calls": execution_plan["provider_calls"],
+            "estimated_provider_waves": execution_plan["estimated_provider_waves"],
+        }
         for key in ("previous_results", "previous_evaluations", "previous_judge_results", "previous_judge_evaluations", "previous_recommendations", "previous_report_markdown", "previous_report_json"):
             manifest[key] = previous_manifest.get(key)
     write_json(manifest_path, manifest)
     print(format_plan(manifest), flush=True)
+    preflight_summary = {
+        "jobs": jobs,
+        "effective_jobs": parallelism["effective_jobs"],
+        "execution_effective_jobs": effective_jobs,
+        "expected_result_rows": expected_cells,
+        "estimated_provider_waves": parallelism["estimated_provider_waves"],
+        "workspace_capacity": workspace_capacity,
+    }
     if args.execute and command_checks and not allow_check_command:
-        summary = {"run_dir": str(output_dir), "status": "blocked", "reason": "command_checks_not_approved", "executed": False, "command_checks": command_checks}
+        summary = {"run_dir": str(output_dir), "status": "blocked", "reason": "command_checks_not_approved", "executed": False, "command_checks": command_checks, **preflight_summary}
         report_ok = persist_summary_and_reports(output_dir, summary)
         print("Execution blocked: task fixtures contain command checks; review argv and add --allow-check-command.", file=sys.stderr)
         return 2 if report_ok else 4
     if args.execute and judge_model and judge_estimate["cost_status"] != "estimated":
-        summary = {"run_dir": str(output_dir), "status": "blocked", "reason": "judge_cost_unknown", "executed": False, "estimate": estimate}
+        summary = {"run_dir": str(output_dir), "status": "blocked", "reason": "judge_cost_unknown", "executed": False, "estimate": estimate, **preflight_summary}
         report_ok = persist_summary_and_reports(output_dir, summary)
         print("Execution blocked: fixed-judge cost is unknown; provide --pricing-file with the judge rate.", file=sys.stderr)
         return 2 if report_ok else 4
     if args.max_cost_usd is not None:
         if estimate["total_cost_status"] != "estimated":
-            summary = {"run_dir": str(output_dir), "status": "blocked", "reason": "cost_unknown", "executed": False, "estimate": estimate}
+            summary = {"run_dir": str(output_dir), "status": "blocked", "reason": "cost_unknown", "executed": False, "estimate": estimate, **preflight_summary}
             report_ok = persist_summary_and_reports(output_dir, summary)
             print("Execution blocked: candidate, controller, or fixed-judge cost is unknown; provide --pricing-file with all rates.", file=sys.stderr)
             return 2 if report_ok else 4
         if estimate["total_cost_usd"] > args.max_cost_usd:
-            summary = {"run_dir": str(output_dir), "status": "blocked", "reason": "estimated_cost_exceeds_cap", "estimated_cost_usd": estimate["total_cost_usd"], "model_cost_usd": estimate["cost_usd"], "controller_cost_usd": controller_estimate["cost_usd"], "judge_cost_usd": judge_estimate["cost_usd"], "max_cost_usd": args.max_cost_usd, "executed": False}
+            summary = {"run_dir": str(output_dir), "status": "blocked", "reason": "estimated_cost_exceeds_cap", "estimated_cost_usd": estimate["total_cost_usd"], "model_cost_usd": estimate["cost_usd"], "controller_cost_usd": controller_estimate["cost_usd"], "judge_cost_usd": judge_estimate["cost_usd"], "max_cost_usd": args.max_cost_usd, "executed": False, **preflight_summary}
             report_ok = persist_summary_and_reports(output_dir, summary)
             print(f"Execution blocked: estimated total cost ${estimate['total_cost_usd']:.6f} exceeds cap ${args.max_cost_usd:.6f}.", file=sys.stderr)
             return 2 if report_ok else 4
     if args.confirm and not args.execute:
         raise RoleBenchError("--confirm requires --execute")
     if args.execute and not args.confirm:
-        summary = {"run_dir": str(output_dir), "status": "awaiting_consent", "reason": "missing_confirm", "executed": False, "estimate": estimate}
+        summary = {"run_dir": str(output_dir), "status": "awaiting_consent", "reason": "missing_confirm", "executed": False, "estimate": estimate, **preflight_summary}
         report_ok = persist_summary_and_reports(output_dir, summary)
         print("Execution blocked: obtain user consent, then rerun with --execute --confirm.", file=sys.stderr)
         return 3 if report_ok else 4
@@ -3085,10 +3824,10 @@ def run_command(args: argparse.Namespace) -> int:
     judge_result_rows = 0
     judge_evaluation_rows = 0
     judge_write_errors = 0
-    executed_results: list[dict[str, Any]] = load_jsonl(results_path, "results.jsonl") if resume else []
-    executed_evaluations: list[dict[str, Any]] = load_jsonl(evaluations_path, "evaluations.jsonl") if resume else []
-    executed_judge_results: list[dict[str, Any]] = load_jsonl(judge_results_path, "judge_results.jsonl") if resume else []
-    executed_judge_evaluations: list[dict[str, Any]] = load_jsonl(judge_evaluations_path, "judge_evaluations.jsonl") if resume else []
+    executed_results: list[dict[str, Any]] = persisted_result_rows
+    executed_evaluations: list[dict[str, Any]] = persisted_evaluation_rows
+    executed_judge_results: list[dict[str, Any]] = persisted_judge_rows
+    executed_judge_evaluations: list[dict[str, Any]] = persisted_judge_evaluation_rows
     result_index = unique_cell_index(executed_results, "results.jsonl")
     evaluation_index = unique_cell_index(executed_evaluations, "evaluations.jsonl")
     judge_result_index = unique_cell_index(executed_judge_results, "judge_results.jsonl")
@@ -3107,6 +3846,7 @@ def run_command(args: argparse.Namespace) -> int:
         if task is None:
             raise RoleBenchError(f"cannot resume unknown task {row.get('task_id')!r}")
         evaluation = failed_evaluation(task, row, "deterministic evaluation was not persisted before interruption; workspace evidence is unavailable")
+        seal_evaluation(evaluation, row)
         append_result(evaluations_path, evaluation)
         executed_evaluations.append(evaluation)
         evaluation_index[key] = evaluation
@@ -3118,6 +3858,7 @@ def run_command(args: argparse.Namespace) -> int:
         if task is None:
             raise RoleBenchError(f"cannot resume unknown task {row.get('task_id')!r}")
         judge_evaluation = rebuild_judge_evaluation(task, row, judge_row)
+        seal_evaluation(judge_evaluation, row, judge_row)
         append_result(judge_evaluations_path, judge_evaluation)
         executed_judge_evaluations.append(judge_evaluation)
         judge_evaluation_index[key] = judge_evaluation
@@ -3129,12 +3870,11 @@ def run_command(args: argparse.Namespace) -> int:
     actual_cost_seen = False
     budget_status = "not-set" if args.max_cost_usd is None else "running"
     stopped_reason = None
+    stop_reasons: list[str] = []
     skipped_cells = 0
     interrupted = False
-    expected_cells = sum(
-        args.runs * sum(task_for_assignment(task, assignment) for task in tasks)
-        for assignment in assignments
-    )
+    cleanup_failures: dict[str, tuple[int, int]] = {}
+    unresolved_workspace_paths: list[str] = []
     for prior_row in [*executed_results, *executed_judge_results]:
         prior_cost = extract_cost(prior_row.get("usage"))
         if prior_cost is not None:
@@ -3143,206 +3883,282 @@ def run_command(args: argparse.Namespace) -> int:
         elif args.max_cost_usd is not None and prior_row.get("provider_call_started"):
             budget_status = "unverifiable"
             stopped_reason = "resumed_provider_did_not_return_cost"
+            stop_reasons.append(stopped_reason)
     if args.max_cost_usd is not None and actual_cost >= args.max_cost_usd and stopped_reason is None:
         budget_status = "reached"
         stopped_reason = "actual_cost_reached_cap"
+        stop_reasons.append(stopped_reason)
     if args.execute:
         artifacts_root = output_dir / "artifacts" / artifact_run_id
-        ordered = list(assignments)
-        random.Random(args.seed).shuffle(ordered)
-        stop = stopped_reason is not None
-        try:
-            for assignment in ordered:
-                applicable = [task for task in tasks if task_for_assignment(task, assignment)]
-                for replicate in range(1, args.runs + 1):
-                    for task in applicable:
-                        key = (assignment["id"], task["id"], replicate)
-                        row = result_index.get(key)
-                        evaluation = evaluation_index.get(key)
-                        fresh_candidate = row is None
-                        if fresh_candidate:
-                            try:
-                                verify_harness_fingerprint(current_harness)
-                            except RoleBenchError as exc:
-                                stopped_reason = "harness_integrity_changed"
-                                print(f"Execution stopped: {exc}", file=sys.stderr)
-                                stop = True
-                                break
-                            harness_error = None
-                            try:
-                                row = run_one(
-                                    args.omp_bin,
-                                    assignment,
-                                    task,
-                                    replicate,
-                                    output_dir,
-                                    args.timeout,
-                                    config_path,
-                                    args.executor,
-                                    controller_model,
-                                    allow_check_command,
-                                    artifacts_root,
-                                )
-                            except Exception as exc:
-                                harness_error = exc
-                                row = {
-                                    "timestamp": now_iso(),
-                                    "assignment_id": assignment["id"],
-                                    "mode": assignment["mode"],
-                                    "role": task["role"],
-                                    "task_id": task["id"],
-                                    "replicate": replicate,
-                                    "model": assignment["mapping"].get(task["role"], ""),
-                                    "thinking": assignment.get("thinking", {}).get(task["role"]),
-                                    "executor": args.executor,
-                                    "provider_call_started": False,
-                                    "status": "error",
-                                    "execution_status": "failed",
-                                    "error_type": "harness_internal",
-                                    "error": f"{type(exc).__name__}: {exc}",
-                                }
-                                row["_evaluation"] = failed_evaluation(task, row, exc)
-                            row.setdefault("assignment_id", assignment["id"])
-                            row.setdefault("mode", assignment["mode"])
-                            row.setdefault("role", task["role"])
-                            row.setdefault("task_id", task["id"])
-                            row.setdefault("replicate", replicate)
-                            row.setdefault("model", assignment["mapping"].get(task["role"], ""))
-                            row.setdefault("thinking", assignment.get("thinking", {}).get(task["role"]))
-                            evaluation = row.pop("_evaluation", None)
-                            try:
-                                verify_harness_fingerprint(current_harness)
-                            except RoleBenchError as exc:
-                                row.setdefault("warnings", []).append({"type": "harness_integrity", "error": str(exc)})
-                                stopped_reason = "harness_integrity_changed"
-                                stop = True
-                            append_result(results_path, row)
-                            executed_results.append(row)
-                            result_index[key] = row
-                            result_rows += 1
-                            if evaluation is not None:
-                                try:
-                                    append_result(evaluations_path, evaluation)
-                                    executed_evaluations.append(evaluation)
-                                    evaluation_index[key] = evaluation
-                                    evaluation_rows += 1
-                                except (OSError, TypeError, ValueError) as exc:
-                                    evaluation_write_errors += 1
-                                    stopped_reason = "evaluation_write_failed"
-                                    stop = True
-                                    print(f"Evaluation row could not be written for {task['id']}: {exc}", file=sys.stderr)
-                            warnings = row.get("warnings", []) if isinstance(row.get("warnings"), list) else []
-                            harness_warnings = [warning for warning in warnings if isinstance(warning, dict) and warning.get("type") in {"workspace_evidence", "artifact_write", "evaluation"}]
-                            if harness_error is not None or harness_warnings:
-                                stopped_reason = "harness_internal" if harness_error is not None else "harness_evidence_failed"
-                                stop = True
-                            elif row.get("error_type") in HARNESS_ERROR_TYPES:
-                                stopped_reason = "harness_execution_failed"
-                                stop = True
-                        else:
-                            skipped_cells += 1
-                        cost = extract_cost(row.get("usage")) if fresh_candidate else None
-                        if cost is not None:
-                            actual_cost += cost
-                            actual_cost_seen = True
-                        if fresh_candidate and args.max_cost_usd is not None and row.get("provider_call_started"):
-                            if cost is None:
-                                budget_status = "unverifiable"
-                                stopped_reason = "provider_did_not_return_cost"
-                                stop = True
-                            elif actual_cost >= args.max_cost_usd:
-                                budget_status = "reached"
-                                stopped_reason = "actual_cost_reached_cap"
-                                stop = True
-                        if stop:
-                            break
-                        if judge_model and key not in judge_result_index:
-                            try:
-                                verify_harness_fingerprint(current_harness)
-                            except RoleBenchError as exc:
-                                stopped_reason = "harness_integrity_changed"
-                                print(f"Execution stopped: {exc}", file=sys.stderr)
-                                stop = True
-                                break
-                            try:
-                                judge_row, judge_evaluation = run_fixed_judge(
-                                    args.omp_bin,
-                                    judge_model,
-                                    task,
-                                    row,
-                                    evaluation or failed_evaluation(task, row, "deterministic evaluation unavailable"),
-                                    int(getattr(args, "judge_timeout", FIXED_JUDGE_TIMEOUT)),
-                                )
-                            except Exception as exc:
-                                judge_row = {
-                                    "schema_version": FIXED_JUDGE_SCHEMA_VERSION,
-                                    "judge_result_id": f"{assignment['id']}:{task['id']}:{replicate}",
-                                    "timestamp": now_iso(),
-                                    "assignment_id": assignment["id"],
-                                    "task_id": task["id"],
-                                    "role": task["role"],
-                                    "model": judge_model,
-                                    "replicate": replicate,
-                                    "evaluator": "fixed_judge",
-                                    "rubric_version": FIXED_JUDGE_RUBRIC_VERSION,
-                                    "provider_call_started": False,
-                                    "status": "error",
-                                    "execution_status": "failed",
-                                    "error_type": "judge_internal",
-                                    "error": f"{type(exc).__name__}: {exc}",
-                                }
-                                judge_evaluation = build_judge_evaluation(task, row, judge_row, None, judge_row["error"])
-                                stopped_reason = "harness_judge_failed"
-                                stop = True
-                            try:
-                                verify_harness_fingerprint(current_harness)
-                            except RoleBenchError as exc:
-                                judge_row.setdefault("warnings", []).append({"type": "harness_integrity", "error": str(exc)})
-                                stopped_reason = "harness_integrity_changed"
-                                stop = True
-                            try:
-                                append_result(judge_results_path, judge_row)
-                                executed_judge_results.append(judge_row)
-                                judge_result_index[key] = judge_row
-                                judge_result_rows += 1
-                            except (OSError, TypeError, ValueError) as exc:
-                                judge_write_errors += 1
-                                stopped_reason = "judge_write_failed"
-                                stop = True
-                                print(f"Fixed-judge row could not be written for {task['id']}: {exc}", file=sys.stderr)
-                            try:
-                                append_result(judge_evaluations_path, judge_evaluation)
-                                executed_judge_evaluations.append(judge_evaluation)
-                                judge_evaluation_index[key] = judge_evaluation
-                                judge_evaluation_rows += 1
-                            except (OSError, TypeError, ValueError) as exc:
-                                judge_write_errors += 1
-                                stopped_reason = "judge_write_failed"
-                                stop = True
-                                print(f"Fixed-judge evaluation could not be written for {task['id']}: {exc}", file=sys.stderr)
-                            judge_cost = extract_cost(judge_row.get("usage"))
-                            if judge_cost is not None:
-                                actual_cost += judge_cost
-                                actual_cost_seen = True
-                            if args.max_cost_usd is not None and judge_row.get("provider_call_started"):
-                                if judge_cost is None:
-                                    budget_status = "unverifiable"
-                                    stopped_reason = "fixed_judge_did_not_return_cost"
-                                    stop = True
-                                elif actual_cost >= args.max_cost_usd:
-                                    budget_status = "reached"
-                                    stopped_reason = "actual_cost_reached_cap"
-                                    stop = True
-                        if stop:
-                            break
-                    if stop:
+        pending_candidates: deque[dict[str, Any]] = deque()
+        pending_judges: deque[dict[str, Any]] = deque()
+        pending_serial: deque[dict[str, Any]] = deque()
+        scheduled_judges: set[tuple[str, str, int]] = set(judge_result_index)
+        for cell in cells:
+            assignment = cell["assignment"]
+            task = cell["task"]
+            replicate = cell["replicate"]
+            key = (assignment["id"], task["id"], replicate)
+            if key in result_index:
+                skipped_cells += 1
+                if judge_model and key not in judge_result_index:
+                    scheduled_judges.add(key)
+                    judge_job = {
+                        "kind": "judge",
+                        "key": key,
+                        "assignment": assignment,
+                        "task": task,
+                        "replicate": replicate,
+                        "row": result_index[key],
+                        "evaluation": evaluation_index.get(key),
+                    }
+                    (pending_serial if jobs == 1 else pending_judges).append(judge_job)
+            else:
+                candidate_job = {
+                    "kind": "candidate",
+                    "key": key,
+                    "assignment": assignment,
+                    "task": task,
+                    "replicate": replicate,
+                }
+                (pending_serial if jobs == 1 else pending_candidates).append(candidate_job)
+        pending = pending_serial if jobs == 1 else deque([*pending_candidates, *pending_judges])
+
+        def request_stop(reason: str | None) -> None:
+            nonlocal stopped_reason, interrupted
+            if not reason:
+                return
+            if reason not in stop_reasons:
+                stop_reasons.append(reason)
+            if reason == "interrupted":
+                interrupted = True
+                stopped_reason = reason
+            elif stopped_reason is None or (reason in HARNESS_STOP_REASONS and stopped_reason not in HARNESS_STOP_REASONS):
+                stopped_reason = reason
+
+        def record_cleanup_failures(row: dict[str, Any]) -> None:
+            warnings = row.get("warnings", [])
+            for warning in warnings if isinstance(warnings, list) else []:
+                if isinstance(warning, dict) and warning.get("type") == "workspace_cleanup_failed" and isinstance(warning.get("path"), str):
+                    try:
+                        cleanup_failures[warning["path"]] = cleanup_identity_from_warning(warning)
+                    except RoleBenchError as exc:
+                        print(f"Invalid workspace cleanup evidence: {exc}", file=sys.stderr)
+                        request_stop("harness_evidence_failed")
+
+        def submit(pool: ThreadPoolExecutor, job: dict[str, Any]) -> Future:
+            if job["kind"] == "candidate":
+                return pool.submit(
+                    execute_candidate_cell,
+                    args.omp_bin,
+                    job["assignment"],
+                    job["task"],
+                    job["replicate"],
+                    output_dir,
+                    args.timeout,
+                    config_path,
+                    args.executor,
+                    controller_model,
+                    allow_check_command,
+                    artifacts_root,
+                    current_harness,
+                )
+            return pool.submit(
+                execute_judge_cell,
+                args.omp_bin,
+                judge_model,
+                job["assignment"],
+                job["task"],
+                job["replicate"],
+                job["row"],
+                job["evaluation"],
+                int(getattr(args, "judge_timeout", FIXED_JUDGE_TIMEOUT)),
+                current_harness,
+            )
+
+        accounted_calls = {("candidate", key) for key in result_index}
+        accounted_calls.update(("judge", key) for key in judge_result_index)
+
+        def process_completed_outcome(job: dict[str, Any], outcome: dict[str, Any]) -> None:
+            nonlocal actual_cost, actual_cost_seen, budget_status
+            nonlocal result_rows, evaluation_rows, evaluation_write_errors
+            nonlocal judge_result_rows, judge_evaluation_rows, judge_write_errors
+            key = job["key"]
+            row = outcome["row"]
+            evaluation = outcome.get("evaluation")
+            record_cleanup_failures(row)
+            if job["kind"] == "candidate":
+                seal_raw_result(row)
+                if evaluation is not None:
+                    seal_evaluation(evaluation, row)
+                if key not in result_index:
+                    try:
+                        append_result(results_path, row)
+                    except (OSError, TypeError, ValueError) as exc:
+                        print(f"Candidate row could not be written for {job['task']['id']}: {exc}", file=sys.stderr)
+                        request_stop("result_write_failed")
+                    else:
+                        executed_results.append(row)
+                        result_index[key] = row
+                        result_rows += 1
+                candidate_persisted = key in result_index
+                if candidate_persisted and evaluation is not None and key not in evaluation_index:
+                    try:
+                        append_result(evaluations_path, evaluation)
+                    except (OSError, TypeError, ValueError) as exc:
+                        evaluation_write_errors += 1
+                        print(f"Evaluation row could not be written for {job['task']['id']}: {exc}", file=sys.stderr)
+                        request_stop("evaluation_write_failed")
+                    else:
+                        executed_evaluations.append(evaluation)
+                        evaluation_index[key] = evaluation
+                        evaluation_rows += 1
+                request_stop(outcome.get("stop_reason"))
+                account_key = ("candidate", key)
+                if account_key not in accounted_calls:
+                    cost = extract_cost(row.get("usage"))
+                    if cost is not None:
+                        actual_cost += cost
+                        actual_cost_seen = True
+                    accounted_calls.add(account_key)
+                    if args.max_cost_usd is not None and row.get("provider_call_started"):
+                        if cost is None:
+                            budget_status = "unverifiable"
+                            request_stop("provider_did_not_return_cost")
+                        elif actual_cost >= args.max_cost_usd:
+                            budget_status = "reached"
+                            request_stop("actual_cost_reached_cap")
+                if candidate_persisted and stopped_reason is None and judge_model and key not in scheduled_judges:
+                    scheduled_judges.add(key)
+                    judge_job = {
+                        "kind": "judge",
+                        "key": key,
+                        "assignment": job["assignment"],
+                        "task": job["task"],
+                        "replicate": job["replicate"],
+                        "row": row,
+                        "evaluation": evaluation_index.get(key),
+                    }
+                    if jobs == 1:
+                        pending.appendleft(judge_job)
+                    else:
+                        pending.append(judge_job)
+                return
+
+            seal_raw_result(row)
+            if evaluation is not None:
+                seal_evaluation(evaluation, result_index[key], row)
+            if key not in judge_result_index:
+                try:
+                    append_result(judge_results_path, row)
+                except (OSError, TypeError, ValueError) as exc:
+                    judge_write_errors += 1
+                    print(f"Fixed-judge row could not be written for {job['task']['id']}: {exc}", file=sys.stderr)
+                    request_stop("judge_write_failed")
+                else:
+                    executed_judge_results.append(row)
+                    judge_result_index[key] = row
+                    judge_result_rows += 1
+            judge_persisted = key in judge_result_index
+            if judge_persisted and evaluation is not None and key not in judge_evaluation_index:
+                try:
+                    append_result(judge_evaluations_path, evaluation)
+                except (OSError, TypeError, ValueError) as exc:
+                    judge_write_errors += 1
+                    print(f"Fixed-judge evaluation could not be written for {job['task']['id']}: {exc}", file=sys.stderr)
+                    request_stop("judge_write_failed")
+                else:
+                    executed_judge_evaluations.append(evaluation)
+                    judge_evaluation_index[key] = evaluation
+                    judge_evaluation_rows += 1
+            request_stop(outcome.get("stop_reason"))
+            account_key = ("judge", key)
+            if account_key not in accounted_calls:
+                judge_cost = extract_cost(row.get("usage"))
+                if judge_cost is not None:
+                    actual_cost += judge_cost
+                    actual_cost_seen = True
+                accounted_calls.add(account_key)
+                if args.max_cost_usd is not None and row.get("provider_call_started"):
+                    if judge_cost is None:
+                        budget_status = "unverifiable"
+                        request_stop("fixed_judge_did_not_return_cost")
+                    elif actual_cost >= args.max_cost_usd:
+                        budget_status = "reached"
+                        request_stop("actual_cost_reached_cap")
+
+        if stopped_reason is not None:
+            request_stop(stopped_reason)
+        active: dict[Future, tuple[int, dict[str, Any]]] = {}
+        dispatch_index = 0
+        with ThreadPoolExecutor(max_workers=max(1, effective_jobs), thread_name_prefix="rolebench") as pool:
+            while pending or active:
+                while stopped_reason is None and pending and len(active) < effective_jobs:
+                    try:
+                        with defer_keyboard_interrupt():
+                            job = pending.popleft()
+                            future = submit(pool, job)
+                            active[future] = (dispatch_index, job)
+                            dispatch_index += 1
+                    except KeyboardInterrupt:
+                        request_stop("interrupted")
+                        print("Execution interrupted while scheduling; draining registered in-flight cells.", file=sys.stderr)
                         break
-                if stop:
+                if not active:
                     break
-        except KeyboardInterrupt:
-            interrupted = True
-            stopped_reason = "interrupted"
-            print("Execution interrupted; persisted cells can be continued with --resume.", file=sys.stderr)
+                try:
+                    completed, _ = wait(active, return_when=FIRST_COMPLETED)
+                except KeyboardInterrupt:
+                    request_stop("interrupted")
+                    print("Execution interrupted; waiting for in-flight cells before cleanup.", file=sys.stderr)
+                    continue
+                for future in sorted(completed, key=lambda item: active[item][0]):
+                    _, job = active[future]
+                    try:
+                        outcome = future.result()
+                    except KeyboardInterrupt:
+                        active.pop(future, None)
+                        request_stop("interrupted")
+                        print("Execution interrupted; persisted cells can be continued with --resume.", file=sys.stderr)
+                        continue
+                    except BaseException as exc:
+                        outcome = {"preflight_error": f"{type(exc).__name__}: {exc}", "stop_reason": "harness_internal"}
+                    if outcome.get("preflight_error"):
+                        active.pop(future, None)
+                        print(f"Execution stopped: {outcome['preflight_error']}", file=sys.stderr)
+                        request_stop(outcome.get("stop_reason"))
+                        continue
+                    processing_interrupts = 0
+                    while True:
+                        try:
+                            with defer_keyboard_interrupt():
+                                process_completed_outcome(job, outcome)
+                            break
+                        except KeyboardInterrupt:
+                            processing_interrupts += 1
+                            request_stop("interrupted")
+                            if processing_interrupts == 1:
+                                print("Execution interrupted; preserving the completed cell before stopping.", file=sys.stderr)
+                            if processing_interrupts >= 3:
+                                print("Completed cell could not be persisted after repeated interrupts.", file=sys.stderr)
+                                request_stop("harness_internal")
+                                break
+                    active.pop(future, None)
+        for workspace_path, expected_identity in sorted(cleanup_failures.items()):
+            try:
+                with defer_keyboard_interrupt():
+                    remove_temp_root(Path(workspace_path), expected_identity)
+            except KeyboardInterrupt:
+                request_stop("interrupted")
+                try:
+                    Path(workspace_path).lstat()
+                except FileNotFoundError:
+                    continue
+                unresolved_workspace_paths.append(workspace_path)
+                print(f"Temporary workspace cleanup was interrupted: {workspace_path}", file=sys.stderr)
+            except (OSError, RoleBenchError) as exc:
+                unresolved_workspace_paths.append(workspace_path)
+                print(f"Temporary workspace could not be released: {workspace_path}: {exc}", file=sys.stderr)
     recommendations = None
     if recommend and args.execute:
         recommendations = build_recommendations(
@@ -3355,11 +4171,12 @@ def run_command(args: argparse.Namespace) -> int:
             min_recommendation_runs,
         )
         write_json(recommendations_path, recommendations)
+    harness_stop_reason = next((reason for reason in stop_reasons if reason in HARNESS_STOP_REASONS), None)
     summary = {
         "run_dir": str(output_dir),
         "status": (
             "preview" if not args.execute
-            else "aborted" if stopped_reason == "interrupted" or stopped_reason in HARNESS_STOP_REASONS
+            else "aborted" if stopped_reason == "interrupted" or harness_stop_reason
             else "stopped" if stopped_reason
             else "completed"
         ),
@@ -3367,6 +4184,11 @@ def run_command(args: argparse.Namespace) -> int:
         "tasks": len(tasks),
         "result_rows": result_rows,
         "expected_result_rows": expected_cells,
+        "jobs": jobs,
+        "effective_jobs": parallelism["effective_jobs"],
+        "execution_effective_jobs": effective_jobs,
+        "estimated_provider_waves": parallelism["estimated_provider_waves"],
+        "workspace_capacity": workspace_capacity,
         "resumed": resume,
         "skipped_cells": skipped_cells,
         "evaluation_rows": evaluation_rows,
@@ -3384,9 +4206,19 @@ def run_command(args: argparse.Namespace) -> int:
         "max_cost_usd": args.max_cost_usd,
         "budget_status": budget_status,
         "stopped_reason": stopped_reason,
+        "stop_reasons": stop_reasons,
+        "workspace_cleanup": {
+            "failed_paths": sorted(cleanup_failures),
+            "unreleased_paths": unresolved_workspace_paths,
+            "status": (
+                "failed" if unresolved_workspace_paths
+                else "recovered-after-failure" if cleanup_failures
+                else "released"
+            ),
+        },
         "harness_status": (
-            "changed" if stopped_reason == "harness_integrity_changed"
-            else "failed" if stopped_reason in HARNESS_STOP_REASONS
+            "changed" if "harness_integrity_changed" in stop_reasons
+            else "failed" if harness_stop_reason
             else "verified"
         ),
     }
@@ -3396,7 +4228,7 @@ def run_command(args: argparse.Namespace) -> int:
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     if interrupted:
         return 130
-    return 4 if stopped_reason in HARNESS_STOP_REASONS or not report_ok else 0
+    return 4 if harness_stop_reason or not report_ok else 0
 
 
 def infer_task_type(task: dict[str, Any]) -> str:
@@ -3560,6 +4392,21 @@ def report_command(args: argparse.Namespace) -> int:
     judge_evaluations = load_jsonl(judge_evaluations_path, "judge_evaluations.jsonl")
     recommendations = load_json_document(recommendations_path) if recommendations_path.exists() else None
     summary = load_json_document(run_dir / "summary.json") if (run_dir / "summary.json").exists() else None
+    parallelism = manifest.get("parallelism", {})
+    workspace_capacity = manifest.get("workspace_capacity", {})
+    max_cost_usd = summary.get("max_cost_usd", manifest.get("max_cost_usd")) if isinstance(summary, dict) else manifest.get("max_cost_usd")
+    budget_status = summary.get("budget_status", "unknown") if isinstance(summary, dict) else "unknown"
+    execution_context = {
+        "requested_jobs": manifest.get("jobs", 1),
+        "effective_jobs": parallelism.get("effective_jobs", 1),
+        "estimated_provider_waves": parallelism.get("estimated_provider_waves", 0),
+        "resume_segment": parallelism.get("resume_segment"),
+        "workspace_max_cell_bytes": workspace_capacity.get("max_cell_bytes", 0),
+        "workspace_estimated_peak_bytes": workspace_capacity.get("estimated_peak_bytes", 0),
+        "max_cost_usd": max_cost_usd,
+        "budget_status": budget_status,
+        "concurrent_cost_exposure_calls": parallelism.get("effective_jobs", 1),
+    }
     scope = benchmark_scope(manifest)
     model_summary = build_model_summary(rows, evaluations, judge_evaluations, recommendations)
     groups: dict[tuple[str, str, str], list[dict[str, Any]]] = defaultdict(list)
@@ -3586,6 +4433,14 @@ def report_command(args: argparse.Namespace) -> int:
         f"- Mode: `{manifest.get('mode', 'unknown')}`",
         f"- Roles: {', '.join(manifest.get('roles', []))}",
         f"- Assignments: {len(manifest.get('assignments', []))}",
+        f"- Parallelism: jobs {manifest.get('jobs', 1)} "
+        f"(effective {parallelism.get('effective_jobs', 1)}), "
+        f"{parallelism.get('candidate_cells', len(rows))} candidate cells, "
+        f"~{parallelism.get('estimated_provider_waves', len(rows))} provider waves",
+        f"- Latency mode: `{'concurrent' if parallelism.get('effective_jobs', 1) > 1 else 'serial'}`",
+        f"- Workspace estimate: max cell {human_bytes(int(workspace_capacity.get('max_cell_bytes', 0)))}, "
+        f"peak {human_bytes(int(workspace_capacity.get('estimated_peak_bytes', 0)))}",
+        f"- Budget: cap {('$%.6f' % max_cost_usd) if isinstance(max_cost_usd, (int, float)) else 'not set'}, status `{budget_status}`",
         f"- Result rows: {len(rows)}",
         f"- Evaluation rows: {len(evaluations)}",
         f"- Fixed-judge rows: {len(judge_evaluations)}",
@@ -3636,6 +4491,14 @@ def report_command(args: argparse.Namespace) -> int:
         "",
         "## Execution",
         "",
+    ])
+    if parallelism.get("effective_jobs", 1) > 1:
+        lines.extend([
+            "Parallel latency includes provider concurrency and load effects. Compare latency only with runs that use the same `jobs` value.",
+            f"The cost cap stops new calls only after observed usage is recorded; up to {parallelism['effective_jobs']} in-flight calls may still add cost.",
+            "",
+        ])
+    lines.extend([
         "| Role | Model | Thinking | Runs | Pass | Error | Pass rate | P50 latency (ms) | P95 latency (ms) | Avg output chars | Cost |",
         "|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|",
     ])
@@ -3705,8 +4568,8 @@ def report_command(args: argparse.Namespace) -> int:
             "|---|---|---|---|---|---|",
         ])
         for evaluation in judge_evaluations:
-            summary = evidence_text(evaluation.get("summary") or "").replace("|", "\\|")
-            lines.append(f"| `{evaluation.get('role', '')}` | `{evaluation.get('task_id', '')}` | `{evaluation.get('model', '')}` | {evaluation.get('outcome', 'unknown')} | {evaluation.get('hard_gate_status', 'unknown')} | {summary} |")
+            judge_summary = evidence_text(evaluation.get("summary") or "").replace("|", "\\|")
+            lines.append(f"| `{evaluation.get('role', '')}` | `{evaluation.get('task_id', '')}` | `{evaluation.get('model', '')}` | {evaluation.get('outcome', 'unknown')} | {evaluation.get('hard_gate_status', 'unknown')} | {judge_summary} |")
     if isinstance(recommendations, dict):
         def recommendation_links(item: dict[str, Any]) -> str:
             paths = item.get("evidence", [])
@@ -3739,7 +4602,7 @@ def report_command(args: argparse.Namespace) -> int:
             f"{role}/{model}:{thinking}" if thinking else f"{role}/{model}": values
             for (role, model, thinking), values in evaluation_groups.items()
         }
-        rendered = json.dumps({"manifest": manifest, "summary": summary, "scope": scope, "model_summary": model_summary, "groups": serializable_groups, "evaluations": evaluations, "evaluation_groups": serializable_evaluation_groups, "judge_results": judge_results, "judge_evaluations": judge_evaluations, "recommendations": recommendations}, ensure_ascii=False, indent=2) + "\n"
+        rendered = json.dumps({"manifest": manifest, "summary": summary, "execution_context": execution_context, "scope": scope, "model_summary": model_summary, "groups": serializable_groups, "evaluations": evaluations, "evaluation_groups": serializable_evaluation_groups, "judge_results": judge_results, "judge_evaluations": judge_evaluations, "recommendations": recommendations}, ensure_ascii=False, indent=2) + "\n"
         if args.output:
             output = Path(args.output).expanduser()
             output.parent.mkdir(parents=True, exist_ok=True)
@@ -3801,6 +4664,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--recent-days", type=int, default=14, help="lookback window for recent work")
     run.add_argument("--recent-commits", type=int, default=5, help="maximum recent commits to include")
     run.add_argument("--runs", type=int, default=1)
+    run.add_argument("--jobs", type=int, default=1, help="maximum concurrent direct candidate or fixed-judge provider calls")
     run.add_argument("--execute", action="store_true", help="invoke OMP; otherwise only write manifest")
     run.add_argument("--resume", action="store_true", help="continue missing cells from an interrupted run with the same manifest and harness")
     run.add_argument("--executor", choices=("direct", "delegated"), default="direct", help="direct model call or a temporary OMP task agent")
@@ -3832,6 +4696,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "run":
             if args.runs < 1:
                 raise RoleBenchError("--runs must be >= 1")
+            if args.jobs < 1:
+                raise RoleBenchError("--jobs must be >= 1")
             if args.timeout < 1:
                 raise RoleBenchError("--timeout must be >= 1")
             if args.recent_days < 1:

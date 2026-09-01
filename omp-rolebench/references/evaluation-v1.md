@@ -90,8 +90,8 @@ Command checks are trusted local code, not a sandbox. The plan prints every exac
 
 Each executed cell produces:
 
-- `results.jsonl`: raw OMP execution, usage, latency, stdout/stderr, and `execution_status` (`completed`, `timeout`, or `failed`).
-- `evaluations.jsonl`: independent deterministic checks, per-dimension evidence, `outcome`, and `hard_gate_status`.
+- `results.jsonl`: raw OMP execution, usage, latency, stdout/stderr, `execution_status` (`completed`, `timeout`, or `failed`), and an independent content digest checked before resume.
+- `evaluations.jsonl`: independent deterministic checks, per-dimension evidence, `outcome`, `hard_gate_status`, and content/raw-result digests used by resume audit.
 - `artifacts/<run-id>/<cell>/workspace-before.json`: hashes, modes, symlinks, special-file types, and directory metadata before OMP runs. `.git` entries are hashed so hook or config changes remain visible, but their text is never retained. Files over 64 MiB use bounded samples and mark the snapshot incomplete, so changed-path checks become `unknown` instead of overstating coverage.
 - `workspace-after.json`, `workspace-diff.json`, and `workspace.patch`: final hashes, changed paths, and UTF-8 text diffs for files up to 64 KiB. The combined patch is capped at 5 MiB and records when it was truncated. `text_unavailable` records changed regular files whose content could not be included rather than rendering a misleading deletion.
 
