@@ -21,6 +21,8 @@ Start with `scripts/memory_baseline.py --runtime omp` to enumerate stored projec
 4. Read relevant `memory://root/skills/<name>/SKILL.md` artifacts when generated skills add duplication or bad guidance.
 5. Use `/memory stats` and `/memory diagnose` when interactive slash commands are available. Ask the user to run them only when their output is needed for a concrete diagnosis.
 
+Treat CLI access through a fresh OMP process as runtime activation unless the installed version establishes that it cannot write persistent state. In particular, `omp read memory://root` can initialize the local-memory schema and job runtime even though it returns read output. Runtime activation can write SQLite and generated artifacts, reclaim or enqueue memory jobs, and call the configured memory models. Under an explicitly read-only boundary that forbids database writes or paid calls, do not invoke it; inspect baseline artifacts and read-only job metadata, then report injection as unverified.
+
 The `memory://` surface resolves one active project at a time. For other stored scopes, inspect only the read-only artifact roots and job metadata reported by the baseline. Do not decode encoded scope-directory names or guess their original working directories. If trustworthy runtime metadata resolves a scope to an existing working directory, use that directory with OMP's public memory surface for the injection check. If a scope cannot be mapped safely, report the scope ID and artifact state without inventing a project name.
 
 If no memory exists, distinguish a new setup from failure: local consolidation processes persisted sessions at startup, while recent, active, old, or ephemeral sessions may be ineligible.
@@ -36,6 +38,17 @@ Use the baseline for read-only job and artifact metrics across every stored scop
 If Stage 2 reports a model-output or JSON parse failure, allow the existing retry budget to run first. If it repeats, propose testing a different `smol` role model with reliable structured output, one change at a time. Do not change memory size, concurrency, lease, or retry settings to mask a model-output failure.
 
 Check scope quality before content quality for every stored scope. A broad working directory such as Desktop can combine unrelated sessions into one project memory. Recommend starting OMP in the actual project root; do not move or merge existing scope data without explicit approval.
+
+## Runtime Refresh And Recovery
+
+Keep runtime recovery separate from the read-only audit:
+
+1. Use the baseline to identify each exact workspace, job kind and key, current status, retry budget, and `last_error`. Do not infer a workspace from an encoded memory-directory name.
+2. Before activation, disclose the exact workspace scopes, OMP-owned SQLite and generated-artifact writes, possible model calls and cost, and any known risk that a host-wide worker could touch another queued scope. Wait for the user's direct approval of that boundary.
+3. Start OMP from one approved workspace at a time. Keep the process alive until its targeted jobs reach `done` or `error`; closing it while a job is `running` can leave an expired lease that requires another startup to reclaim. Do not run recoveries concurrently against the shared database.
+4. Monitor job state through the read-only baseline. If an unapproved scope starts processing, stop further activation and report the expanded effect. Do not update job rows, leases, retry counters, or ownership fields directly.
+5. Stop after one native attempt per approved failing job. If the same error returns, report it and propose the smallest evidence-backed next change rather than consuming the remaining retry budget automatically.
+6. After all targeted jobs reach a terminal state, close the OMP process, re-run the baseline, and verify `memory://root` from each approved workspace. Record any scope that remains unverified.
 
 ## Audit Efficiency
 

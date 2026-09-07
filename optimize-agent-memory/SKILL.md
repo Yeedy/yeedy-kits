@@ -23,6 +23,8 @@ Audit the entire memory store owned by every selected agent by default. When the
 
 Run the bundled `scripts/memory_baseline.py` before proposing changes and again after the runtime refreshes. An installed copy defaults to its current host and honors `CODEX_HOME`, `PI_CODING_AGENT_DIR`, and the active OMP profile. Pass `--runtime omp`, `--runtime codex`, or `--runtime both` only when the user explicitly selects a target; repository-source usage always requires this option. Use the matching `--omp-dir` or `--codex-dir` only for an explicitly selected alternate root or test fixture. If multiple Codex memory databases exist, the baseline fails and names every candidate; inspect their provenance and pass the intended one with `--codex-db`. Do not guess from location or modification time. Treat artifact sizes and job states as operational metrics, not memory-quality judgments.
 
+Treat a command as mutating when it initializes an agent runtime or can change persistent state, even if its name is `read`, `stats`, or `diagnose`. During an explicitly read-only audit that forbids database writes or paid model calls, do not invoke such a command. Use the baseline and stored artifacts instead, and mark runtime injection or recovery as unverified.
+
 The baseline trims configured runtime paths before use and treats empty or whitespace-only values as unset. Its output is an object for one runtime and an array in `omp`, then `codex` order for `--runtime both`. Artifact `bytes` and `lines` are available size proxies; they are not token counts. Estimate injected tokens from the runtime's actual memory surface and label that estimate approximate.
 
 Classify every material item as:
@@ -72,7 +74,7 @@ Prefix stable IDs with `O` for OMP and `C` for Codex. Show exact replacement tex
 1. Re-read affected artifacts immediately before editing; abort if they changed after the preview.
 2. Follow each selected agent's mutation path. Do not substitute one agent's commands, files, or tools for the other's.
 3. Preserve unapproved content, formatting, ordering, provenance, and final newlines.
-4. Request the minimum required approval for writes outside the current workspace.
+4. Request the minimum required approval for writes outside the current workspace. State the exact target and scope, runtime-owned persistent writes, external calls, and possible model cost. An approval question or plan written by the agent is not authorization; wait for a direct affirmative user response.
 5. Treat whole-store reset, clear, or deletion as destructive and require explicit approval naming the runtime and scope.
 6. Do not change memory configuration without separate approval of exact keys and values.
 7. Fail clearly if the supported artifact or mutation surface cannot be resolved. Do not guess a path, command, schema, or fallback.
