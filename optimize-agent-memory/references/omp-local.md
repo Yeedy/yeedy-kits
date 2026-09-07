@@ -13,7 +13,7 @@ For an explicit project scope, resolve the exact scope through OMP's public memo
 
 ## Read
 
-Start with `scripts/memory_baseline.py --runtime omp` to enumerate stored project scopes and host-wide job health. By default, audit the artifacts reported for every scope. For an explicitly selected project, use the baseline only to locate and diagnose that scope, then restrict content inspection and recommendations to it. Use OMP's public surfaces for the active project so project identity remains correct:
+Start with `scripts/memory_baseline.py --runtime omp` to enumerate stored project scopes and host-wide job health. By default, audit the artifacts reported for every scope. For an explicitly selected project, use the baseline only to locate and diagnose that scope, then restrict content inspection and recommendations to it. Use OMP's public surfaces for the active project only when runtime activation is authorized, so project identity remains correct:
 
 1. Read `memory://root` for the compact payload injected into a new session.
 2. Read `memory://root/MEMORY.md` for consolidated memory.
@@ -48,7 +48,7 @@ Keep runtime recovery separate from the read-only audit:
 3. Start OMP from one approved workspace at a time. Keep the process alive until its targeted jobs reach `done` or `error`; closing it while a job is `running` can leave an expired lease that requires another startup to reclaim. Do not run recoveries concurrently against the shared database.
 4. Monitor job state through the read-only baseline. If an unapproved scope starts processing, stop further activation and report the expanded effect. Do not update job rows, leases, retry counters, or ownership fields directly.
 5. Stop after one native attempt per approved failing job. If the same error returns, report it and propose the smallest evidence-backed next change rather than consuming the remaining retry budget automatically.
-6. After all targeted jobs reach a terminal state, close the OMP process, re-run the baseline, and verify `memory://root` from each approved workspace. Record any scope that remains unverified.
+6. After all targeted jobs reach a terminal state, close the OMP process and re-run the baseline. Verify `memory://root` from each approved workspace only when that activation is covered by the current authorization. A later read-only scheduled audit should observe completed recovery through stored artifacts and job metadata, not reactivate OMP to repeat verification. Record any scope that remains unverified.
 
 ## Audit Efficiency
 
@@ -79,4 +79,4 @@ Do not tune lease, retry, heartbeat, payload, or fallback-token settings without
 
 ## Verify
 
-Re-read edited lessons, compare the baseline, run available stats or diagnostics after refresh, and inspect `memory://root` from a new session. A `learn` call affects future sessions rather than mutating the active prompt prefix.
+Re-read edited lessons and compare the baseline. Run stats, diagnostics, or `memory://root` from a new session after refresh only when runtime activation is authorized. Under a read-only boundary, report artifact availability and size separately from actual injection, mark injection unverified, and complete the audit without requesting write permission or retrying rejected activation. A `learn` call affects future sessions rather than mutating the active prompt prefix.

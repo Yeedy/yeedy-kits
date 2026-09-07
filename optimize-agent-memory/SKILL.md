@@ -85,7 +85,7 @@ Prefix stable IDs with `O` for OMP and `C` for Codex. Show exact replacement tex
 2. Confirm unapproved content is unchanged.
 3. Re-run `memory_baseline.py` and compare generated-artifact availability, injected artifact size, source count, job status, and errors with the baseline.
 4. Use the runtime-specific health or provenance checks.
-5. Verify injection in a new task or session only after the runtime has refreshed its memory.
+5. Verify injection in a new task or session only after the runtime has refreshed its memory and activation is within the current authorization. For a read-only audit that forbids runtime writes or model calls, skip activation and report `injection: unverified (read-only boundary)` with available artifact metrics. This is a verification limit, not an audit failure: finish the audit without requesting broader permission or retrying a rejected command. Do not claim end-to-end verification.
 6. Report applied IDs, skipped IDs, before/after metrics, verification results, and any refresh still required.
 
 Stop after approved changes are verified. Do not polish unrelated agent configuration, generated skills, or memory outside the selected agents and scope.
