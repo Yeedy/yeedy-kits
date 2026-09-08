@@ -15,7 +15,7 @@ For an explicit project scope, resolve the exact scope through OMP's public memo
 
 Start with `scripts/memory_baseline.py --runtime omp` to enumerate stored project scopes and host-wide job health. By default, audit the artifacts reported for every scope. For an explicitly selected project, use the baseline only to locate and diagnose that scope, then restrict content inspection and recommendations to it. Use OMP's public surfaces for the active project only when runtime activation is authorized, so project identity remains correct:
 
-1. Read `memory://root` for the compact payload injected into a new session.
+1. Read `memory://root` for the compact memory payload resolved for the requesting session.
 2. Read `memory://root/MEMORY.md` for consolidated memory.
 3. Read `memory://root/learned.md` for explicit and autolearn lessons.
 4. Read relevant `memory://root/skills/<name>/SKILL.md` artifacts when generated skills add duplication or bad guidance.
@@ -23,7 +23,11 @@ Start with `scripts/memory_baseline.py --runtime omp` to enumerate stored projec
 
 Treat CLI access through a fresh OMP process as runtime activation unless the installed version establishes that it cannot write persistent state. In particular, `omp read memory://root` can initialize the local-memory schema and job runtime even though it returns read output. Runtime activation can write SQLite and generated artifacts, reclaim or enqueue memory jobs, and call the configured memory models. Under an explicitly read-only boundary that forbids database writes or paid calls, do not invoke it; inspect baseline artifacts and read-only job metadata, then report injection as unverified.
 
-The `memory://` surface resolves one active project at a time. For other stored scopes, inspect only the read-only artifact roots and job metadata reported by the baseline. Do not decode encoded scope-directory names or guess their original working directories. If trustworthy runtime metadata resolves a scope to an existing working directory, use that directory with OMP's public memory surface for the injection check. If a scope cannot be mapped safely, report the scope ID and artifact state without inventing a project name.
+The `memory://` surface is bound to the requesting session, not merely its working directory. Concurrent sessions in the same directory must not be used interchangeably for verification. Subagents and Advisor access the memory of their owning main session; they are not independent project-verification contexts. Record the verified session identity when available and its workspace. A check in a newly authorized session verifies that session only, not an earlier session in the same directory.
+
+If a session has expired and the request is rejected, report the session failure and injection as unverified. Do not interpret the rejection as missing memory or Stage 2 failure, or substitute another live session as proof that the original session works. Session-bound routing does not establish separate persistent stores or remove runtime initialization side effects.
+
+For other stored scopes, inspect only the read-only artifact roots and job metadata reported by the baseline. Do not decode encoded scope-directory names or guess their original working directories. If trustworthy runtime metadata resolves a scope to an existing working directory, use an authorized session in that directory with OMP's public memory surface for the injection check. If a scope cannot be mapped safely, report the scope ID and artifact state without inventing a project name.
 
 If no memory exists, distinguish a new setup from failure: local consolidation processes persisted sessions at startup, while recent, active, old, or ephemeral sessions may be ineligible.
 
@@ -31,7 +35,7 @@ Distinguish pipeline stages:
 
 - Stage 1 success produces `raw_memories.md` and `rollout_summaries/`; these are intermediate evidence, not proof that memory is injected.
 - Stage 2 success produces `MEMORY.md`, `memory_summary.md`, and optional generated skills.
-- Treat `memory://root` as the injection check. If it reports no artifacts while Stage 1 files exist, diagnose Stage 2 instead of curating content blindly.
+- Treat a successful `memory://root` read in the target session as the injection-surface check. If it reports no artifacts while Stage 1 files for the same scope exist, diagnose Stage 2 instead of curating content blindly.
 
 Use the baseline for read-only job and artifact metrics across every stored scope. Prefer `/memory diagnose` for the active scope when available. When deeper local diagnosis is needed, read job status from the OMP database in read-only mode; never update job rows. Surface `last_error` exactly.
 
