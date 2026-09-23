@@ -161,7 +161,7 @@ Use it as a second screening stage after `omp bench`: a model that is fast but l
 
 ## Reports
 
-`run` writes `report.md` and `report.json` automatically. Both formats retain the effective concurrency, dependency-aware provider-wave estimate, maximum/peak copied-workspace estimate, cost cap, final budget status, and concurrent in-flight cost exposure alongside the quality evidence. The command below rerenders either format when an existing run needs a refreshed report:
+`run` writes `report.md` and `report.json` automatically. Both formats retain the effective concurrency, dependency-aware provider-wave estimate, maximum/peak copied-workspace estimate, cost cap, final budget status, and concurrent in-flight cost exposure alongside the quality evidence. The command below rerenders either format when an existing run needs a refreshed report; without `--output` it prints to stdout, so pass `--output <run>/report.md` to actually replace the file:
 
 ```bash
 python3 omp-rolebench/scripts/rolebench.py report \
