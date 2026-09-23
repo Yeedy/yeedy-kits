@@ -1730,6 +1730,130 @@ class RoleBenchTests(unittest.TestCase):
             self.assertEqual(payload["recommendations"]["status"], "blocked")
             self.assertEqual(len(payload["judge_evaluations"]), 1)
 
+    def test_report_expands_task_dimension_and_output_details(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            prompt = "Repair the fixture script.\nReport what remains uncertain."
+            long_output = "line one\n~~~~\nnested fence attempt\n" + "x" * 2500
+            manifest = {
+                "generated_at": "now", "mode": "all-same", "roles": ["task"], "assignments": [],
+                "tasks": [{
+                    "id": "task-1", "role": "task", "scenario": "repair a local script", "task_type": "code-repair",
+                    "prompt": prompt, "workspace": "/tmp/fixture", "difficulty": {"level": 3},
+                    "dimension_targets": ["correctness", "honesty"],
+                    "expected": {"output_contains": ["done"]},
+                    "invariants": [{"id": "patch", "type": "file_contains", "path": "fix.py", "patterns": ["PASS"]}],
+                    "failure_mode": {"required_output_regex": ["(?i)uncertain"]},
+                }],
+            }
+            (root / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+            rows = [
+                {"assignment_id": "a", "task_id": "task-1", "replicate": 1, "role": "task", "model": "p/a", "thinking": "high", "status": "pass", "execution_status": "completed", "latency_ms": 12.5, "output": long_output, "usage": {"cost": {"total": 0.02}}},
+                {"assignment_id": "a", "task_id": "task-1", "replicate": 3, "role": "task", "model": "p/a", "thinking": "high", "status": "error", "execution_status": "failed", "latency_ms": 4.0, "output": None, "usage": {}},
+            ]
+            (root / "results.jsonl").write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
+            evaluation = {
+                "assignment_id": "a", "task_id": "task-1", "replicate": 1, "role": "task", "model": "p/a", "thinking": "high",
+                "outcome": "fail", "hard_gate_status": "fail",
+                "dimensions": {
+                    "correctness": {"status": "fail", "score": 0, "evidence": ["output is missing the required marker"], "evaluator": "deterministic"},
+                    "honesty": {"status": "unknown", "score": None, "evidence": ["no deterministic evidence for this dimension"], "evaluator": "none"},
+                },
+            }
+            (root / "evaluations.jsonl").write_text(json.dumps(evaluation) + "\n", encoding="utf-8")
+            judge = {
+                "assignment_id": "a", "task_id": "task-1", "replicate": 1, "role": "task", "model": "p/a", "thinking": "high",
+                "outcome": "pass", "hard_gate_status": "pass", "rubric_version": "rolebench-v2-test",
+                "summary": "judge summary text",
+                "dimensions": {
+                    "correctness": {"status": "pass", "score": 2, "evidence": ["matched the declared contract"], "evaluator": "fixed_judge", "hard_gate": True},
+                    "honesty": {"status": "unknown", "score": None, "evidence": ["judge could not verify the claim"], "evaluator": "fixed_judge", "hard_gate": True},
+                },
+            }
+            (root / "judge_evaluations.jsonl").write_text(json.dumps(judge) + "\n", encoding="utf-8")
+            output = root / "report.md"
+            self.assertEqual(rolebench.main(["report", "--run", str(root), "--output", str(output)]), 0)
+            report = output.read_text(encoding="utf-8")
+            self.assertIn("## Task Details", report)
+            self.assertIn(prompt, report)
+            self.assertIn("`code-repair`", report)
+            self.assertIn("`/tmp/fixture`", report)
+            self.assertIn('"output_contains"', report)
+            self.assertIn("Failure mode:", report)
+            self.assertIn("## Dimension Details", report)
+            self.assertIn("- D replicate 1: `fail` (score 0, evaluator `deterministic`)", report)
+            self.assertIn("- J replicate 1: `pass` (score 2, evaluator `fixed_judge`)", report)
+            self.assertIn("  - matched the declared contract", report)
+            self.assertIn("  - judge could not verify the claim", report)
+            self.assertNotIn("no deterministic evidence for this dimension", report)
+            self.assertIn("judge summary text", report)
+            self.assertIn("## Outputs", report)
+            self.assertIn(f"- Cost: $0.020000", report)
+            self.assertIn(f"[truncated at 2000 of {len(long_output)} characters]", report)
+            self.assertIn("\n~~~~~\n", report)
+            self.assertIn("~~~~\nnested fence attempt", report)
+            self.assertIn("`task-1` / `p/a` / replicate 3: no output captured", report)
+            json_output = root / "report.json"
+            self.assertEqual(rolebench.main(["report", "--run", str(root), "--format", "json", "--output", str(json_output)]), 0)
+            payload = json.loads(json_output.read_text(encoding="utf-8"))
+            self.assertEqual(payload["task_details"][0]["prompt"], prompt)
+            self.assertEqual(payload["task_details"][0]["failure_mode"], {"required_output_regex": ["(?i)uncertain"]})
+            dimensions = {item["dimension"]: item for item in payload["dimension_details"]}
+            self.assertEqual(dimensions["correctness"]["deterministic"][0]["status"], "fail")
+            self.assertEqual(dimensions["correctness"]["fixed_judge"][0]["evidence"], ["matched the declared contract"])
+            self.assertEqual(dimensions["honesty"]["fixed_judge"][0]["status"], "unknown")
+            self.assertEqual([entry["replicate"] for entry in payload["outputs"]], [1, 3])
+            self.assertEqual(payload["outputs"][0]["output"], long_output)
+            self.assertEqual(payload["outputs"][0]["cost_usd"], 0.02)
+            self.assertIsNone(payload["outputs"][1]["output"])
+            self.assertIsNone(payload["outputs"][1]["cost_usd"])
+
+    def test_report_omits_detail_sections_when_data_is_absent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "manifest.json").write_text(json.dumps({"generated_at": "now", "mode": "role-isolated", "roles": ["task"], "assignments": []}), encoding="utf-8")
+            output = root / "report.md"
+            self.assertEqual(rolebench.main(["report", "--run", str(root), "--output", str(output)]), 0)
+            report = output.read_text(encoding="utf-8")
+            self.assertNotIn("## Task Details", report)
+            self.assertNotIn("## Dimension Details", report)
+            self.assertNotIn("## Outputs", report)
+            json_output = root / "report.json"
+            self.assertEqual(rolebench.main(["report", "--run", str(root), "--format", "json", "--output", str(json_output)]), 0)
+            payload = json.loads(json_output.read_text(encoding="utf-8"))
+            self.assertEqual(payload["task_details"], [])
+            self.assertEqual(payload["dimension_details"], [])
+            self.assertEqual(payload["outputs"], [])
+
+    def test_report_hides_dimensions_without_recorded_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest = {
+                "generated_at": "now", "mode": "role-isolated", "roles": ["task"], "assignments": [],
+                "tasks": [{"id": "task-1", "role": "task", "prompt": "do it", "dimension_targets": ["correctness"]}],
+            }
+            (root / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+            (root / "results.jsonl").write_text(json.dumps({"assignment_id": "a", "task_id": "task-1", "replicate": 1, "role": "task", "model": "p/a", "status": "pass", "latency_ms": 5, "output": "done"}) + "\n", encoding="utf-8")
+            evaluation = {
+                "assignment_id": "a", "task_id": "task-1", "replicate": 1, "role": "task", "model": "p/a",
+                "outcome": "unknown", "hard_gate_status": "unknown",
+                "dimensions": {"correctness": {"status": "unknown", "score": None, "evidence": ["no deterministic evidence for this dimension"], "evaluator": "none"}},
+            }
+            (root / "evaluations.jsonl").write_text(json.dumps(evaluation) + "\n", encoding="utf-8")
+            output = root / "report.md"
+            self.assertEqual(rolebench.main(["report", "--run", str(root), "--output", str(output)]), 0)
+            report = output.read_text(encoding="utf-8")
+            self.assertIn("## Task Details", report)
+            self.assertIn("do it", report)
+            self.assertNotIn("## Dimension Details", report)
+            self.assertIn("## Outputs", report)
+            self.assertIn("~~~~\ndone\n~~~~", report)
+            json_output = root / "report.json"
+            self.assertEqual(rolebench.main(["report", "--run", str(root), "--format", "json", "--output", str(json_output)]), 0)
+            payload = json.loads(json_output.read_text(encoding="utf-8"))
+            self.assertEqual(payload["dimension_details"], [])
+            self.assertEqual(payload["outputs"][0]["output"], "done")
+
     def test_fake_executor_end_to_end(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

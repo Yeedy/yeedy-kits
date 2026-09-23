@@ -224,6 +224,9 @@ REGEX_INPUT_LIMIT = 256 * 1024
 REGEX_TIMEOUT_SECONDS = 1.0
 COMMAND_OUTPUT_LIMIT = 1024 * 1024
 EVIDENCE_TEXT_LIMIT = 1000
+OUTPUT_DETAIL_LIMIT = 2000
+# aggregate_dimensions records this placeholder when a declared dimension has no covering check.
+DIMENSION_UNEVIDENCED_NOTE = "no deterministic evidence for this dimension"
 SAFE_COMMAND_ENV_KEYS = ("PATH", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "TMPDIR", "SYSTEMROOT", "PATHEXT")
 REGEX_WORKER = "import json,re,sys; pattern,text=json.load(sys.stdin); sys.exit(0 if re.search(pattern,text) else 1)"
 FIXED_JUDGE_SCHEMA_VERSION = 1
@@ -4377,6 +4380,146 @@ def build_model_summary(
     return summaries
 
 
+def fence_for(text: str) -> str:
+    """Return a tilde fence longer than any tilde run in text so the content cannot close it early."""
+    longest = current = 0
+    for character in text:
+        current = current + 1 if character == "~" else 0
+        longest = max(longest, current)
+    return "~" * max(4, longest + 1)
+
+
+def long_text_block(text: str, limit: int | None = None) -> list[str]:
+    """Fence long text for markdown, optionally truncating it and noting the cut."""
+    body = text.replace("\r\n", "\n").replace("\r", "\n").strip("\n")
+    if limit is not None and len(body) > limit:
+        body = f"{body[:limit]}\n\n[truncated at {limit} of {len(body)} characters]"
+    fence = fence_for(body)
+    return [fence, *body.split("\n"), fence]
+
+
+def evidence_bullets(evidence: str) -> list[str]:
+    """Render one evidence entry as a bullet, keeping embedded newlines inside the list item."""
+    text = evidence.replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not text:
+        return []
+    head, *rest = text.split("\n")
+    return [f"- {head}", *(f"  {line}" for line in rest)]
+
+
+def numeric_sort_key(value: Any) -> tuple[int, str]:
+    """Order replicates numerically even when a run mixes int and digit-string values."""
+    if isinstance(value, bool):
+        return (0, str(value))
+    if isinstance(value, (int, float)):
+        return (int(value), "")
+    text = str(value)
+    return (int(text), "") if text.isdigit() else (0, text)
+
+
+def build_task_details(manifest: dict[str, Any]) -> list[dict[str, Any]]:
+    details = []
+    for task in manifest.get("tasks", []):
+        if not isinstance(task, dict):
+            continue
+        workspace = task.get("workspace")
+        details.append({
+            "task_id": task.get("id"),
+            "role": task.get("role"),
+            "scenario": task.get("scenario") or task.get("id"),
+            "task_type": infer_task_type(task),
+            "difficulty": task.get("difficulty", {}).get("level") if isinstance(task.get("difficulty"), dict) else None,
+            "workspace": workspace if isinstance(workspace, str) and workspace else None,
+            "dimension_targets": [item for item in task.get("dimension_targets", []) if isinstance(item, str)],
+            "prompt": task.get("prompt") if isinstance(task.get("prompt"), str) else "",
+            "expected": task.get("expected") if isinstance(task.get("expected"), dict) else {},
+            "invariants": task.get("invariants") if isinstance(task.get("invariants"), list) else [],
+            "failure_mode": task.get("failure_mode") if isinstance(task.get("failure_mode"), dict) else {},
+        })
+    return details
+
+
+def dimension_cell_informative(cell: dict[str, Any]) -> bool:
+    if cell["status"] not in (None, "unknown") or cell["score"] is not None:
+        return True
+    return any(
+        evidence.strip() and evidence.strip() != DIMENSION_UNEVIDENCED_NOTE
+        for evidence in cell["evidence"]
+    )
+
+
+def build_dimension_details(
+    evaluations: list[dict[str, Any]],
+    judge_evaluations: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Group per-dimension values by role/model/thinking pair so D and J evidence stay distinguishable."""
+    grouped: dict[tuple[str, str, str, str], dict[str, list[dict[str, Any]]]] = {}
+    for source, rows in (("deterministic", evaluations), ("fixed_judge", judge_evaluations)):
+        for row in rows:
+            dimensions = row.get("dimensions")
+            if not isinstance(dimensions, dict):
+                continue
+            identity = (row.get("role", ""), row.get("model", ""), row.get("thinking") or "")
+            for dimension, value in dimensions.items():
+                if not isinstance(value, dict):
+                    continue
+                evidence = value.get("evidence")
+                grouped.setdefault((*identity, dimension), {}).setdefault(source, []).append({
+                    "task_id": row.get("task_id"),
+                    "replicate": row.get("replicate"),
+                    "status": value.get("status"),
+                    "score": value.get("score") if isinstance(value.get("score"), (int, float)) else None,
+                    "evaluator": value.get("evaluator") or source,
+                    "evidence": [item for item in evidence if isinstance(item, str)] if isinstance(evidence, list) else [],
+                })
+    details = []
+    for (role, model, thinking, dimension), sources in sorted(grouped.items()):
+        if not any(dimension_cell_informative(cell) for cells in sources.values() for cell in cells):
+            continue
+        details.append({
+            "role": role,
+            "model": model,
+            "thinking": thinking,
+            "dimension": dimension,
+            "hard_gate": dimension in HARD_GATE_DIMENSIONS,
+            "deterministic": sorted(
+                sources.get("deterministic", []),
+                key=lambda cell: (str(cell["task_id"]), numeric_sort_key(cell["replicate"])),
+            ),
+            "fixed_judge": sorted(
+                sources.get("fixed_judge", []),
+                key=lambda cell: (str(cell["task_id"]), numeric_sort_key(cell["replicate"])),
+            ),
+        })
+    return details
+
+
+def build_outputs(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    outputs = []
+    for row in sorted(rows, key=lambda row: (
+        str(row.get("role", "")),
+        str(row.get("model", "")),
+        str(row.get("thinking") or ""),
+        str(row.get("task_id", "")),
+        numeric_sort_key(row.get("replicate")),
+    )):
+        output = row.get("output")
+        outputs.append({
+            "role": row.get("role", ""),
+            "model": row.get("model", ""),
+            "thinking": row.get("thinking") or "",
+            "assignment_id": row.get("assignment_id"),
+            "task_id": row.get("task_id"),
+            "replicate": row.get("replicate"),
+            "status": row.get("status"),
+            "execution_status": row.get("execution_status"),
+            "latency_ms": row.get("latency_ms") if isinstance(row.get("latency_ms"), (int, float)) else None,
+            "cost_usd": extract_cost(row.get("usage")),
+            "output": output if isinstance(output, str) and output.strip() else None,
+        })
+    return outputs
+
+
 def report_command(args: argparse.Namespace) -> int:
     run_dir = Path(args.run).expanduser()
     manifest_path = run_dir / "manifest.json"
@@ -4409,6 +4552,9 @@ def report_command(args: argparse.Namespace) -> int:
     }
     scope = benchmark_scope(manifest)
     model_summary = build_model_summary(rows, evaluations, judge_evaluations, recommendations)
+    task_details = build_task_details(manifest)
+    dimension_details = build_dimension_details(evaluations, judge_evaluations)
+    outputs = build_outputs(rows)
     groups: dict[tuple[str, str, str], list[dict[str, Any]]] = defaultdict(list)
     for row in rows:
         groups[(row.get("role", ""), row.get("model", ""), row.get("thinking") or "")].append(row)
@@ -4506,7 +4652,7 @@ def report_command(args: argparse.Namespace) -> int:
         passes = sum(value.get("status") == "pass" for value in values)
         errors = len(values) - passes
         latency = [float(value["latency_ms"]) for value in values if isinstance(value.get("latency_ms"), (int, float))]
-        output_size = [len(value.get("output", "")) for value in values]
+        output_size = [len(value.get("output") or "") for value in values]
         costs = [cost for value in values if (cost := extract_cost(value.get("usage"))) is not None]
         p50 = percentile(latency, 0.50)
         p95 = percentile(latency, 0.95)
@@ -4592,6 +4738,74 @@ def report_command(args: argparse.Namespace) -> int:
                 hard_dimensions = ", ".join(candidate.get("judge_hard_dimensions", [])) or "none"
                 quality = candidate.get("quality_score") if candidate.get("quality_score") is not None else "unknown"
                 lines.append(f"| `{candidate.get('role', '')}` | `{candidate.get('model', '')}` | `{candidate.get('thinking') or '-'}` | {candidate.get('eligible', False)} | `{hard_dimensions}` | {quality} | {reasons or '-'} | {recommendation_links(candidate)} |")
+    if task_details:
+        lines.extend(["", "## Task Details", ""])
+        for detail in task_details:
+            lines.extend([
+                f"### `{detail['task_id']}`",
+                "",
+                f"- Role: `{detail['role']}`",
+                f"- Scenario: {detail['scenario'] or '-'}",
+                f"- Task type: `{detail['task_type']}`",
+                f"- Difficulty: {detail['difficulty'] if detail['difficulty'] is not None else 'unknown'}",
+                f"- Workspace: `{detail['workspace'] or 'isolated-empty'}`",
+                f"- Dimension targets: `{', '.join(detail['dimension_targets']) or 'none'}`",
+            ])
+            if detail["prompt"].strip():
+                lines.extend(["", "Prompt:", "", *long_text_block(detail["prompt"])])
+            for label, value in (("Expected", detail["expected"]), ("Invariants", detail["invariants"]), ("Failure mode", detail["failure_mode"])):
+                if not value:
+                    continue
+                lines.extend(["", f"{label}:", "", *long_text_block(json.dumps(value, ensure_ascii=False, indent=2))])
+            lines.append("")
+    if dimension_details:
+        lines.extend(["", "## Dimension Details", ""])
+        current_identity = None
+        for detail in dimension_details:
+            identity = (detail["role"], detail["model"], detail["thinking"])
+            if identity != current_identity:
+                current_identity = identity
+                lines.extend([f"### `{detail['role']}` / `{detail['model']}` / `{detail['thinking'] or '-'}`", ""])
+            lines.extend([f"#### `{detail['dimension']}`{' (hard gate)' if detail['hard_gate'] else ''}", ""])
+            for source, label in (("deterministic", "D"), ("fixed_judge", "J")):
+                for cell in detail[source]:
+                    score = cell["score"] if cell["score"] is not None else "unknown"
+                    lines.append(f"- {label} replicate {cell['replicate']}: `{cell['status'] or 'unknown'}` (score {score}, evaluator `{cell['evaluator']}`)")
+                    for evidence in cell["evidence"]:
+                        if evidence.strip() == DIMENSION_UNEVIDENCED_NOTE:
+                            continue
+                        lines.extend(f"  {line}" if line else "" for line in evidence_bullets(evidence))
+            lines.append("")
+    if outputs:
+        lines.extend(["", "## Outputs", ""])
+        for entry in outputs:
+            if entry["output"] is None:
+                continue
+            latency = f"{entry['latency_ms']:.1f} ms" if entry["latency_ms"] is not None else "unknown"
+            cost = f"${entry['cost_usd']:.6f}" if entry["cost_usd"] is not None else "unknown"
+            output_note = f"{len(entry['output'])} characters"
+            if len(entry["output"]) > OUTPUT_DETAIL_LIMIT:
+                output_note += f", truncated to the first {OUTPUT_DETAIL_LIMIT} characters below"
+            lines.extend([
+                f"### `{entry['task_id']}` / `{entry['model']}` / replicate {entry['replicate']}",
+                "",
+                f"- Role: `{entry['role']}`; thinking: `{entry['thinking'] or '-'}`",
+                f"- Assignment: `{entry['assignment_id'] or '-'}`",
+                f"- Status: `{entry['status']}`; execution: `{entry['execution_status']}`",
+                f"- Latency: {latency}",
+                f"- Cost: {cost}",
+                f"- Output: {output_note}",
+                "",
+                *long_text_block(entry["output"], OUTPUT_DETAIL_LIMIT),
+                "",
+            ])
+        missing_outputs = [entry for entry in outputs if entry["output"] is None]
+        if missing_outputs:
+            lines.extend(["Cells without output:", ""])
+            for entry in missing_outputs:
+                latency = f"{entry['latency_ms']:.1f} ms" if entry["latency_ms"] is not None else "unknown"
+                lines.append(f"- `{entry['task_id']}` / `{entry['model']}` / replicate {entry['replicate']}: no output captured (status `{entry['status']}`, execution `{entry['execution_status']}`, latency {latency})")
+            lines.append("")
     report = "\n".join(lines) + "\n"
     if args.format == "json":
         serializable_groups = {
@@ -4602,7 +4816,7 @@ def report_command(args: argparse.Namespace) -> int:
             f"{role}/{model}:{thinking}" if thinking else f"{role}/{model}": values
             for (role, model, thinking), values in evaluation_groups.items()
         }
-        rendered = json.dumps({"manifest": manifest, "summary": summary, "execution_context": execution_context, "scope": scope, "model_summary": model_summary, "groups": serializable_groups, "evaluations": evaluations, "evaluation_groups": serializable_evaluation_groups, "judge_results": judge_results, "judge_evaluations": judge_evaluations, "recommendations": recommendations}, ensure_ascii=False, indent=2) + "\n"
+        rendered = json.dumps({"manifest": manifest, "summary": summary, "execution_context": execution_context, "scope": scope, "model_summary": model_summary, "groups": serializable_groups, "evaluations": evaluations, "evaluation_groups": serializable_evaluation_groups, "judge_results": judge_results, "judge_evaluations": judge_evaluations, "recommendations": recommendations, "task_details": task_details, "dimension_details": dimension_details, "outputs": outputs}, ensure_ascii=False, indent=2) + "\n"
         if args.output:
             output = Path(args.output).expanduser()
             output.parent.mkdir(parents=True, exist_ok=True)

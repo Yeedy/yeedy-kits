@@ -1,6 +1,6 @@
 ---
 name: omp-rolebench
-description: Benchmark Oh My Pi model-role assignments. Use when comparing all models, models from selected providers, or explicitly named models across all or selected OMP roles, generating isolated/all-same assignment matrices, running repeatable role tasks, or producing a cost/quality report.
+description: Benchmark Oh My Pi model-role assignments. Use when comparing all models, models from selected providers, or explicitly named models across all or selected OMP roles, generating isolated/all-same assignment matrices, running repeatable role tasks, producing a cost/quality report, measuring raw provider response performance (TTFT, throughput, prompt cache) with `omp bench`, or measuring instruction following/working memory with `omp if-bench`.
 ---
 
 # OMP RoleBench
@@ -110,6 +110,8 @@ For task-subagent experiments, see [observed-task-role-ab.md](references/observe
 
 `--tasks-file` accepts task schema V1 as JSON or JSONL. Tasks require `id`, `role`, and `prompt`; they may declare `scenario`, `task_type`, difficulty metadata, easy/hard pairing, expected output, workspace invariants, failure modes, and target dimensions. See [evaluation-v1.md](references/evaluation-v1.md) for the complete schema and evaluator behavior. When a tasks file is omitted, choose between `--task-source core` and `--task-source recent`; the CLI default remains `core` for backward compatibility. At the skill interaction layer, if the user has not chosen a source, ask whether to use the generic suite or recent local work before generating the plan.
 
+At every interaction-layer decision point — task source, whether to follow an all-`unknown` run with deterministic fixtures or the fixed judge, judge model choice — present the options with the `ask` tool (recommended option marked) instead of ending the turn with an open text question. Do not stop mid-flow while the next step is a bounded choice the user can pick.
+
 Relative `workspace` paths in a tasks file resolve from that file's directory. The bundled `assets/task-high/tasks-task-high.jsonl` suite provides three reusable `task` fixtures with deterministic output, file, scope, and command checks; command execution still requires explicit `--allow-check-command` approval.
 
 The generic core suite remains a low-cost smoke suite. Its deterministic protocol and workspace tasks provide usable V1 checks, while subjective roles remain `unknown` where evidence is insufficient. For role-allocation decisions, provide paired easy/hard fixtures plus controlled failure or adversarial cases rather than treating core-suite latency as quality.
@@ -130,6 +132,33 @@ The default `direct` executor calls the selected model with a role contract prom
 
 The V1 evaluator deterministically checks declared output contracts, file state, changed-path scope, failure-output patterns, and explicitly approved command results. With `--judge-model`, V2 sends a blinded task/output/evidence packet to a versioned fixed judge and writes `judge_results.jsonl` plus `judge_evaluations.jsonl`; each judge uses a temporary minimal OMP config and empty cwd, disables tools, extensions, skills, and rules, because the packet is the complete evaluation contract, so it must not investigate the temporary workspace as a new task. Malformed or incomplete judge evidence is `unknown` and never overwrites V1 results. Execution status, task outcome, dimension status, and hard gates remain separate. Incomplete execution, evaluator limits, missing evidence, and dimensions without applicable checks are `unknown` with a `null` score; no individual hard gate passes without evidence. Snapshot, artifact, or evaluator failures are recorded without overwriting a completed raw provider result. Add `--recommend` to write a recommendation only after every selected role has the minimum repeated runs, all applicable deterministic hard evidence passes, and the fixed judge fully verifies every requested hard dimension. A hard dimension with no deterministic evaluator remains `unknown` in V1 but does not duplicate the fixed-judge gate; blocked candidates retain their reasons. There is no composite score. Tool-trace reconstruction, host security isolation, and statistical significance remain outside this V2 slice. See [evaluation-v2.md](references/evaluation-v2.md) for the schema and limits.
 
+## Response performance (`omp bench`)
+
+`omp bench` measures raw provider response behavior — TTFT vs decode throughput with p50/p95 — without touching `modelRoles` or any config. Use it alongside RoleBench: RoleBench answers per-role quality and real-task latency/cost; `omp bench` isolates provider-side speed independent of roles.
+
+```bash
+omp bench anthropic/claude-opus-4-5 openai/gpt-5.2 --runs 3 --json
+```
+
+- Profiles: `chat` (default; balanced, TTFT + tok/s), `prefill` (large cache-busted input; input-processing speed), `generation` (long forced output; sustained decode), `mix` (rotates all three). Tune with `--runs`, `--max-tokens`, `--prefill-bytes`, `--prompt`.
+- `--cache` measures independent cold/warm prompt-cache pairs (`--cache-pairs`, `--cache-prefix-file`, `--cache-prefix-bytes`); not supported for `openai-codex-responses`.
+- `--par N` sets parallel queries (default 4); `--service-tier` overrides the configured `tier.*` setting per model family; `--json` gives machine-readable output. Selectors accept fuzzy ids (`omp bench opus sonnet`) and thinking suffixes (`provider/model:low`).
+
+Recommended workflow: run `omp bench` as a cheap screening stage to drop unresponsive or slow candidates before committing to a full rolebench matrix, and to attribute observed latency (TTFT vs prefill vs decode vs cache) when a rolebench cell looks slow. It makes metered provider calls but has no cost cap and no `--confirm` gate, so the consent plan must state the models, profile, `--runs`, and `--par` before executing.
+
+## Instruction following (`omp if-bench`)
+
+`omp if-bench` measures instruction following and working memory: each model plays one cached thread of glyph-array actions with a moving cat-sound directive; turn N issues N actions, so later turns stress long-context state tracking. Like `omp bench`, it runs model selectors directly without touching `modelRoles` or any config.
+
+```bash
+omp if-bench opus sonnet gpt-5.2 --json
+```
+
+- `--turns` caps turns per model (default 24); `--length` sets the character-array length (even, 8–26, default 24); `--nya-max` bounds the accepted cat sound `nya{1,N}` (default 8); `--max-tokens` caps output per turn (default 32768).
+- `--par N` benchmarks models concurrently (default 4); use `--par 1` for a clean sequential probe. `--json` emits a machine-readable per-turn transcript.
+
+Use it as a second screening stage after `omp bench`: a model that is fast but loses the array state or the moving directive is a poor fit for `task`/`default` roles that must hold constraints across long sessions. Same consent rule as `omp bench` — metered calls, no cost cap or `--confirm` gate, so state the models, `--turns`, `--length`, and `--par` in the plan before executing.
+
 ## Reports
 
 `run` writes `report.md` and `report.json` automatically. Both formats retain the effective concurrency, dependency-aware provider-wave estimate, maximum/peak copied-workspace estimate, cost cap, final budget status, and concurrent in-flight cost exposure alongside the quality evidence. The command below rerenders either format when an existing run needs a refreshed report:
@@ -141,6 +170,8 @@ python3 omp-rolebench/scripts/rolebench.py report \
 ```
 
 Reports begin with a benchmark-scope table listing each local scenario, task type, workspace kind, difficulty, checks, and target dimensions. The model-summary table puts each tested role/model/thinking variant on one row with execution and outcome counts, every evaluated dimension, gate/recommendation status as overall performance, p50 latency, and observed cost. It does not invent a composite score. Detailed sections retain assignment counts, output size, hard-gate failures, fixed-judge results, candidate-level blocking reasons, and links to raw/evaluation/artifact evidence. Treat cost as unknown unless completed assistant events contain usage/cost data; multi-turn assistant costs are summed, while missing usage remains unknown rather than inferred. See [evaluation-v2.md](references/evaluation-v2.md) for the fixed-judge and recommendation artifacts.
+
+When the data exists, reports append three expanded sections after the aggregate tables: `Task Details` (full prompt, declared expectations/invariants/failure mode per task), `Dimension Details` (per-replicate deterministic and judge status/score with the judge's evidence bullets verbatim; dimensions whose only record is the evaluator's no-evidence placeholder are omitted), and `Outputs` (per-cell latency, cost, and the model output truncated at 2000 characters with an in-fence marker). Long text is fenced with dynamically sized tilde fences so nested fences cannot break the report; the same expansions are mirrored in `report.json` under `task_details`, `dimension_details`, and `outputs`.
 
 ## Guardrails
 
