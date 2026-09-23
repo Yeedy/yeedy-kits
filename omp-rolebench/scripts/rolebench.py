@@ -226,6 +226,7 @@ REGEX_TIMEOUT_SECONDS = 1.0
 COMMAND_OUTPUT_LIMIT = 1024 * 1024
 EVIDENCE_TEXT_LIMIT = 1000
 OUTPUT_DETAIL_LIMIT = 2000
+CONCLUSION_REASON_LIMIT = 400
 # aggregate_dimensions records this placeholder when a declared dimension has no covering check.
 DIMENSION_UNEVIDENCED_NOTE = "no deterministic evidence for this dimension"
 SAFE_COMMAND_ENV_KEYS = ("PATH", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "TMPDIR", "SYSTEMROOT", "PATHEXT")
@@ -4381,6 +4382,248 @@ def build_model_summary(
     return summaries
 
 
+def single_line_reason(value: Any) -> str:
+    """Flatten a reason onto one line so a markdown bullet stays a single list item."""
+    text = " ".join(
+        line.strip()
+        for line in str(value).replace("\r\n", "\n").replace("\r", "\n").split("\n")
+        if line.strip()
+    )
+    if len(text) > CONCLUSION_REASON_LIMIT:
+        text = text[:CONCLUSION_REASON_LIMIT].rstrip() + "..."
+    return text
+
+
+def judge_cell_is_clean(evaluation: dict[str, Any]) -> bool:
+    """A judge cell is a clean pass only when the outcome and every recorded dimension passed."""
+    if evaluation.get("outcome") != "pass":
+        return False
+    dimensions = evaluation.get("dimensions")
+    if not isinstance(dimensions, dict):
+        return True
+    return all(not isinstance(value, dict) or value.get("status") == "pass" for value in dimensions.values())
+
+
+def judge_cell_failure(evaluation: dict[str, Any]) -> dict[str, Any]:
+    """Pick the most severe non-pass dimension of a judge cell and the reason to lead its bullet with."""
+    dimensions = evaluation.get("dimensions")
+    ranked: list[tuple[int, int, int, str, bool, dict[str, Any]]] = []
+    if isinstance(dimensions, dict):
+        dimension_rank = {dimension: index for index, dimension in enumerate(EVALUATION_DIMENSIONS)}
+        for name, value in dimensions.items():
+            if not isinstance(value, dict) or value.get("status") not in ("fail", "unknown"):
+                continue
+            hard_gate = value["hard_gate"] if isinstance(value.get("hard_gate"), bool) else name in HARD_GATE_DIMENSIONS
+            ranked.append((
+                0 if value.get("status") == "fail" else 1,
+                0 if hard_gate else 1,
+                dimension_rank.get(name, len(EVALUATION_DIMENSIONS)),
+                name,
+                hard_gate,
+                value,
+            ))
+    ranked.sort(key=lambda entry: entry[:4])
+    selected = ranked[0] if ranked else None
+    summary = evaluation.get("summary")
+    if isinstance(summary, str) and summary.strip():
+        reason = single_line_reason(summary)
+    elif selected is not None:
+        evidence = selected[5].get("evidence")
+        evidence = evidence if isinstance(evidence, list) else []
+        usable = [
+            item
+            for item in evidence
+            if isinstance(item, str) and item.strip() and item.strip() != DIMENSION_UNEVIDENCED_NOTE
+        ]
+        reason = single_line_reason(usable[0]) if usable else DIMENSION_UNEVIDENCED_NOTE
+    else:
+        reason = f"no {evaluation.get('outcome') or 'unknown'} reason recorded"
+    return {
+        "dimension": selected[3] if selected else None,
+        "hard_gate": selected[4] if selected else None,
+        "reason": reason,
+    }
+
+
+def build_conclusions(
+    rows: list[dict[str, Any]],
+    evaluations: list[dict[str, Any]],
+    judge_evaluations: list[dict[str, Any]],
+    recommendations: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    """Lead the report with verdicts: execution and judge tallies plus why every non-pass judge cell fell short."""
+    row_groups: dict[tuple[str, str, str], list[dict[str, Any]]] = defaultdict(list)
+    deterministic_groups: dict[tuple[str, str, str], list[dict[str, Any]]] = defaultdict(list)
+    judge_groups: dict[tuple[str, str, str], list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        row_groups[(row.get("role", ""), row.get("model", ""), row.get("thinking") or "")].append(row)
+    for evaluation in evaluations:
+        deterministic_groups[(evaluation.get("role", ""), evaluation.get("model", ""), evaluation.get("thinking") or "")].append(evaluation)
+    for evaluation in judge_evaluations:
+        judge_groups[(evaluation.get("role", ""), evaluation.get("model", ""), evaluation.get("thinking") or "")].append(evaluation)
+    recommendation_source = recommendations if isinstance(recommendations, dict) else {}
+    candidates = {
+        (item.get("role", ""), item.get("model", ""), item.get("thinking") or ""): item
+        for item in recommendation_source.get("candidates", [])
+        if isinstance(item, dict)
+    }
+    winners = {
+        (item.get("role", ""), item.get("model", ""), item.get("thinking") or ""): item
+        for item in recommendation_source.get("roles", [])
+        if isinstance(item, dict) and item.get("status") == "recommended"
+    }
+    dimension_rank = {dimension: index for index, dimension in enumerate(EVALUATION_DIMENSIONS)}
+    conclusions = []
+    for role, model, thinking in sorted(set(row_groups) | set(deterministic_groups) | set(judge_groups)):
+        key = (role, model, thinking)
+        execution_values = row_groups[key]
+        deterministic_values = deterministic_groups[key]
+        judge_values = sorted(judge_groups[key], key=lambda value: (str(value.get("task_id")), numeric_sort_key(value.get("replicate"))))
+        execution = {
+            "runs": len(execution_values),
+            "pass": sum(value.get("status") == "pass" for value in execution_values),
+            "error": sum(value.get("status") != "pass" for value in execution_values),
+        }
+        deterministic = {
+            "evaluations": len(deterministic_values),
+            "pass": sum(value.get("outcome") == "pass" for value in deterministic_values),
+            "fail": sum(value.get("outcome") == "fail" for value in deterministic_values),
+            "unknown": sum(value.get("outcome") == "unknown" for value in deterministic_values),
+            "hard_gate_failures": sum(value.get("hard_gate_status") == "fail" for value in deterministic_values),
+        }
+        failed_counts: dict[str, int] = defaultdict(int)
+        for value in deterministic_values:
+            dimensions = value.get("dimensions")
+            if not isinstance(dimensions, dict):
+                continue
+            for name, dimension in dimensions.items():
+                if isinstance(dimension, dict) and dimension.get("status") == "fail":
+                    failed_counts[name] += 1
+        deterministic["failed_dimensions"] = [
+            {"dimension": name, "count": count}
+            for name, count in sorted(
+                failed_counts.items(),
+                key=lambda item: (-item[1], dimension_rank.get(item[0], len(EVALUATION_DIMENSIONS)), item[0]),
+            )
+        ]
+        fixed_judge = {
+            "evaluations": len(judge_values),
+            "pass": sum(value.get("outcome") == "pass" for value in judge_values),
+            "fail": sum(value.get("outcome") == "fail" for value in judge_values),
+            "unknown": sum(value.get("outcome") == "unknown" for value in judge_values),
+            "hard_gate_failures": sum(value.get("hard_gate_status") == "fail" for value in judge_values),
+            "hard_gate_unknown": sum(value.get("hard_gate_status") == "unknown" for value in judge_values),
+        } if judge_values else None
+        reasons = []
+        for value in judge_values:
+            if judge_cell_is_clean(value):
+                continue
+            failure = judge_cell_failure(value)
+            reasons.append({
+                "task_id": value.get("task_id"),
+                "replicate": value.get("replicate"),
+                "outcome": value.get("outcome") or "unknown",
+                "dimension": failure["dimension"],
+                "hard_gate": failure["hard_gate"],
+                "reason": failure["reason"],
+            })
+        all_judge_dimensions_passed = bool(judge_values) and not reasons and not deterministic["failed_dimensions"]
+        winner = winners.get(key)
+        candidate = candidates.get(key)
+        winner_candidate = winner.get("candidate") if winner is not None and isinstance(winner.get("candidate"), dict) else None
+        quality_source = winner_candidate or candidate
+        quality_score = (
+            quality_source.get("quality_score")
+            if isinstance(quality_source, dict) and isinstance(quality_source.get("quality_score"), (int, float))
+            else None
+        )
+        if winner is not None:
+            recommendation = {
+                "status": "recommended",
+                "reason": single_line_reason(winner.get("reason") or "eligible with the strongest evidence"),
+                "eligible": True,
+                "quality_score": quality_score,
+                "blocked_reasons": [],
+            }
+        elif candidate is not None:
+            blocked_reasons = [str(reason) for reason in candidate.get("blocked_reasons", []) if str(reason).strip()]
+            eligible = bool(candidate.get("eligible"))
+            recommendation = {
+                "status": "eligible" if eligible else "blocked",
+                "reason": single_line_reason("; ".join(blocked_reasons)) if blocked_reasons else "eligible; not the top-ranked candidate for this role",
+                "eligible": eligible,
+                "quality_score": quality_score,
+                "blocked_reasons": blocked_reasons,
+            }
+        else:
+            recommendation = None
+        verdict_parts = []
+        if execution["runs"]:
+            verdict_parts.append(f"execution {execution['pass']} pass / {execution['error']} error")
+        if deterministic["evaluations"]:
+            verdict_parts.append(
+                f"deterministic evaluations {deterministic['pass']} pass / {deterministic['fail']} fail / {deterministic['unknown']} unknown"
+            )
+        if fixed_judge is not None:
+            hard_gate = (
+                f"{fixed_judge['hard_gate_failures']} fail / {fixed_judge['hard_gate_unknown']} unknown"
+                if fixed_judge["hard_gate_failures"] or fixed_judge["hard_gate_unknown"]
+                else "pass"
+            )
+            verdict_parts.append(
+                f"fixed judge {fixed_judge['pass']} pass / {fixed_judge['fail']} fail / {fixed_judge['unknown']} unknown"
+                f" (hard gate {hard_gate})"
+            )
+        conclusions.append({
+            "role": role,
+            "model": model,
+            "thinking": thinking or None,
+            "verdict": ("; ".join(verdict_parts) + ".") if verdict_parts else "No execution or evaluation rows were recorded.",
+            "execution": execution,
+            "deterministic": deterministic,
+            "fixed_judge": fixed_judge,
+            "recommendation": recommendation,
+            "reasons": reasons,
+            "all_judge_dimensions_passed": all_judge_dimensions_passed,
+        })
+    return conclusions
+
+
+def render_conclusions(conclusions: list[dict[str, Any]]) -> list[str]:
+    """Render the conclusions section that leads the report, ending with a blank separator line."""
+    lines = ["## Conclusions", ""]
+    if not conclusions:
+        return [*lines, "No execution, evaluation, or fixed-judge rows were recorded for this run.", ""]
+    lines.extend([
+        "Verdicts come first: each identity lists execution and fixed-judge tallies, then every non-pass judge cell "
+        "with its reason. The detail tables below are unchanged.",
+        "",
+    ])
+    for item in conclusions:
+        lines.extend([f"### `{item['role']}` / `{item['model']}` / `{item['thinking'] or '-'}`", ""])
+        recommendation = item["recommendation"]
+        if recommendation:
+            quality = f" (quality {recommendation['quality_score']:.2f})" if recommendation["quality_score"] is not None else ""
+            lines.append(f"- Recommendation: `{recommendation['status']}` — {recommendation['reason']}{quality}")
+        lines.append(f"- Verdict: {item['verdict']}")
+        for reason in item["reasons"]:
+            suffix = ""
+            if reason["dimension"]:
+                tags = f"`{reason['dimension']}`{', hard gate' if reason['hard_gate'] else ''}"
+                suffix = f" ({tags})"
+            lines.append(
+                f"- `{reason['task_id']}` replicate {reason['replicate']}{suffix}: `{reason['outcome']}` — {reason['reason']}"
+            )
+        failed_dimensions = item["deterministic"]["failed_dimensions"]
+        if failed_dimensions:
+            summary = ", ".join(f"`{entry['dimension']}` x{entry['count']}" for entry in failed_dimensions)
+            lines.append(f"- Deterministic dimension failures: {summary}")
+        if item["all_judge_dimensions_passed"]:
+            lines.append("- All judge dimensions passed.")
+        lines.append("")
+    return lines
+
+
 def fence_for(text: str) -> str:
     """Return a tilde fence longer than any tilde run in text so the content cannot close it early."""
     longest = current = 0
@@ -4602,6 +4845,7 @@ def report_command(args: argparse.Namespace) -> int:
         "concurrent_cost_exposure_calls": parallelism.get("effective_jobs", 1),
     }
     scope = benchmark_scope(manifest)
+    conclusions = build_conclusions(rows, evaluations, judge_evaluations, recommendations)
     model_summary = build_model_summary(rows, evaluations, judge_evaluations, recommendations)
     task_details = build_task_details(manifest)
     dimension_details = build_dimension_details(evaluations, judge_evaluations)
@@ -4639,11 +4883,14 @@ def report_command(args: argparse.Namespace) -> int:
         f"- Evaluation rows: {len(evaluations)}",
         f"- Fixed-judge rows: {len(judge_evaluations)}",
         "",
+    ]
+    lines.extend(render_conclusions(conclusions))
+    lines.extend([
         "## Benchmark Scope",
         "",
         "| Task | Role | Scenario | Task type | Workspace | Difficulty | Checks | Dimensions |",
         "|---|---|---|---|---|---:|---:|---|",
-    ]
+    ])
     for item in scope:
         scenario = str(item.get("scenario") or "-").replace("|", "\\|")
         dimensions = ", ".join(item.get("dimensions", [])) or "none"
@@ -4862,7 +5109,7 @@ def report_command(args: argparse.Namespace) -> int:
             f"{role}/{model}:{thinking}" if thinking else f"{role}/{model}": values
             for (role, model, thinking), values in evaluation_groups.items()
         }
-        rendered = json.dumps({"manifest": manifest, "summary": summary, "execution_context": execution_context, "scope": scope, "model_summary": model_summary, "groups": serializable_groups, "evaluations": evaluations, "evaluation_groups": serializable_evaluation_groups, "judge_results": judge_results, "judge_evaluations": judge_evaluations, "recommendations": recommendations, "task_details": task_details, "dimension_details": dimension_details, "dimension_summary": dimension_summary, "outputs": outputs}, ensure_ascii=False, indent=2) + "\n"
+        rendered = json.dumps({"manifest": manifest, "summary": summary, "execution_context": execution_context, "scope": scope, "conclusions": conclusions, "model_summary": model_summary, "groups": serializable_groups, "evaluations": evaluations, "evaluation_groups": serializable_evaluation_groups, "judge_results": judge_results, "judge_evaluations": judge_evaluations, "recommendations": recommendations, "task_details": task_details, "dimension_details": dimension_details, "dimension_summary": dimension_summary, "outputs": outputs}, ensure_ascii=False, indent=2) + "\n"
         if args.output:
             output = Path(args.output).expanduser()
             output.parent.mkdir(parents=True, exist_ok=True)
