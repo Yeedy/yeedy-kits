@@ -171,6 +171,7 @@ EVALUATION_DIMENSIONS = (
     "safety",
 )
 HARD_GATE_DIMENSIONS = {"correctness", "honesty", "safety"}
+DIMENSION_SOURCES = (("deterministic", "D"), ("fixed_judge", "J"))
 DIFFICULTY_AXES = {"scope", "reasoning", "tool_depth", "context", "uncertainty", "risk", "adversarial"}
 EXPECTED_KEYS = {"output_exact", "output_contains", "output_regex", "output_not_regex", "output_json_equals", "max_output_chars"}
 TASK_KEYS = {
@@ -4494,6 +4495,56 @@ def build_dimension_details(
     return details
 
 
+def build_dimension_summary(
+    evaluations: list[dict[str, Any]],
+    judge_evaluations: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Aggregate dimension outcomes per role/model/thinking pair and source so deterministic (D) and fixed-judge (J) evidence never merge."""
+    grouped: dict[tuple[str, str, str, str, str], list[dict[str, Any]]] = defaultdict(list)
+    rows_by_source = {"deterministic": evaluations, "fixed_judge": judge_evaluations}
+    for source, _ in DIMENSION_SOURCES:
+        for row in rows_by_source[source]:
+            dimensions = row.get("dimensions")
+            if not isinstance(dimensions, dict):
+                continue
+            identity = (row.get("role", ""), row.get("model", ""), row.get("thinking") or "")
+            for dimension, value in dimensions.items():
+                if isinstance(value, dict):
+                    grouped[(*identity, dimension, source)].append(value)
+    dimension_rank = {dimension: index for index, dimension in enumerate(EVALUATION_DIMENSIONS)}
+    source_rank = {source: index for index, (source, _) in enumerate(DIMENSION_SOURCES)}
+    labels = dict(DIMENSION_SOURCES)
+    summary = []
+    for (role, model, thinking, dimension, source), values in grouped.items():
+        counts = summarized_dimension(values, source)
+        if source == "deterministic":
+            hard_gate = dimension in HARD_GATE_DIMENSIONS
+        else:
+            declared = [value["hard_gate"] for value in values if isinstance(value.get("hard_gate"), bool)]
+            hard_gate = any(declared) if declared else dimension in HARD_GATE_DIMENSIONS
+        summary.append({
+            "role": role,
+            "model": model,
+            "thinking": thinking,
+            "dimension": dimension,
+            "source": source,
+            "source_label": labels[source],
+            "hard_gate": hard_gate,
+            "pass": counts["pass"],
+            "fail": counts["fail"],
+            "unknown": counts["unknown"],
+            "average_known_score": counts["average_known_score"],
+        })
+    return sorted(summary, key=lambda item: (
+        item["role"],
+        item["model"],
+        item["thinking"],
+        dimension_rank.get(item["dimension"], len(EVALUATION_DIMENSIONS)),
+        item["dimension"],
+        source_rank[item["source"]],
+    ))
+
+
 def build_outputs(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     outputs = []
     for row in sorted(rows, key=lambda row: (
@@ -4554,18 +4605,15 @@ def report_command(args: argparse.Namespace) -> int:
     model_summary = build_model_summary(rows, evaluations, judge_evaluations, recommendations)
     task_details = build_task_details(manifest)
     dimension_details = build_dimension_details(evaluations, judge_evaluations)
+    dimension_summary = build_dimension_summary(evaluations, judge_evaluations)
     outputs = build_outputs(rows)
     groups: dict[tuple[str, str, str], list[dict[str, Any]]] = defaultdict(list)
     for row in rows:
         groups[(row.get("role", ""), row.get("model", ""), row.get("thinking") or "")].append(row)
     evaluation_groups: dict[tuple[str, str, str], list[dict[str, Any]]] = defaultdict(list)
-    dimension_groups: dict[tuple[str, str, str, str], list[dict[str, Any]]] = defaultdict(list)
     for evaluation in evaluations:
         key = (evaluation.get("role", ""), evaluation.get("model", ""), evaluation.get("thinking") or "")
         evaluation_groups[key].append(evaluation)
-        for dimension, value in evaluation.get("dimensions", {}).items():
-            if isinstance(value, dict):
-                dimension_groups[(*key, dimension)].append(value)
     summary_dimensions = [
         dimension for dimension in EVALUATION_DIMENSIONS
         if any(dimension in item.get("dimensions", {}) for item in model_summary)
@@ -4678,20 +4726,18 @@ def report_command(args: argparse.Namespace) -> int:
             unknown = sum(value.get("outcome") == "unknown" for value in values)
             hard_failures = sum(value.get("hard_gate_status") == "fail" for value in values)
             lines.append(f"| `{role}` | `{model}` | `{thinking or '-'}` | {len(values)} | {passes} | {failures} | {unknown} | {hard_failures} |")
+    if evaluations or judge_evaluations:
         lines.extend([
             "",
             "## Dimensions",
             "",
-            "| Role | Model | Thinking | Dimension | Pass | Fail | Unknown | Avg known score | Hard gate |",
-            "|---|---|---|---|---:|---:|---:|---:|---|",
+            "| Role | Model | Thinking | Dimension | Source | Pass | Fail | Unknown | Avg known score | Hard gate |",
+            "|---|---|---|---|---|---:|---:|---:|---:|---|",
         ])
-        for (role, model, thinking, dimension), values in sorted(dimension_groups.items()):
-            passes = sum(value.get("status") == "pass" for value in values)
-            failures = sum(value.get("status") == "fail" for value in values)
-            unknown = sum(value.get("status") == "unknown" for value in values)
-            scores = [float(value["score"]) for value in values if isinstance(value.get("score"), (int, float)) and value.get("status") != "unknown"]
-            avg_score = f"{sum(scores) / len(scores):.2f}" if scores else "unknown"
-            lines.append(f"| `{role}` | `{model}` | `{thinking or '-'}` | `{dimension}` | {passes} | {failures} | {unknown} | {avg_score} | {'yes' if dimension in HARD_GATE_DIMENSIONS else 'no'} |")
+        for item in dimension_summary:
+            avg_score = f"{item['average_known_score']:.2f}" if item["average_known_score"] is not None else "unknown"
+            lines.append(f"| `{item['role']}` | `{item['model']}` | `{item['thinking'] or '-'}` | `{item['dimension']}` | {item['source_label']} | {item['pass']} | {item['fail']} | {item['unknown']} | {avg_score} | {'yes' if item['hard_gate'] else 'no'} |")
+    if evaluations:
         failed_checks = [
             (evaluation, check)
             for evaluation in evaluations
@@ -4816,7 +4862,7 @@ def report_command(args: argparse.Namespace) -> int:
             f"{role}/{model}:{thinking}" if thinking else f"{role}/{model}": values
             for (role, model, thinking), values in evaluation_groups.items()
         }
-        rendered = json.dumps({"manifest": manifest, "summary": summary, "execution_context": execution_context, "scope": scope, "model_summary": model_summary, "groups": serializable_groups, "evaluations": evaluations, "evaluation_groups": serializable_evaluation_groups, "judge_results": judge_results, "judge_evaluations": judge_evaluations, "recommendations": recommendations, "task_details": task_details, "dimension_details": dimension_details, "outputs": outputs}, ensure_ascii=False, indent=2) + "\n"
+        rendered = json.dumps({"manifest": manifest, "summary": summary, "execution_context": execution_context, "scope": scope, "model_summary": model_summary, "groups": serializable_groups, "evaluations": evaluations, "evaluation_groups": serializable_evaluation_groups, "judge_results": judge_results, "judge_evaluations": judge_evaluations, "recommendations": recommendations, "task_details": task_details, "dimension_details": dimension_details, "dimension_summary": dimension_summary, "outputs": outputs}, ensure_ascii=False, indent=2) + "\n"
         if args.output:
             output = Path(args.output).expanduser()
             output.parent.mkdir(parents=True, exist_ok=True)
