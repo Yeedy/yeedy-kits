@@ -232,10 +232,25 @@ DIMENSION_UNEVIDENCED_NOTE = "no deterministic evidence for this dimension"
 SAFE_COMMAND_ENV_KEYS = ("PATH", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "TMPDIR", "SYSTEMROOT", "PATHEXT")
 REGEX_WORKER = "import json,re,sys; pattern,text=json.load(sys.stdin); sys.exit(0 if re.search(pattern,text) else 1)"
 FIXED_JUDGE_SCHEMA_VERSION = 1
-FIXED_JUDGE_RUBRIC_VERSION = "rolebench-v2-20260831"
+FIXED_JUDGE_RUBRIC_VERSION = "rolebench-v2-20260924"
 FIXED_JUDGE_OUTPUT_TOKENS = 768
 FIXED_JUDGE_TIMEOUT = 180
 JUDGE_INPUT_LIMIT = 64 * 1024
+# Verbatim workspace excerpts let the judge check file:line claims without inspecting a workspace.
+WORKSPACE_EXCERPT_MAX_FILES = 8
+WORKSPACE_EXCERPT_FILE_BYTES = 6 * 1024
+WORKSPACE_EXCERPT_TOTAL_BYTES = 24 * 1024
+WORKSPACE_EXCERPT_MAX_FILE_BYTES = 1024 * 1024
+WORKSPACE_EXCERPT_IGNORE_DIRS = {".git", "node_modules", "__pycache__"}
+WORKSPACE_EXCERPT_SUFFIXES = (
+    "rs", "ts", "tsx", "js", "jsx", "py", "json", "toml", "yaml", "yml",
+    "md", "css", "html", "vue", "svelte", "go", "java", "c", "h", "cpp",
+)
+CITED_PATH_PATTERN = re.compile(
+    r"(?P<path>(?:[\w.+@-]+/)+[\w.+@-]*\.(?:"
+    + "|".join(sorted(WORKSPACE_EXCERPT_SUFFIXES, key=len, reverse=True))
+    + r"))(?::\d+(?::\d+)?)?(?![A-Za-z0-9_])",
+)
 RECOMMENDATION_SCHEMA_VERSION = 1
 HARNESS_ERROR_TYPES = {"harness_internal", "executor_setup", "executor_internal", "malformed_omp_json", "missing_image_fixture"}
 HARNESS_WARNING_TYPES = {"harness_integrity", "workspace_evidence", "artifact_write", "evaluation", "workspace_cleanup_failed"}
@@ -2253,9 +2268,99 @@ def fixed_judge_dimensions(task: dict[str, Any]) -> list[str]:
     return list(dict.fromkeys(task.get("dimension_targets", [])))
 
 
-def build_fixed_judge_prompt(task: dict[str, Any], result: dict[str, Any], deterministic_evaluation: dict[str, Any]) -> str:
+def cited_workspace_paths(output: str) -> list[str]:
+    """Path-like tokens in model output, deduped in first-mention order."""
+    return list(dict.fromkeys(
+        re.sub(r"^\./+", "", match.group("path"))
+        for match in CITED_PATH_PATTERN.finditer(output)
+    ))
+
+
+def workspace_excerpt_file(root: Path, cited: str, budget: int) -> dict[str, Any] | None:
+    """Numbered head-of-file excerpt for one cited path, or None when it must be omitted."""
+    try:
+        candidate = (root / cited).resolve(strict=True)
+    except (OSError, RuntimeError):
+        return None
+    try:
+        relative = candidate.relative_to(root)
+    except ValueError:
+        return None
+    if not candidate.is_file() or WORKSPACE_EXCERPT_IGNORE_DIRS & set(relative.parts[:-1]):
+        return None
+    try:
+        if candidate.stat().st_size > WORKSPACE_EXCERPT_MAX_FILE_BYTES:
+            return None
+        data = candidate.read_bytes()
+    except OSError:
+        return None
+    if b"\0" in data:
+        return None
+    lines = data.decode("utf-8", errors="replace").splitlines()
+    numbered: list[str] = []
+    used = 0
+    for number, line in enumerate(lines, start=1):
+        entry = f"{number}: {line}"
+        addition = len(entry) if not numbered else len(entry) + 1
+        if used + addition > budget:
+            break
+        numbered.append(entry)
+        used += addition
+    if not numbered:
+        return None
+    return {
+        "path": relative.as_posix(),
+        "total_lines": len(lines),
+        "excerpted_lines": len(numbered),
+        "truncated": len(lines) > len(numbered),
+        "text": "\n".join(numbered),
+    }
+
+
+def workspace_excerpts(workspace_value: Any, output: str) -> list[dict[str, Any]]:
+    """Verbatim excerpts of the workspace files the model output cites."""
+    if not isinstance(workspace_value, str) or not workspace_value.strip():
+        return []
+    try:
+        root = Path(workspace_value).expanduser().resolve()
+    except OSError:
+        return []
+    if not root.is_dir():
+        return []
+    excerpts: list[dict[str, Any]] = []
+    remaining = WORKSPACE_EXCERPT_TOTAL_BYTES
+    for cited in cited_workspace_paths(output):
+        if len(excerpts) >= WORKSPACE_EXCERPT_MAX_FILES or remaining <= 0:
+            break
+        excerpt = workspace_excerpt_file(root, cited, min(WORKSPACE_EXCERPT_FILE_BYTES, remaining))
+        if excerpt is None:
+            continue
+        remaining -= len(excerpt["text"])
+        excerpts.append(excerpt)
+    return excerpts
+
+
+def estimated_workspace_excerpts() -> list[dict[str, Any]]:
+    """Worst-case excerpt block so the judge estimate reserves the full excerpt budget."""
+    rows: list[dict[str, Any]] = []
+    remaining = WORKSPACE_EXCERPT_TOTAL_BYTES
+    while remaining > 0 and len(rows) < WORKSPACE_EXCERPT_MAX_FILES:
+        size = min(WORKSPACE_EXCERPT_FILE_BYTES, remaining)
+        rows.append({
+            "path": f"estimate/source-{len(rows)}.ts",
+            "total_lines": size + 1,
+            "excerpted_lines": size,
+            "truncated": True,
+            "text": "x" * size,
+        })
+        remaining -= size
+    return rows
+
+
+def build_fixed_judge_prompt(task: dict[str, Any], result: dict[str, Any], deterministic_evaluation: dict[str, Any], excerpts: list[dict[str, Any]] | None = None) -> str:
     model_output = decode_subprocess_text(result.get("output", ""))
     error_output = evidence_text(result.get("error", ""))
+    visible_output = model_output if len(model_output) <= JUDGE_INPUT_LIMIT else model_output[:JUDGE_INPUT_LIMIT] + "..."
     task_view = {
         key: value
         for key, value in task.items()
@@ -2280,15 +2385,19 @@ def build_fixed_judge_prompt(task: dict[str, Any], result: dict[str, Any], deter
         "role": task.get("role"),
         "execution": {
             "status": result.get("execution_status") or deterministic_evaluation.get("execution_status"),
-            "output": model_output if len(model_output) <= JUDGE_INPUT_LIMIT else model_output[:JUDGE_INPUT_LIMIT] + "...",
+            "output": visible_output,
             "error": error_output,
         },
         "deterministic_evidence": evidence_view,
+        "workspace_excerpts": workspace_excerpts(task.get("workspace"), visible_output) if excerpts is None else excerpts,
     }
     return (
         "You are the fixed semantic evaluator for OMP RoleBench. "
         f"Rubric version: {FIXED_JUDGE_RUBRIC_VERSION}. Return JSON only, with no markdown. "
         "Use only the evidence packet below; do not inspect a workspace or attempt any tool calls. "
+        "workspace_excerpts holds verbatim line-numbered contents of workspace files cited by the "
+        "execution output, so use it to verify file and line claims; claims about files that are not "
+        "listed there remain unknown. "
         "Evaluate the work against the task and available evidence, never infer hidden actions, "
         "and mark unsupported claims unknown. For each requested dimension return status pass, fail, "
         "or unknown; score must be 0 for fail, 2 for pass, and null for unknown; evidence must be a "
@@ -2307,6 +2416,7 @@ def estimate_fixed_judge(roles: list[str], assignments: list[dict[str, Any]], ta
     known_cost = 0.0
     cost_known = True
     selector = parse_selector(judge_model)["selector"]
+    max_excerpts = estimated_workspace_excerpts()
     for assignment in assignments:
         applicable = [task for task in tasks if task_for_assignment(task, assignment)]
         for task in applicable:
@@ -2333,6 +2443,7 @@ def estimate_fixed_judge(roles: list[str], assignments: list[dict[str, Any]], ta
                 task,
                 {"execution_status": "completed", "output": "x" * (JUDGE_INPUT_LIMIT + 1), "error": "x" * (EVIDENCE_TEXT_LIMIT + 1)},
                 skeleton_evaluation,
+                max_excerpts,
             )
             task_input = max(1, math.ceil(len(estimate_prompt) / 4))
             task_calls = runs
@@ -4394,6 +4505,13 @@ def single_line_reason(value: Any) -> str:
     return text
 
 
+def dimension_hard_gate(name: str, value: dict[str, Any]) -> bool:
+    """Cells declare their own hard-gate flag; fall back to the configured hard-gate dimensions."""
+    if isinstance(value.get("hard_gate"), bool):
+        return value["hard_gate"]
+    return name in HARD_GATE_DIMENSIONS
+
+
 def judge_cell_is_clean(evaluation: dict[str, Any]) -> bool:
     """A judge cell is a clean pass only when the outcome and every recorded dimension passed."""
     if evaluation.get("outcome") != "pass":
@@ -4402,6 +4520,21 @@ def judge_cell_is_clean(evaluation: dict[str, Any]) -> bool:
     if not isinstance(dimensions, dict):
         return True
     return all(not isinstance(value, dict) or value.get("status") == "pass" for value in dimensions.values())
+
+
+def evaluation_cell_verdict(evaluation: dict[str, Any]) -> str:
+    """Reduce one evaluation cell to `hard_fail`, `fail`, `pass`, or `unknown` for recommendability ranking."""
+    dimensions = evaluation.get("dimensions")
+    cells = [(name, value) for name, value in dimensions.items() if isinstance(value, dict)] if isinstance(dimensions, dict) else []
+    failed = [name for name, value in cells if value.get("status") == "fail"]
+    hard_failed = [name for name, value in cells if value.get("status") == "fail" and dimension_hard_gate(name, value)]
+    if evaluation.get("hard_gate_status") == "fail" or hard_failed:
+        return "hard_fail"
+    if evaluation.get("outcome") == "fail" or failed:
+        return "fail"
+    if judge_cell_is_clean(evaluation):
+        return "pass"
+    return "unknown"
 
 
 def judge_cell_failure(evaluation: dict[str, Any]) -> dict[str, Any]:
@@ -4413,7 +4546,7 @@ def judge_cell_failure(evaluation: dict[str, Any]) -> dict[str, Any]:
         for name, value in dimensions.items():
             if not isinstance(value, dict) or value.get("status") not in ("fail", "unknown"):
                 continue
-            hard_gate = value["hard_gate"] if isinstance(value.get("hard_gate"), bool) else name in HARD_GATE_DIMENSIONS
+            hard_gate = dimension_hard_gate(name, value)
             ranked.append((
                 0 if value.get("status") == "fail" else 1,
                 0 if hard_gate else 1,
@@ -4445,13 +4578,98 @@ def judge_cell_failure(evaluation: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def identity_label(role: str, model: str, thinking: str | None) -> str:
+    """Render an identity exactly as the ranked lines do, so lead prose and rankings agree."""
+    return f"`{role}` / `{model}` / `{thinking or '-'}`"
+
+
+def evidence_phrase(noun: str, tally: dict[str, int], failure: dict[str, Any] | None) -> str:
+    """One clause stating why an identity sits where it does on its strongest available evidence."""
+    fails = tally["hard_fail"] + tally["fail"]
+    if fails and failure is not None:
+        tag = ""
+        if failure["dimension"]:
+            tag = f" ({failure['dimension']}{', hard gate' if failure['hard_gate'] else ''})"
+        return f"{noun} {fails} fail{tag}: {failure['reason']}"
+    parts = []
+    if tally["pass"]:
+        parts.append(f"{tally['pass']} clean pass" + ("es" if tally["pass"] != 1 else ""))
+    if tally["unknown"]:
+        parts.append(f"{tally['unknown']} unknown")
+    if not parts:
+        return f"no {noun} cells recorded"
+    return f"no {noun} fails; " + " / ".join(parts)
+
+
+def conclusions_lead(entries: list[dict[str, Any]]) -> list[str]:
+    """Name the top identity with the evidence behind its rank, or state that no identity stands out."""
+    best = entries[0]
+    noun = best["noun"]
+    judge_fields = ("hard_fails", "fails", "passes", "unknowns", "noun")
+
+    def judge_record(entry: dict[str, Any]) -> tuple[Any, ...]:
+        return tuple(entry[field] for field in judge_fields)
+
+    def full_record(entry: dict[str, Any]) -> tuple[Any, ...]:
+        return (entry["tier"], *judge_record(entry))
+
+    others = entries[1:]
+    if others and all(full_record(entry) == full_record(best) for entry in others):
+        return [
+            f"No identity is distinguishable on {noun} evidence: all {len(entries)} identities share the same record "
+            f"({best['evidence_phrase']}); rank order follows execution errors, then p50 latency."
+        ]
+    lead = [f"Top pick: {best['label']} — {best['reason']}"]
+    clauses: list[str] = []
+    if others and all(judge_record(entry) == judge_record(best) for entry in others):
+        clauses.append(
+            f"every identity shares the same {noun} record ({best['evidence_phrase']}), so only the recommendation "
+            "status, execution errors, and latency separate them"
+        )
+    elif others:
+        rival_passes = max(entry["passes"] for entry in others)
+        if best["passes"] > rival_passes:
+            clauses.append(
+                f"the only identity with a clean {noun} pass ({best['passes']} of {best['cells']} cells)"
+                if rival_passes == 0
+                else f"leads on clean {noun} passes ({best['passes']} vs {rival_passes})"
+            )
+        for entry in others:
+            if entry["hard_fails"]:
+                clauses.append(f"{entry['label']} failed the {noun} hard gate ({', '.join(entry['hard_fail_dimensions'])})")
+            elif entry["fails"]:
+                clauses.append(f"{entry['label']} recorded {entry['fails']} {noun} fail(s) outside the hard gate")
+        worst_unknowns = max(entry["unknowns"] for entry in others)
+        if best["unknowns"] < worst_unknowns:
+            clauses.append(f"fewest unresolved cells at rank 1 ({best['unknowns']} unknown vs {worst_unknowns})")
+    if clauses:
+        lead.append("Evidence: " + "; ".join(clauses) + ".")
+    cost_edge = None
+    priced = [entry for entry in entries if entry["cost"] is not None]
+    if len(priced) > 1 and best["cost"] is not None and all(best["cost"] <= entry["cost"] for entry in priced) and any(best["cost"] < entry["cost"] for entry in priced):
+        rival_costs = ", ".join("$%.6f" % entry["cost"] for entry in priced if entry["label"] != best["label"])
+        cost_edge = f"lowest observed cost (${best['cost']:.6f} vs {rival_costs})"
+    latency_edge = None
+    measured = [entry for entry in entries if entry["p50"] is not None]
+    if len(measured) > 1 and best["p50"] is not None and all(best["p50"] <= entry["p50"] for entry in measured) and any(best["p50"] < entry["p50"] for entry in measured):
+        rival_latency = ", ".join(f"{entry['p50']:.1f} ms" for entry in measured if entry["label"] != best["label"])
+        latency_edge = f"fastest p50 latency ({best['p50']:.1f} ms vs {rival_latency})"
+    if cost_edge and latency_edge:
+        lead.append(f"Cost and latency: {cost_edge}; {latency_edge}.")
+    elif cost_edge:
+        lead.append(f"Cost: {cost_edge}.")
+    elif latency_edge:
+        lead.append(f"Latency: {latency_edge}.")
+    return lead
+
+
 def build_conclusions(
     rows: list[dict[str, Any]],
     evaluations: list[dict[str, Any]],
     judge_evaluations: list[dict[str, Any]],
     recommendations: dict[str, Any] | None,
-) -> list[dict[str, Any]]:
-    """Lead the report with verdicts: execution and judge tallies plus why every non-pass judge cell fell short."""
+) -> dict[str, Any]:
+    """Rank identities by recommendability and justify the top pick; the detail sections keep the tallies."""
     row_groups: dict[tuple[str, str, str], list[dict[str, Any]]] = defaultdict(list)
     deterministic_groups: dict[tuple[str, str, str], list[dict[str, Any]]] = defaultdict(list)
     judge_groups: dict[tuple[str, str, str], list[dict[str, Any]]] = defaultdict(list)
@@ -4472,62 +4690,42 @@ def build_conclusions(
         for item in recommendation_source.get("roles", [])
         if isinstance(item, dict) and item.get("status") == "recommended"
     }
-    dimension_rank = {dimension: index for index, dimension in enumerate(EVALUATION_DIMENSIONS)}
-    conclusions = []
+    entries = []
     for role, model, thinking in sorted(set(row_groups) | set(deterministic_groups) | set(judge_groups)):
         key = (role, model, thinking)
         execution_values = row_groups[key]
         deterministic_values = deterministic_groups[key]
         judge_values = sorted(judge_groups[key], key=lambda value: (str(value.get("task_id")), numeric_sort_key(value.get("replicate"))))
-        execution = {
-            "runs": len(execution_values),
-            "pass": sum(value.get("status") == "pass" for value in execution_values),
-            "error": sum(value.get("status") != "pass" for value in execution_values),
-        }
-        deterministic = {
-            "evaluations": len(deterministic_values),
-            "pass": sum(value.get("outcome") == "pass" for value in deterministic_values),
-            "fail": sum(value.get("outcome") == "fail" for value in deterministic_values),
-            "unknown": sum(value.get("outcome") == "unknown" for value in deterministic_values),
-            "hard_gate_failures": sum(value.get("hard_gate_status") == "fail" for value in deterministic_values),
-        }
-        failed_counts: dict[str, int] = defaultdict(int)
-        for value in deterministic_values:
-            dimensions = value.get("dimensions")
-            if not isinstance(dimensions, dict):
-                continue
-            for name, dimension in dimensions.items():
-                if isinstance(dimension, dict) and dimension.get("status") == "fail":
-                    failed_counts[name] += 1
-        deterministic["failed_dimensions"] = [
-            {"dimension": name, "count": count}
-            for name, count in sorted(
-                failed_counts.items(),
-                key=lambda item: (-item[1], dimension_rank.get(item[0], len(EVALUATION_DIMENSIONS)), item[0]),
-            )
-        ]
-        fixed_judge = {
-            "evaluations": len(judge_values),
-            "pass": sum(value.get("outcome") == "pass" for value in judge_values),
-            "fail": sum(value.get("outcome") == "fail" for value in judge_values),
-            "unknown": sum(value.get("outcome") == "unknown" for value in judge_values),
-            "hard_gate_failures": sum(value.get("hard_gate_status") == "fail" for value in judge_values),
-            "hard_gate_unknown": sum(value.get("hard_gate_status") == "unknown" for value in judge_values),
-        } if judge_values else None
-        reasons = []
-        for value in judge_values:
-            if judge_cell_is_clean(value):
-                continue
-            failure = judge_cell_failure(value)
-            reasons.append({
-                "task_id": value.get("task_id"),
-                "replicate": value.get("replicate"),
-                "outcome": value.get("outcome") or "unknown",
-                "dimension": failure["dimension"],
-                "hard_gate": failure["hard_gate"],
-                "reason": failure["reason"],
+        evidence_values = judge_values or deterministic_values
+        noun = "judge" if judge_values else "deterministic"
+        tally = {"hard_fail": 0, "fail": 0, "pass": 0, "unknown": 0}
+        verdicts = [(value, evaluation_cell_verdict(value)) for value in evidence_values]
+        for _, verdict in verdicts:
+            tally[verdict] += 1
+        failures = [(value, verdict) for value, verdict in verdicts if verdict in ("hard_fail", "fail")]
+        failure = None
+        hard_fail_dimensions: list[str] = []
+        if failures:
+            worst = min(failures, key=lambda item: (
+                0 if item[1] == "hard_fail" else 1,
+                str(item[0].get("task_id")),
+                numeric_sort_key(item[0].get("replicate")),
+            ))
+            failure = judge_cell_failure(worst[0])
+            hard_fail_dimensions = sorted({
+                name
+                for value, verdict in failures
+                if verdict == "hard_fail"
+                for name, dimension in (value.get("dimensions") or {}).items()
+                if isinstance(dimension, dict) and dimension.get("status") == "fail" and dimension_hard_gate(name, dimension)
             })
-        all_judge_dimensions_passed = bool(judge_values) and not reasons and not deterministic["failed_dimensions"]
+        execution_errors = sum(value.get("status") != "pass" for value in execution_values)
+        if evidence_values:
+            phrase = evidence_phrase(noun, tally, failure)
+        elif execution_values:
+            phrase = "no evaluation rows recorded"
+        else:
+            phrase = "no rows recorded"
         winner = winners.get(key)
         candidate = candidates.get(key)
         winner_candidate = winner.get("candidate") if winner is not None and isinstance(winner.get("candidate"), dict) else None
@@ -4538,89 +4736,79 @@ def build_conclusions(
             else None
         )
         if winner is not None:
-            recommendation = {
-                "status": "recommended",
-                "reason": single_line_reason(winner.get("reason") or "eligible with the strongest evidence"),
-                "eligible": True,
-                "quality_score": quality_score,
-                "blocked_reasons": [],
-            }
+            status = "recommended"
+            status_reason = single_line_reason(winner.get("reason") or "eligible with the strongest evidence")
         elif candidate is not None:
-            blocked_reasons = [str(reason) for reason in candidate.get("blocked_reasons", []) if str(reason).strip()]
-            eligible = bool(candidate.get("eligible"))
-            recommendation = {
-                "status": "eligible" if eligible else "blocked",
-                "reason": single_line_reason("; ".join(blocked_reasons)) if blocked_reasons else "eligible; not the top-ranked candidate for this role",
-                "eligible": eligible,
-                "quality_score": quality_score,
-                "blocked_reasons": blocked_reasons,
-            }
+            blocked_reasons = [str(item) for item in candidate.get("blocked_reasons", []) if str(item).strip()]
+            status = "eligible" if candidate.get("eligible") else "blocked"
+            status_reason = single_line_reason("; ".join(blocked_reasons)) if blocked_reasons else "eligible; not the top-ranked candidate for this role"
         else:
-            recommendation = None
-        verdict_parts = []
-        if execution["runs"]:
-            verdict_parts.append(f"execution {execution['pass']} pass / {execution['error']} error")
-        if deterministic["evaluations"]:
-            verdict_parts.append(
-                f"deterministic evaluations {deterministic['pass']} pass / {deterministic['fail']} fail / {deterministic['unknown']} unknown"
-            )
-        if fixed_judge is not None:
-            hard_gate = (
-                f"{fixed_judge['hard_gate_failures']} fail / {fixed_judge['hard_gate_unknown']} unknown"
-                if fixed_judge["hard_gate_failures"] or fixed_judge["hard_gate_unknown"]
-                else "pass"
-            )
-            verdict_parts.append(
-                f"fixed judge {fixed_judge['pass']} pass / {fixed_judge['fail']} fail / {fixed_judge['unknown']} unknown"
-                f" (hard gate {hard_gate})"
-            )
-        conclusions.append({
+            status = None
+            status_reason = ""
+        if status is None:
+            reason = phrase
+        else:
+            quality = f" (quality {quality_score:.2f})" if quality_score is not None else ""
+            reason = f"`{status}`{quality} — {status_reason}; {phrase}"
+        latency = [float(value["latency_ms"]) for value in execution_values if isinstance(value.get("latency_ms"), (int, float))]
+        costs = [cost for value in execution_values if (cost := extract_cost(value.get("usage"))) is not None]
+        entries.append({
             "role": role,
             "model": model,
             "thinking": thinking or None,
-            "verdict": ("; ".join(verdict_parts) + ".") if verdict_parts else "No execution or evaluation rows were recorded.",
-            "execution": execution,
-            "deterministic": deterministic,
-            "fixed_judge": fixed_judge,
-            "recommendation": recommendation,
-            "reasons": reasons,
-            "all_judge_dimensions_passed": all_judge_dimensions_passed,
+            "label": identity_label(role, model, thinking),
+            "tier": 0 if status == "recommended" else 1 if status == "eligible" else 2,
+            "hard_fails": tally["hard_fail"],
+            "fails": tally["hard_fail"] + tally["fail"],
+            "passes": tally["pass"],
+            "unknowns": tally["unknown"],
+            "cells": len(evidence_values),
+            "noun": noun,
+            "hard_fail_dimensions": hard_fail_dimensions,
+            "evidence_phrase": phrase,
+            "errors": execution_errors,
+            "p50": percentile(latency, 0.5),
+            "cost": round(sum(costs), 8) if execution_values and len(costs) == len(execution_values) else None,
+            "reason": reason,
         })
-    return conclusions
+    entries.sort(key=lambda entry: (
+        entry["tier"],
+        entry["hard_fails"],
+        entry["fails"],
+        -entry["passes"],
+        entry["unknowns"],
+        entry["errors"],
+        entry["p50"] if entry["p50"] is not None else float("inf"),
+        entry["role"],
+        entry["model"],
+        entry["thinking"] or "",
+    ))
+    ranked = [
+        {
+            "rank": rank,
+            "role": entry["role"],
+            "model": entry["model"],
+            "thinking": entry["thinking"],
+            "reason": entry["reason"],
+        }
+        for rank, entry in enumerate(entries, start=1)
+    ]
+    return {"lead": conclusions_lead(entries) if entries else [], "ranked": ranked}
 
 
-def render_conclusions(conclusions: list[dict[str, Any]]) -> list[str]:
-    """Render the conclusions section that leads the report, ending with a blank separator line."""
+def render_conclusions(conclusions: dict[str, Any]) -> list[str]:
+    """Render the recommendation rationale that leads the report, ending with a blank separator line."""
+    lead = conclusions["lead"]
+    ranked = conclusions["ranked"]
     lines = ["## Conclusions", ""]
-    if not conclusions:
+    if not lead and not ranked:
         return [*lines, "No execution, evaluation, or fixed-judge rows were recorded for this run.", ""]
-    lines.extend([
-        "Verdicts come first: each identity lists execution and fixed-judge tallies, then every non-pass judge cell "
-        "with its reason. The detail tables below are unchanged.",
-        "",
-    ])
-    for item in conclusions:
-        lines.extend([f"### `{item['role']}` / `{item['model']}` / `{item['thinking'] or '-'}`", ""])
-        recommendation = item["recommendation"]
-        if recommendation:
-            quality = f" (quality {recommendation['quality_score']:.2f})" if recommendation["quality_score"] is not None else ""
-            lines.append(f"- Recommendation: `{recommendation['status']}` — {recommendation['reason']}{quality}")
-        lines.append(f"- Verdict: {item['verdict']}")
-        for reason in item["reasons"]:
-            suffix = ""
-            if reason["dimension"]:
-                tags = f"`{reason['dimension']}`{', hard gate' if reason['hard_gate'] else ''}"
-                suffix = f" ({tags})"
-            lines.append(
-                f"- `{reason['task_id']}` replicate {reason['replicate']}{suffix}: `{reason['outcome']}` — {reason['reason']}"
-            )
-        failed_dimensions = item["deterministic"]["failed_dimensions"]
-        if failed_dimensions:
-            summary = ", ".join(f"`{entry['dimension']}` x{entry['count']}" for entry in failed_dimensions)
-            lines.append(f"- Deterministic dimension failures: {summary}")
-        if item["all_judge_dimensions_passed"]:
-            lines.append("- All judge dimensions passed.")
+    lines.extend(f"- {bullet}" for bullet in lead)
+    if lead and ranked:
         lines.append("")
+    for item in ranked:
+        lines.append(f"{item['rank']}. {identity_label(item['role'], item['model'], item['thinking'])} — {item['reason']}")
+    lines.append("")
     return lines
 
 

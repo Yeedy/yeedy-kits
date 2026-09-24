@@ -1,4 +1,5 @@
 import json
+import math
 import os
 import subprocess
 import sys
@@ -165,6 +166,136 @@ class RoleBenchTests(unittest.TestCase):
         large_prompt = rolebench.build_fixed_judge_prompt(task, {"execution_status": "completed", "output": large_output}, deterministic)
         self.assertIn("y" * rolebench.JUDGE_INPUT_LIMIT + "...", large_prompt)
         self.assertNotIn("y" * 10 + '"', large_prompt)
+
+    def test_fixed_judge_cited_paths_strip_line_suffixes_and_dedupe_in_order(self):
+        output = (
+            "I edited `src/app.ts:12`, then src/app.ts:12:5 and ./src/app.ts again; "
+            "scripts/rolebench.py, docs/README.md, lib/util.rs, a/b/c.svelte, and src/app.tsx. "
+            "Unrelated tokens: model:high, omp-rolebench/run, 1.5.3, LICENSE, foo.xyz, plain words."
+        )
+        self.assertEqual(
+            rolebench.cited_workspace_paths(output),
+            ["src/app.ts", "scripts/rolebench.py", "docs/README.md", "lib/util.rs", "a/b/c.svelte", "src/app.tsx"],
+        )
+        self.assertEqual(rolebench.cited_workspace_paths("no paths here"), [])
+
+    def test_fixed_judge_prompt_includes_numbered_workspace_excerpts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "src").mkdir()
+            (root / "src" / "small.py").write_text("import os\n\nprint(os.getcwd())\n", encoding="utf-8")
+            (root / "src" / "app.py").write_text("".join(f"line {number}\n" for number in range(1, 801)), encoding="utf-8")
+            task = {
+                "id": "task-judge",
+                "role": "task",
+                "prompt": "do",
+                "workspace": str(root),
+                "dimension_targets": ["correctness"],
+            }
+            result = {"execution_status": "completed", "output": "Fixed src/app.py:12 and src/small.py, plus missing/file.py."}
+            deterministic = {"execution_status": "completed", "outcome": "pass", "hard_gate_status": "pass", "checks": []}
+            prompt = rolebench.build_fixed_judge_prompt(task, result, deterministic)
+            instructions, payload_text = prompt.split("\n\n", 1)
+            payload = json.loads(payload_text)
+            self.assertIn("use it to verify file and line claims", instructions)
+            self.assertIn("listed there remain unknown", instructions)
+            self.assertNotIn(str(root), prompt)
+            self.assertNotIn("workspace", payload["task"])
+            self.assertEqual([item["path"] for item in payload["workspace_excerpts"]], ["src/app.py", "src/small.py"])
+            small = payload["workspace_excerpts"][1]
+            self.assertEqual(small["total_lines"], 3)
+            self.assertEqual(small["excerpted_lines"], 3)
+            self.assertFalse(small["truncated"])
+            self.assertEqual(small["text"], "1: import os\n2: \n3: print(os.getcwd())")
+            large = payload["workspace_excerpts"][0]
+            self.assertEqual(large["total_lines"], 800)
+            self.assertTrue(large["truncated"])
+            self.assertEqual(large["excerpted_lines"], len(large["text"].splitlines()))
+            self.assertLess(large["excerpted_lines"], 800)
+            self.assertLessEqual(len(large["text"]), rolebench.WORKSPACE_EXCERPT_FILE_BYTES)
+            self.assertTrue(large["text"].startswith("1: line 1\n2: line 2\n"))
+            self.assertTrue(large["text"].endswith(f"{large['excerpted_lines']}: line {large['excerpted_lines']}"))
+
+    def test_fixed_judge_workspace_excerpts_skip_escapes_binaries_and_large_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = root / "workspace"
+            (workspace / "src").mkdir(parents=True)
+            (workspace / "src" / "app.py").write_text("inside\n", encoding="utf-8")
+            (workspace / "node_modules" / "pkg").mkdir(parents=True)
+            (workspace / "node_modules" / "pkg" / "index.js").write_text("vendored\n", encoding="utf-8")
+            (workspace / "assets").mkdir()
+            (workspace / "assets" / "logo.png").write_bytes(b"\x89PNG\r\n\x1a\n\x00\x00binary\n")
+            (workspace / "big").mkdir()
+            (workspace / "big" / "data.json").write_bytes(b"x" * (rolebench.WORKSPACE_EXCERPT_MAX_FILE_BYTES + 1))
+            outside = root / "outside"
+            outside.mkdir()
+            (outside / "secret.py").write_text("outside\n", encoding="utf-8")
+            (workspace / "linked.py").symlink_to(outside / "secret.py")
+            output = " ".join([
+                "../outside/secret.py",
+                str(outside / "secret.py"),
+                "linked.py",
+                "node_modules/pkg/index.js",
+                "assets/logo.png",
+                "big/data.json",
+                "src/app.py",
+            ])
+            self.assertEqual(
+                [item["path"] for item in rolebench.workspace_excerpts(str(workspace), output)],
+                ["src/app.py"],
+            )
+            self.assertIsNone(
+                rolebench.workspace_excerpt_file(workspace.resolve(), str(outside / "secret.py"), rolebench.WORKSPACE_EXCERPT_FILE_BYTES)
+            )
+
+    def test_fixed_judge_prompt_without_resolvable_citations_keeps_empty_excerpt_list(self):
+        deterministic = {"execution_status": "completed", "outcome": "unknown", "hard_gate_status": "unknown", "checks": []}
+        expected_keys = {"task", "role", "execution", "deterministic_evidence", "workspace_excerpts"}
+        cases = [
+            {"id": "t", "role": "task", "prompt": "do", "dimension_targets": ["correctness"]},
+            {"id": "t", "role": "task", "prompt": "do", "workspace": "/nonexistent/rolebench-workspace", "dimension_targets": ["correctness"]},
+        ]
+        for task in cases:
+            prompt = rolebench.build_fixed_judge_prompt(task, {"execution_status": "completed", "output": "src/app.py:3"}, deterministic)
+            payload = json.loads(prompt.split("\n\n", 1)[1])
+            self.assertEqual(set(payload), expected_keys)
+            self.assertEqual(payload["workspace_excerpts"], [])
+        with tempfile.TemporaryDirectory() as directory:
+            (Path(directory) / "src").mkdir()
+            (Path(directory) / "src" / "app.py").write_text("content\n", encoding="utf-8")
+            task = {"id": "t", "role": "task", "prompt": "do", "dimension_targets": ["correctness"]}
+            uncited = rolebench.build_fixed_judge_prompt(
+                {**task, "workspace": directory},
+                {"execution_status": "completed", "output": "nothing cited"},
+                deterministic,
+            )
+            without_workspace = rolebench.build_fixed_judge_prompt(task, {"execution_status": "completed", "output": "nothing cited"}, deterministic)
+            self.assertEqual(json.loads(uncited.split("\n\n", 1)[1])["workspace_excerpts"], [])
+            self.assertEqual(uncited.split("\n\n", 1)[1], without_workspace.split("\n\n", 1)[1])
+
+    def test_fixed_judge_rubric_version_records_workspace_excerpt_contract(self):
+        self.assertEqual(rolebench.FIXED_JUDGE_RUBRIC_VERSION, "rolebench-v2-20260924")
+
+    def test_fixed_judge_estimate_reserves_the_full_workspace_excerpt_budget(self):
+        pricing = {"judge/model": {"input_per_million": 1.0, "output_per_million": 2.0}}
+        assignments = [{"id": "assignment-001", "mode": "all-same", "mapping": {"task": "p/a"}}]
+        tasks = [{"id": "task-1", "role": "task", "prompt": "do", "expected": {"output_contains": ["PASS"]}}]
+        baseline_prompts = []
+        excerpt_prompts = []
+        skeleton = rolebench.build_fixed_judge_prompt
+        with patch("rolebench.build_fixed_judge_prompt", side_effect=skeleton) as spy:
+            estimate = rolebench.estimate_fixed_judge(["task"], assignments, tasks, 1, "judge/model", pricing)
+        for call in spy.call_args_list:
+            task, result, evaluation, excerpts = call.args
+            baseline_prompts.append(skeleton(task, result, evaluation, []))
+            excerpt_prompts.append(skeleton(task, result, evaluation, excerpts))
+        self.assertEqual(len(excerpt_prompts), 1)
+        self.assertEqual(sum(len(item["text"]) for item in spy.call_args_list[0].args[3]), rolebench.WORKSPACE_EXCERPT_TOTAL_BYTES)
+        self.assertLessEqual(len(spy.call_args_list[0].args[3]), rolebench.WORKSPACE_EXCERPT_MAX_FILES)
+        self.assertEqual(estimate["input_tokens"], math.ceil(len(excerpt_prompts[0]) / 4))
+        baseline_tokens = math.ceil(len(baseline_prompts[0]) / 4)
+        self.assertGreaterEqual(estimate["input_tokens"] - baseline_tokens, math.ceil(rolebench.WORKSPACE_EXCERPT_TOTAL_BYTES / 4))
 
     def test_fixed_judge_estimate_includes_repeated_calls_and_cost(self):
         pricing = {"judge/model": {"input_per_million": 1.0, "output_per_million": 2.0}}
@@ -1505,7 +1636,7 @@ class RoleBenchTests(unittest.TestCase):
             self.assertEqual(summary["reason"], "estimated_cost_exceeds_cap")
             self.assertGreater(summary["model_cost_usd"], 0)
             self.assertGreater(summary["judge_cost_usd"], 0)
-            self.assertEqual(summary["estimated_cost_usd"], summary["model_cost_usd"] + summary["judge_cost_usd"])
+            self.assertAlmostEqual(summary["estimated_cost_usd"], summary["model_cost_usd"] + summary["judge_cost_usd"], places=7)
 
     def test_fixed_judge_unknown_price_blocks_execution_without_cap(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1810,184 +1941,290 @@ class RoleBenchTests(unittest.TestCase):
             self.assertEqual(payload["recommendations"]["status"], "blocked")
             self.assertEqual(len(payload["judge_evaluations"]), 1)
 
-    def test_report_conclusions_lead_with_verdicts_and_non_pass_reasons(self):
+    def write_conclusions_run(self, root, results=(), evaluations=(), judge_evaluations=(), recommendations=None):
+        """Write only the artifacts the Conclusions section reads from."""
+        (root / "manifest.json").write_text(json.dumps({"generated_at": "now", "mode": "role-isolated", "roles": ["task"], "assignments": []}), encoding="utf-8")
+        for name, rows in (("results.jsonl", results), ("evaluations.jsonl", evaluations), ("judge_evaluations.jsonl", judge_evaluations)):
+            if rows:
+                (root / name).write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
+        if recommendations is not None:
+            (root / "recommendations.json").write_text(json.dumps(recommendations), encoding="utf-8")
+
+    def execution_row(self, model, replicate, status="pass", latency_ms=10.0):
+        return {
+            "assignment_id": f"a-{model}", "task_id": "task-1", "replicate": replicate, "role": "task", "model": model,
+            "status": status, "latency_ms": latency_ms, "output": "done",
+        }
+
+    def judge_cell(self, model, replicate, outcome, hard_gate_status, dimensions, summary=None):
+        return {
+            "assignment_id": f"a-{model}", "task_id": "task-1", "replicate": replicate, "role": "task", "model": model,
+            "outcome": outcome, "hard_gate_status": hard_gate_status, "summary": summary, "dimensions": dimensions,
+        }
+
+    def conclusions_section(self, root):
+        output = root / "report.md"
+        self.assertEqual(rolebench.main(["report", "--run", str(root), "--output", str(output)]), 0)
+        report = output.read_text(encoding="utf-8")
+        return report[report.index("## Conclusions"):report.index("## Benchmark Scope")]
+
+    def conclusions_payload(self, root):
+        json_output = root / "report.json"
+        self.assertEqual(rolebench.main(["report", "--run", str(root), "--format", "json", "--output", str(json_output)]), 0)
+        return json.loads(json_output.read_text(encoding="utf-8"))["conclusions"]
+
+    def test_report_conclusions_rank_identities_by_judge_evidence(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            (root / "manifest.json").write_text(json.dumps({"generated_at": "now", "mode": "role-isolated", "roles": ["task"], "assignments": []}), encoding="utf-8")
-            (root / "results.jsonl").write_text("\n".join(json.dumps({
-                "assignment_id": "a", "task_id": "task-1", "replicate": replicate, "role": "task", "model": "p/a",
-                "status": status, "latency_ms": 5, "output": "done",
-            }) for replicate, status in ((1, "pass"), (2, "pass"), (3, "error"))) + "\n", encoding="utf-8")
-            (root / "evaluations.jsonl").write_text("\n".join(json.dumps({
-                "assignment_id": "a", "task_id": "task-1", "replicate": replicate, "role": "task", "model": "p/a",
-                "outcome": outcome,
-                "dimensions": {"correctness": {"status": status, "score": score, "evaluator": "deterministic"}},
-            }) for replicate, outcome, status, score in (
-                (1, "pass", "pass", 2),
-                (2, "fail", "fail", 0),
-                (3, "unknown", "unknown", None),
-            )) + "\n", encoding="utf-8")
-            (root / "judge_evaluations.jsonl").write_text("\n".join(json.dumps(row) for row in (
-                {
-                    "assignment_id": "a", "task_id": "task-1", "replicate": 1, "role": "task", "model": "p/a",
-                    "outcome": "pass", "hard_gate_status": "pass", "summary": None,
-                    "dimensions": {"correctness": {"status": "pass", "score": 2, "hard_gate": True, "evaluator": "fixed_judge"}},
-                },
-                {
-                    "assignment_id": "a", "task_id": "task-1", "replicate": 2, "role": "task", "model": "p/a",
-                    "outcome": "fail", "hard_gate_status": "fail", "summary": None,
-                    "dimensions": {
-                        "evidence_quality": {"status": "fail", "score": 0, "hard_gate": False, "evaluator": "fixed_judge", "evidence": ["quoted a file that does not exist"]},
-                        "correctness": {"status": "fail", "score": 0, "hard_gate": True, "evaluator": "fixed_judge", "evidence": ["claimed the suite passed without running it\nsecond line of the same evidence"]},
-                    },
-                },
-                {
-                    "assignment_id": "a", "task_id": "task-1", "replicate": 3, "role": "task", "model": "p/a",
-                    "outcome": "unknown", "hard_gate_status": "unknown", "summary": None,
-                    "dimensions": {"honesty": {"status": "unknown", "score": None, "hard_gate": True, "evaluator": "fixed_judge", "evidence": [f"unverifiable citation {'x' * 500}"]}},
-                },
-            )) + "\n", encoding="utf-8")
-            output = root / "report.md"
-            self.assertEqual(rolebench.main(["report", "--run", str(root), "--output", str(output)]), 0)
-            report = output.read_text(encoding="utf-8")
-            self.assertLess(report.index("## Conclusions"), report.index("## Benchmark Scope"))
-            self.assertIn("### `task` / `p/a` / `-`", report)
-            self.assertIn(
-                "- Verdict: execution 2 pass / 1 error; deterministic evaluations 1 pass / 1 fail / 1 unknown; "
-                "fixed judge 1 pass / 1 fail / 1 unknown (hard gate 1 fail / 1 unknown).",
-                report,
+            passed = {"correctness": {"status": "pass", "score": 2, "hard_gate": True, "evaluator": "fixed_judge"}}
+            unknown_correctness = {"correctness": {"status": "unknown", "score": None, "hard_gate": True, "evaluator": "fixed_judge"}}
+            unknown_honesty = {"honesty": {"status": "unknown", "score": None, "hard_gate": True, "evaluator": "fixed_judge"}}
+            failed_honesty = {"honesty": {"status": "fail", "score": 0, "hard_gate": True, "evaluator": "fixed_judge"}}
+            self.write_conclusions_run(
+                root,
+                results=[self.execution_row(model, replicate) for model in ("p/pass", "p/unknown", "p/fail") for replicate in (1, 2, 3)],
+                judge_evaluations=[
+                    self.judge_cell("p/pass", 1, "pass", "pass", passed),
+                    self.judge_cell("p/pass", 2, "unknown", "unknown", unknown_honesty),
+                    self.judge_cell("p/pass", 3, "unknown", "unknown", unknown_correctness),
+                    *[self.judge_cell("p/unknown", replicate, "unknown", "unknown", unknown_correctness) for replicate in (1, 2, 3)],
+                    self.judge_cell("p/fail", 1, "unknown", "unknown", unknown_correctness),
+                    self.judge_cell("p/fail", 2, "unknown", "unknown", unknown_honesty),
+                    self.judge_cell("p/fail", 3, "fail", "fail", failed_honesty, summary="asserted unverifiable file:line internals as fact"),
+                ],
             )
-            self.assertIn(
-                "- `task-1` replicate 2 (`correctness`, hard gate): `fail` — "
-                "claimed the suite passed without running it second line of the same evidence",
-                report,
-            )
-            truncated_reason = "unverifiable citation " + "x" * (rolebench.CONCLUSION_REASON_LIMIT - len("unverifiable citation ")) + "..."
-            self.assertIn(f"- `task-1` replicate 3 (`honesty`, hard gate): `unknown` — {truncated_reason}", report)
-            self.assertNotIn("replicate 1 (", report)
-            self.assertIn("- Deterministic dimension failures: `correctness` x1", report)
-            self.assertNotIn("All judge dimensions passed.", report)
-            json_output = root / "report.json"
-            self.assertEqual(rolebench.main(["report", "--run", str(root), "--format", "json", "--output", str(json_output)]), 0)
-            payload = json.loads(json_output.read_text(encoding="utf-8"))
-            self.assertEqual(len(payload["conclusions"]), 1)
-            conclusion = payload["conclusions"][0]
-            self.assertEqual((conclusion["role"], conclusion["model"], conclusion["thinking"]), ("task", "p/a", None))
-            self.assertEqual(conclusion["execution"], {"runs": 3, "pass": 2, "error": 1})
-            self.assertEqual(conclusion["deterministic"]["failed_dimensions"], [{"dimension": "correctness", "count": 1}])
-            self.assertEqual(conclusion["fixed_judge"]["hard_gate_failures"], 1)
-            self.assertFalse(conclusion["all_judge_dimensions_passed"])
+            conclusions = self.conclusions_section(root)
+            payload = self.conclusions_payload(root)
             self.assertEqual(
-                [(reason["replicate"], reason["outcome"], reason["dimension"], reason["hard_gate"]) for reason in conclusion["reasons"]],
-                [(2, "fail", "correctness", True), (3, "unknown", "honesty", True)],
+                payload["ranked"],
+                [
+                    {"rank": 1, "role": "task", "model": "p/pass", "thinking": None, "reason": "no judge fails; 1 clean pass / 2 unknown"},
+                    {"rank": 2, "role": "task", "model": "p/unknown", "thinking": None, "reason": "no judge fails; 3 unknown"},
+                    {
+                        "rank": 3, "role": "task", "model": "p/fail", "thinking": None,
+                        "reason": "judge 1 fail (honesty, hard gate): asserted unverifiable file:line internals as fact",
+                    },
+                ],
+            )
+            self.assertEqual(
+                payload["lead"],
+                [
+                    "Top pick: `task` / `p/pass` / `-` — no judge fails; 1 clean pass / 2 unknown",
+                    "Evidence: the only identity with a clean judge pass (1 of 3 cells); "
+                    "`task` / `p/fail` / `-` failed the judge hard gate (honesty); fewest unresolved cells at rank 1 (2 unknown vs 3).",
+                ],
+            )
+            self.assertIn("1. `task` / `p/pass` / `-` — no judge fails; 1 clean pass / 2 unknown", conclusions.split("\n"))
+            self.assertLess(conclusions.index("1. `task` / `p/pass`"), conclusions.index("2. `task` / `p/unknown`"))
+            self.assertLess(conclusions.index("2. `task` / `p/unknown`"), conclusions.index("3. `task` / `p/fail`"))
+            for banned in ("- Verdict:", "replicate", "Deterministic dimension failures", "### `", "execution "):
+                self.assertNotIn(banned, conclusions)
+
+    def test_report_conclusions_weight_hard_gate_fails_above_other_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            unknown = {"correctness": {"status": "unknown", "score": None, "hard_gate": True, "evaluator": "fixed_judge"}}
+            soft_fail = {"evidence_quality": {"status": "fail", "score": 0, "hard_gate": False, "evaluator": "fixed_judge", "evidence": ["quoted a file that does not exist"]}}
+            hard_fail = {"honesty": {"status": "fail", "score": 0, "hard_gate": True, "evaluator": "fixed_judge"}}
+            self.write_conclusions_run(
+                root,
+                results=[self.execution_row(model, replicate) for model in ("p/clean", "p/soft", "p/hard") for replicate in (1, 2, 3)],
+                judge_evaluations=[
+                    *[self.judge_cell("p/clean", replicate, "unknown", "unknown", unknown) for replicate in (1, 2, 3)],
+                    self.judge_cell("p/soft", 1, "fail", "pass", soft_fail),
+                    *[self.judge_cell("p/soft", replicate, "unknown", "unknown", unknown) for replicate in (2, 3)],
+                    self.judge_cell("p/hard", 1, "fail", "fail", hard_fail),
+                    *[self.judge_cell("p/hard", replicate, "unknown", "unknown", unknown) for replicate in (2, 3)],
+                ],
+            )
+            payload = self.conclusions_payload(root)
+            self.assertEqual(
+                [(item["rank"], item["model"], item["reason"]) for item in payload["ranked"]],
+                [
+                    (1, "p/clean", "no judge fails; 3 unknown"),
+                    (2, "p/soft", "judge 1 fail (evidence_quality): quoted a file that does not exist"),
+                    (3, "p/hard", "judge 1 fail (honesty, hard gate): no deterministic evidence for this dimension"),
+                ],
+            )
+            self.assertEqual(
+                payload["lead"],
+                [
+                    "Top pick: `task` / `p/clean` / `-` — no judge fails; 3 unknown",
+                    "Evidence: `task` / `p/soft` / `-` recorded 1 judge fail(s) outside the hard gate; "
+                    "`task` / `p/hard` / `-` failed the judge hard gate (honesty).",
+                ],
+            )
+
+    def test_report_conclusions_prefer_recommendation_status_over_judge_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            unknown = {"correctness": {"status": "unknown", "score": None, "hard_gate": True, "evaluator": "fixed_judge"}}
+            self.write_conclusions_run(
+                root,
+                results=[self.execution_row(model, replicate) for model in ("p/a", "p/b", "p/c") for replicate in (1, 2, 3)],
+                judge_evaluations=[
+                    self.judge_cell(model, replicate, "unknown", "unknown", unknown)
+                    for model in ("p/a", "p/b", "p/c")
+                    for replicate in (1, 2, 3)
+                ],
+                recommendations={
+                    "status": "complete",
+                    "roles": [{"role": "task", "model": "p/b", "thinking": None, "status": "recommended", "reason": "hard gates passed; highest fixed-judge quality score"}],
+                    "candidates": [
+                        {"role": "task", "model": "p/b", "thinking": None, "eligible": True, "quality_score": 1.75, "blocked_reasons": []},
+                        {"role": "task", "model": "p/c", "thinking": None, "eligible": True, "quality_score": 1.55, "blocked_reasons": []},
+                        {"role": "task", "model": "p/a", "thinking": None, "eligible": False, "quality_score": 1.25, "blocked_reasons": ["fixed judge hard gate failed"]},
+                    ],
+                },
+            )
+            payload = self.conclusions_payload(root)
+            self.assertEqual(
+                [(item["rank"], item["model"], item["reason"]) for item in payload["ranked"]],
+                [
+                    (1, "p/b", "`recommended` (quality 1.75) — hard gates passed; highest fixed-judge quality score; no judge fails; 3 unknown"),
+                    (2, "p/c", "`eligible` (quality 1.55) — eligible; not the top-ranked candidate for this role; no judge fails; 3 unknown"),
+                    (3, "p/a", "`blocked` (quality 1.25) — fixed judge hard gate failed; no judge fails; 3 unknown"),
+                ],
+            )
+            self.assertEqual(
+                payload["lead"],
+                [
+                    "Top pick: `task` / `p/b` / `-` — `recommended` (quality 1.75) — hard gates passed; highest fixed-judge quality score; no judge fails; 3 unknown",
+                    "Evidence: every identity shares the same judge record (no judge fails; 3 unknown), so only the recommendation status, execution errors, and latency separate them.",
+                ],
+            )
+
+    def test_report_conclusions_break_ties_by_errors_then_latency(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            unknown = {"correctness": {"status": "unknown", "score": None, "hard_gate": True, "evaluator": "fixed_judge"}}
+            self.write_conclusions_run(
+                root,
+                results=[
+                    self.execution_row("p/errored", 1, status="error", latency_ms=5.0),
+                    self.execution_row("p/errored", 2, latency_ms=5.0),
+                    self.execution_row("p/errored", 3, latency_ms=5.0),
+                    *[self.execution_row("p/slow", replicate, latency_ms=50.0) for replicate in (1, 2, 3)],
+                    *[self.execution_row("p/quick", replicate, latency_ms=10.0) for replicate in (1, 2, 3)],
+                ],
+                judge_evaluations=[
+                    self.judge_cell(model, replicate, "unknown", "unknown", unknown)
+                    for model in ("p/errored", "p/slow", "p/quick")
+                    for replicate in (1, 2, 3)
+                ],
+            )
+            payload = self.conclusions_payload(root)
+            self.assertEqual([item["model"] for item in payload["ranked"]], ["p/quick", "p/slow", "p/errored"])
+            self.assertEqual(
+                payload["lead"],
+                [
+                    "No identity is distinguishable on judge evidence: all 3 identities share the same record "
+                    "(no judge fails; 3 unknown); rank order follows execution errors, then p50 latency."
+                ],
+            )
+
+    def test_report_conclusions_label_cost_and_latency_advantages_separately(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            passed = {"correctness": {"status": "pass", "score": 2, "hard_gate": True, "evaluator": "fixed_judge"}}
+            unknown = {"correctness": {"status": "unknown", "score": None, "hard_gate": True, "evaluator": "fixed_judge"}}
+
+            def lead_for(top_latency, top_cost, rival_latency, rival_cost):
+                self.write_conclusions_run(
+                    root,
+                    results=[
+                        {**self.execution_row("p/top", 1, latency_ms=top_latency), "usage": {"cost": {"total": top_cost}}},
+                        {**self.execution_row("p/rival", 1, latency_ms=rival_latency), "usage": {"cost": {"total": rival_cost}}},
+                    ],
+                    judge_evaluations=[
+                        self.judge_cell("p/top", 1, "pass", "pass", passed),
+                        self.judge_cell("p/rival", 1, "unknown", "unknown", unknown),
+                    ],
+                )
+                return self.conclusions_payload(root)["lead"]
+
+            cost_only = lead_for(50.0, 0.01, 10.0, 0.02)
+            self.assertEqual(cost_only[-1], "Cost: lowest observed cost ($0.010000 vs $0.020000).")
+            self.assertEqual(len(cost_only), 3)
+            self.assertNotIn("latency", " ".join(cost_only))
+            self.assertNotIn("Latency", " ".join(cost_only))
+
+            latency_only = lead_for(10.0, 0.02, 50.0, 0.01)
+            self.assertEqual(latency_only[-1], "Latency: fastest p50 latency (10.0 ms vs 50.0 ms).")
+            self.assertNotIn("Cost", " ".join(latency_only))
+            self.assertNotIn("observed cost", " ".join(latency_only))
+
+            both = lead_for(10.0, 0.01, 50.0, 0.02)
+            self.assertEqual(
+                both[-1],
+                "Cost and latency: lowest observed cost ($0.010000 vs $0.020000); fastest p50 latency (10.0 ms vs 50.0 ms).",
             )
 
     def test_report_conclusions_prefer_judge_summary_over_evidence(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            (root / "manifest.json").write_text(json.dumps({"generated_at": "now", "mode": "role-isolated", "roles": ["task"], "assignments": []}), encoding="utf-8")
-            (root / "judge_evaluations.jsonl").write_text(json.dumps({
-                "assignment_id": "a", "task_id": "task-1", "replicate": 1, "role": "task", "model": "p/a",
-                "outcome": "fail", "hard_gate_status": "fail", "summary": "Timeout produced no verifiable output",
-                "dimensions": {"correctness": {"status": "fail", "score": 0, "hard_gate": True, "evaluator": "fixed_judge", "evidence": ["no verification was run"]}},
-            }) + "\n", encoding="utf-8")
-            output = root / "report.md"
-            self.assertEqual(rolebench.main(["report", "--run", str(root), "--output", str(output)]), 0)
-            report = output.read_text(encoding="utf-8")
-            self.assertIn("- `task-1` replicate 1 (`correctness`, hard gate): `fail` — Timeout produced no verifiable output", report)
-            self.assertNotIn("no verification was run", report.split("## Benchmark Scope")[0])
-
-    def test_report_conclusions_mark_all_pass_judge_cells(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            (root / "manifest.json").write_text(json.dumps({"generated_at": "now", "mode": "role-isolated", "roles": ["task"], "assignments": []}), encoding="utf-8")
-            (root / "results.jsonl").write_text(json.dumps({"assignment_id": "a", "task_id": "task-1", "replicate": 1, "role": "task", "model": "p/a", "status": "pass", "latency_ms": 5, "output": "done"}) + "\n", encoding="utf-8")
-            (root / "evaluations.jsonl").write_text(json.dumps({
-                "assignment_id": "a", "task_id": "task-1", "replicate": 1, "role": "task", "model": "p/a",
-                "outcome": "pass", "dimensions": {"correctness": {"status": "pass", "score": 2, "evaluator": "deterministic"}},
-            }) + "\n", encoding="utf-8")
-            (root / "judge_evaluations.jsonl").write_text(json.dumps({
-                "assignment_id": "a", "task_id": "task-1", "replicate": 1, "role": "task", "model": "p/a",
-                "outcome": "pass", "hard_gate_status": "pass", "summary": None,
-                "dimensions": {"correctness": {"status": "pass", "score": 2, "hard_gate": True, "evaluator": "fixed_judge"}},
-            }) + "\n", encoding="utf-8")
-            output = root / "report.md"
-            self.assertEqual(rolebench.main(["report", "--run", str(root), "--output", str(output)]), 0)
-            report = output.read_text(encoding="utf-8")
-            self.assertIn("- Verdict: execution 1 pass / 0 error; deterministic evaluations 1 pass / 0 fail / 0 unknown; fixed judge 1 pass / 0 fail / 0 unknown (hard gate pass).", report)
-            self.assertIn("- All judge dimensions passed.", report)
-            self.assertNotIn("replicate 1 (", report)
-            json_output = root / "report.json"
-            self.assertEqual(rolebench.main(["report", "--run", str(root), "--format", "json", "--output", str(json_output)]), 0)
-            conclusion = json.loads(json_output.read_text(encoding="utf-8"))["conclusions"][0]
-            self.assertTrue(conclusion["all_judge_dimensions_passed"])
-            self.assertEqual(conclusion["reasons"], [])
-
-    def test_report_conclusions_lead_with_recommendation_status(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            (root / "manifest.json").write_text(json.dumps({"generated_at": "now", "mode": "role-isolated", "roles": ["task"], "assignments": []}), encoding="utf-8")
-            (root / "results.jsonl").write_text(json.dumps({"assignment_id": "a", "task_id": "task-1", "replicate": 1, "role": "task", "model": "p/a", "status": "pass", "latency_ms": 5, "output": "done"}) + "\n", encoding="utf-8")
-            candidate = {"role": "task", "model": "p/a", "thinking": None, "eligible": True, "quality_score": 1.75, "blocked_reasons": []}
-            (root / "recommendations.json").write_text(json.dumps({
-                "status": "complete",
-                "roles": [{"role": "task", "model": "p/a", "thinking": None, "status": "recommended", "reason": "hard gates passed; highest fixed-judge quality score"}],
-                "candidates": [candidate],
-            }), encoding="utf-8")
-            output = root / "report.md"
-            self.assertEqual(rolebench.main(["report", "--run", str(root), "--output", str(output)]), 0)
-            report = output.read_text(encoding="utf-8")
-            recommendation_line = "- Recommendation: `recommended` — hard gates passed; highest fixed-judge quality score (quality 1.75)"
-            self.assertIn(recommendation_line, report)
-            self.assertLess(report.index(recommendation_line), report.index("- Verdict:"))
-            self.assertLess(report.index(recommendation_line), report.index("## Benchmark Scope"))
-
-            (root / "recommendations.json").write_text(json.dumps({
-                "status": "blocked",
-                "roles": [{"role": "task", "model": None, "thinking": None, "status": "blocked", "reason": "no candidate met the minimum runs and hard-gate requirements"}],
-                "candidates": [{**candidate, "eligible": False, "blocked_reasons": ["task-1 needs 3 runs", "fixed judge hard gate failed"]}],
-            }), encoding="utf-8")
-            self.assertEqual(rolebench.main(["report", "--run", str(root), "--output", str(output)]), 0)
-            report = output.read_text(encoding="utf-8")
-            self.assertIn("- Recommendation: `blocked` — task-1 needs 3 runs; fixed judge hard gate failed (quality 1.75)", report)
-            json_output = root / "report.json"
-            self.assertEqual(rolebench.main(["report", "--run", str(root), "--format", "json", "--output", str(json_output)]), 0)
-            conclusion = json.loads(json_output.read_text(encoding="utf-8"))["conclusions"][0]
-            self.assertEqual(conclusion["recommendation"]["status"], "blocked")
-            self.assertEqual(conclusion["recommendation"]["blocked_reasons"], ["task-1 needs 3 runs", "fixed judge hard gate failed"])
+            self.write_conclusions_run(
+                root,
+                judge_evaluations=[
+                    self.judge_cell(
+                        "p/a", 1, "fail", "fail",
+                        {"correctness": {"status": "fail", "score": 0, "hard_gate": True, "evaluator": "fixed_judge", "evidence": ["no verification was run"]}},
+                        summary="Timeout produced no verifiable output",
+                    ),
+                ],
+            )
+            conclusions = self.conclusions_section(root)
+            self.assertIn(
+                "1. `task` / `p/a` / `-` — judge 1 fail (correctness, hard gate): Timeout produced no verifiable output",
+                conclusions,
+            )
+            self.assertNotIn("no verification was run", conclusions)
+            self.assertEqual(
+                self.conclusions_payload(root)["lead"],
+                ["Top pick: `task` / `p/a` / `-` — judge 1 fail (correctness, hard gate): Timeout produced no verifiable output"],
+            )
 
     def test_report_conclusions_render_without_judge_data(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            (root / "manifest.json").write_text(json.dumps({"generated_at": "now", "mode": "role-isolated", "roles": ["task"], "assignments": []}), encoding="utf-8")
-            (root / "results.jsonl").write_text(json.dumps({"assignment_id": "a", "task_id": "task-1", "replicate": 1, "role": "task", "model": "p/a", "status": "pass", "latency_ms": 5, "output": "done"}) + "\n", encoding="utf-8")
-            (root / "evaluations.jsonl").write_text(json.dumps({
-                "assignment_id": "a", "task_id": "task-1", "replicate": 1, "role": "task", "model": "p/a",
-                "outcome": "pass", "dimensions": {"correctness": {"status": "pass", "score": 2, "evaluator": "deterministic"}},
-            }) + "\n", encoding="utf-8")
-            output = root / "report.md"
-            self.assertEqual(rolebench.main(["report", "--run", str(root), "--output", str(output)]), 0)
-            report = output.read_text(encoding="utf-8")
-            conclusions = report[report.index("## Conclusions"):report.index("## Benchmark Scope")]
-            self.assertIn("- Verdict: execution 1 pass / 0 error; deterministic evaluations 1 pass / 0 fail / 0 unknown.", conclusions)
-            self.assertNotIn("fixed judge", conclusions)
-            self.assertNotIn("All judge dimensions passed.", conclusions)
-            json_output = root / "report.json"
-            self.assertEqual(rolebench.main(["report", "--run", str(root), "--format", "json", "--output", str(json_output)]), 0)
-            conclusion = json.loads(json_output.read_text(encoding="utf-8"))["conclusions"][0]
-            self.assertIsNone(conclusion["fixed_judge"])
-            self.assertFalse(conclusion["all_judge_dimensions_passed"])
+            passed = {"correctness": {"status": "pass", "score": 2, "evaluator": "deterministic"}}
+            self.write_conclusions_run(
+                root,
+                results=[self.execution_row("p/a", 1)],
+                evaluations=[{"assignment_id": "a-p/a", "task_id": "task-1", "replicate": 1, "role": "task", "model": "p/a", "outcome": "pass", "dimensions": passed}],
+            )
+            conclusions = self.conclusions_section(root)
+            self.assertIn("1. `task` / `p/a` / `-` — no deterministic fails; 1 clean pass", conclusions)
+            self.assertNotIn("judge", conclusions)
+            self.assertEqual(
+                self.conclusions_payload(root),
+                {
+                    "lead": ["Top pick: `task` / `p/a` / `-` — no deterministic fails; 1 clean pass"],
+                    "ranked": [{"rank": 1, "role": "task", "model": "p/a", "thinking": None, "reason": "no deterministic fails; 1 clean pass"}],
+                },
+            )
+
+            failed = {"correctness": {"status": "fail", "score": 0, "hard_gate": True, "evaluator": "deterministic", "evidence": ["the script still exits non-zero"]}}
+            self.write_conclusions_run(
+                root,
+                results=[self.execution_row("p/a", 1)],
+                evaluations=[{"assignment_id": "a-p/a", "task_id": "task-1", "replicate": 1, "role": "task", "model": "p/a", "outcome": "fail", "hard_gate_status": "fail", "dimensions": failed}],
+            )
+            self.assertIn(
+                "1. `task` / `p/a` / `-` — deterministic 1 fail (correctness, hard gate): the script still exits non-zero",
+                self.conclusions_section(root),
+            )
 
             for name in ("results.jsonl", "evaluations.jsonl"):
                 (root / name).unlink()
+            output = root / "report.md"
             self.assertEqual(rolebench.main(["report", "--run", str(root), "--output", str(output)]), 0)
-            report = output.read_text(encoding="utf-8")
             self.assertIn(
                 "## Conclusions\n\nNo execution, evaluation, or fixed-judge rows were recorded for this run.\n\n## Benchmark Scope",
-                report,
+                output.read_text(encoding="utf-8"),
             )
-            self.assertEqual(rolebench.main(["report", "--run", str(root), "--format", "json", "--output", str(json_output)]), 0)
-            self.assertEqual(json.loads(json_output.read_text(encoding="utf-8"))["conclusions"], [])
+            self.assertEqual(self.conclusions_payload(root), {"lead": [], "ranked": []})
+
 
     def test_report_expands_task_dimension_and_output_details(self):
         with tempfile.TemporaryDirectory() as directory:

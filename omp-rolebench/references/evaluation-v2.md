@@ -51,7 +51,7 @@ python3 omp-rolebench/scripts/rolebench.py run \
 
 ## Judge contract
 
-The current rubric version is recorded as `rolebench-v2-20260831`. The prompt requires JSON with a `dimensions` object. Each requested dimension has:
+The current rubric version is recorded as `rolebench-v2-20260924` (since 2026-09-24 the packet may include `workspace_excerpts`: bounded verbatim, line-numbered excerpts of workspace files cited in the candidate output, capped at 8 files / 24 KiB, which the judge may use to verify file/line claims; claims about files outside the excerpts remain `unknown`). The prompt requires JSON with a `dimensions` object. Each requested dimension has:
 
 ```json
 {
