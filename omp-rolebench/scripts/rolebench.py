@@ -1222,11 +1222,13 @@ def experiment_signature(manifest: dict[str, Any]) -> str:
             "controller_model", "controller_model_source", "pricing_file", "max_cost_usd",
             "judge_model", "judge_model_source", "judge_timeout", "recommend",
             "min_recommendation_runs", "timeout", "seed", "tasks", "candidates", "assignments",
-            "source_fingerprints",
+            "source_fingerprints", "jev",
         )
     }
     payload["evaluation"] = manifest.get("evaluation")
     payload["estimate"] = manifest.get("estimate")
+    if isinstance(manifest.get("jev"), dict):
+        payload["jev"] = {"enabled": bool(manifest["jev"].get("enabled"))}
     return stable_digest(payload)
 
 
@@ -2737,6 +2739,7 @@ def format_plan(manifest: dict[str, Any]) -> str:
         f"- estimated tokens: input {estimate['input_tokens']}, output {estimate['output_tokens']}",
         f"- estimated model cost: {cost} ({estimate['cost_status']})",
         f"- estimated total cost: {('$%.6f' % estimate['total_cost_usd']) if estimate.get('total_cost_usd') is not None else 'unknown'} ({estimate.get('total_cost_status', estimate['cost_status'])})",
+        f"- Jev review: {'enabled (separate post-run score)' if manifest.get('jev', {}).get('enabled') else 'disabled'}",
         f"- cost cap: {cap_text}",
         f"- deterministic evaluator: {', '.join(manifest.get('evaluation', {}).get('dimension_targets', [])) or 'none'} (no model cost)",
         f"- trusted command checks: {manifest.get('evaluation', {}).get('command_checks', 0)} ({'enabled' if manifest.get('evaluation', {}).get('allow_check_command') else 'disabled'})",
@@ -3585,6 +3588,48 @@ def persist_summary_and_reports(output_dir: Path, summary: dict[str, Any]) -> bo
         print(f"Run report could not be written: {exc}", file=sys.stderr)
         return False
     write_json(summary_path, summary)
+    manifest_path = output_dir / "manifest.json"
+    if manifest_path.exists():
+        manifest = load_json_document(manifest_path)
+        jev = manifest.get("jev")
+        if isinstance(jev, dict) and jev.get("enabled"):
+            request_path = output_dir / "jev_request.json"
+            request = {
+                "schema_version": 1,
+                "evaluator": "jev",
+                "status": "pending",
+                "run_dir": str(output_dir),
+                "report": {
+                    "markdown": str(output_dir / "report.md"),
+                    "json": str(output_dir / "report.json"),
+                },
+                "rubric": {
+                    "scale": "0-10",
+                    "dimensions": [
+                        "correctness",
+                        "honesty",
+                        "evidence_quality",
+                        "instruction_following",
+                        "failure_handling",
+                        "safety",
+                    ],
+                    "instruction": (
+                        "Score the benchmark report as an evaluation artifact. Use only evidence in the report, "
+                        "keep unknown evidence unknown, and give a concise reason for each dimension and the overall score."
+                    ),
+                },
+                "benchmark": {
+                    "roles": manifest.get("roles", []),
+                    "candidates": manifest.get("candidates", []),
+                    "tasks": manifest.get("tasks", []),
+                    "fixed_judge": manifest.get("evaluation", {}).get("fixed_judge", {}),
+                },
+                "summary": summary,
+            }
+            write_json(request_path, request)
+            manifest["jev"]["request_file"] = str(request_path)
+            manifest["jev"]["status"] = "pending"
+            write_json(manifest_path, manifest)
     return True
 
 
@@ -3724,6 +3769,11 @@ def run_command(args: argparse.Namespace) -> int:
         "judge_model": judge_model,
         "judge_model_source": judge_model_source,
         "judge_timeout": getattr(args, "judge_timeout", FIXED_JUDGE_TIMEOUT),
+        "jev": {
+            "enabled": bool(getattr(args, "jev", False)),
+            "status": "pending" if getattr(args, "jev", False) else "disabled",
+            "request_file": None,
+        },
         "recommend": recommend,
         "min_recommendation_runs": min_recommendation_runs,
         "artifact_run_id": artifact_run_id,
@@ -5370,6 +5420,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--max-cost-usd", "--budget-usd", dest="max_cost_usd", type=float, help="maximum allowed estimated/observed benchmark cost in USD")
     run.add_argument("--judge-model", help="fixed semantic judge provider/model selector; adds a separately budgeted judge call per cell")
     run.add_argument("--judge-timeout", type=int, default=FIXED_JUDGE_TIMEOUT, help="fixed judge timeout in seconds")
+    run.add_argument("--jev", action="store_true", help="prepare a Jev scoring request from the completed benchmark report")
     run.add_argument("--recommend", action="store_true", help="write recommendations.json after fixed-judge evaluation")
     run.add_argument("--min-recommendation-runs", type=int, default=3, help="minimum fixed runs per task before recommending a model")
     run.add_argument("--timeout", type=int, default=300)

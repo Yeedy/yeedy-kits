@@ -16,6 +16,34 @@ import rolebench
 
 
 class RoleBenchTests(unittest.TestCase):
+    def test_run_parser_exposes_optional_jev_scoring(self):
+        args = rolebench.build_parser().parse_args(["run", "--models", "p/a", "--roles", "task", "--output", "run", "--jev"])
+        self.assertTrue(args.jev)
+
+    def test_jev_flag_is_part_of_experiment_signature_without_runtime_metadata(self):
+        base = {"jev": {"enabled": True, "status": "pending", "request_file": None}}
+        with_request = {"jev": {"enabled": True, "status": "pending", "request_file": "/tmp/jev_request.json"}}
+        self.assertEqual(rolebench.experiment_signature(base), rolebench.experiment_signature(with_request))
+
+    def test_jev_request_is_written_after_report_persistence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output_dir = Path(directory)
+            rolebench.write_json(output_dir / "manifest.json", {
+                "jev": {"enabled": True, "status": "pending", "request_file": None},
+                "roles": ["task"],
+                "candidates": [{"selector": "p/a"}],
+                "tasks": [{"id": "task-1"}],
+                "evaluation": {"fixed_judge": {"enabled": False}},
+            })
+            with patch.object(rolebench, "report_command", return_value=0):
+                self.assertTrue(rolebench.persist_summary_and_reports(output_dir, {"status": "preview"}))
+            request = json.loads((output_dir / "jev_request.json").read_text(encoding="utf-8"))
+            self.assertEqual(request["evaluator"], "jev")
+            self.assertEqual(request["benchmark"]["roles"], ["task"])
+            manifest = json.loads((output_dir / "manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["jev"]["status"], "pending")
+            self.assertEqual(manifest["jev"]["request_file"], str(output_dir / "jev_request.json"))
+
     def git(self, directory, *arguments):
         return subprocess.run(
             ["git", "-C", str(directory), *arguments],

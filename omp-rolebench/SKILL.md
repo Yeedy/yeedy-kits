@@ -66,6 +66,28 @@ python3 omp-rolebench/scripts/rolebench.py run \
   --output runs/v2-20260829
 ```
 
+When the surrounding OMP session has the Jev MCP available, opt in to a separate
+Jev review with `--jev`:
+
+```bash
+python3 omp-rolebench/scripts/rolebench.py run \
+  --models opencode-go/glm-5.3-flash \
+  --roles smol,task \
+  --runs 3 \
+  --execute --confirm --jev \
+  --output runs/jev-20260829
+```
+
+`--jev` does not add provider calls to the benchmark matrix. After the run's
+reports are written, the harness creates `jev_request.json` with the report
+paths, benchmark context, and a 0-10 rubric for correctness, honesty,
+evidence quality, instruction following, failure handling, and safety. The
+orchestrator submits that request to Jev and keeps Jev's response as a
+separate score artifact; it must not replace `evaluations.jsonl`, fixed-judge
+rows, or the recommendation gate. If Jev is unavailable, retain the request
+and report the score as unavailable rather than treating that as a benchmark
+failure.
+
 ## Consent and budget gate
 
 Before any provider call, show the user a short plan containing the candidate models, roles, assignment mode, executor, task count, repeat count, independent candidate-cell count, requested/effective `--jobs`, estimated provider waves, maximum copied-workspace size, estimated peak temporary-disk use, request count, estimated input/output tokens, estimated USD cost, deterministic evaluation dimensions, and any exact command-check argv. For delegated execution, also show the controller model and whether it came from `modelRoles.default` or an explicit `--controller-model` override. When a fixed judge is enabled, include the judge model, whether it came from `modelRoles.default` or an explicit `--judge-model` override, rubric version, request count, token estimate, and cost; the displayed total and `--max-cost-usd` gate cover candidate, controller, and judge calls. Ask for explicit approval in the conversation. Before executing, the user can change `--jobs`, controller, or judge model; rerun the preview and obtain consent for that revised plan. If the user states a budget in natural language (for example, "benchmark cost must stay below $0.50"), convert it to `--max-cost-usd 0.50` and repeat the cap in the confirmation request.
@@ -110,7 +132,7 @@ For task-subagent experiments, see [observed-task-role-ab.md](references/observe
 
 `--tasks-file` accepts task schema V1 as JSON or JSONL. Tasks require `id`, `role`, and `prompt`; they may declare `scenario`, `task_type`, difficulty metadata, easy/hard pairing, expected output, workspace invariants, failure modes, and target dimensions. See [evaluation-v1.md](references/evaluation-v1.md) for the complete schema and evaluator behavior. When a tasks file is omitted, choose between `--task-source core` and `--task-source recent`; the CLI default remains `core` for backward compatibility.
 
-Collect every choice in ONE batched `ask` call at the very start of a rolebench engagement, together with the plan/consent gate: task source (generic suite vs recent local work), candidate models and thinking suffixes, assignment mode, executor, whether to enable the fixed judge and which judge model, runs/jobs/timeout, budget cap, workspace strategy for large repos, and any post-run actions (e.g. recording results to external notes). After that single approval, run to completion without mid-flow `ask` interruptions — present results and follow-up options in the final summary instead. Mid-flow interruption is reserved for genuine blockers (harness defects, budget gate hits, unexpected destructive choices), not for decisions that could have been foreseen at plan time.
+Collect every choice in ONE batched `ask` call at the very start of a rolebench engagement, before starting the bench script, together with the plan/consent gate: task source (generic suite vs recent local work), candidate models and thinking suffixes, assignment mode, executor, whether to enable the fixed judge and which judge model, whether to enable the optional Jev review (`--jev`), runs/jobs/timeout, budget cap, workspace strategy for large repos, and any post-run actions (e.g. recording results to external notes). Mark Jev as unavailable when its MCP is not loaded; do not silently enable it. After that single approval, run to completion without mid-flow `ask` interruptions — present results and follow-up options in the final summary instead. Mid-flow interruption is reserved for genuine blockers (harness defects, budget gate hits, unexpected destructive choices), not for decisions that could have been foreseen at plan time.
 
 Relative `workspace` paths in a tasks file resolve from that file's directory. The bundled `assets/task-high/tasks-task-high.jsonl` suite provides three reusable `task` fixtures with deterministic output, file, scope, and command checks; command execution still requires explicit `--allow-check-command` approval.
 
