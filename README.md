@@ -1,6 +1,6 @@
-# Private Agent Skills
+# Yeedy Kits
 
-个人 Codex skills 源码仓库。每个一级子目录对应一个可独立安装和分享的 skill。
+个人 Codex skills、MCP 和 plugin 源码工作区。`skill/` 下每个子目录对应一个可独立安装和分享的 skill。
 
 ## Skills
 
@@ -16,32 +16,31 @@
 - 优先使用 Exa 检索资料，不可用时回退到默认 Web Search
 - 将运行状态保存在使用该 skill 的 workspace，不写入 skill 安装目录
 
-详见 [ai-coding-daily-coach/SKILL.md](ai-coding-daily-coach/SKILL.md)。
+详见 [skill/ai-coding-daily-coach/SKILL.md](skill/ai-coding-daily-coach/SKILL.md)。
 
 ### optimize-agent-memory
 
 审计和精炼 Codex 或 Oh My Pi memory。默认覆盖当前 agent 的全部 memory；也可以明确指定 OMP、Codex、两者，或进一步缩小到某个项目、workspace 或类别。识别过时、重复、低价值或过度膨胀的记忆，并通过对应 agent 支持的持久化入口安全修正。
 
-详见 [optimize-agent-memory/SKILL.md](optimize-agent-memory/SKILL.md)。
+详见 [skill/optimize-agent-memory/SKILL.md](skill/optimize-agent-memory/SKILL.md)。
 
 ### omp-rolebench
 
 对 Oh My Pi 的模型与 `modelRoles` 做可重复 benchmark。支持全量/供应商/显式模型筛选、全部/指定角色、通用或近期工作任务源、单角色隔离和全角色同模型分配，并在执行前展示方案、估算成本并要求确认，最后输出 JSONL 原始结果与 Markdown 报告。
 
-详见 [omp-rolebench/SKILL.md](omp-rolebench/SKILL.md)。
+详见 [skill/omp-rolebench/SKILL.md](skill/omp-rolebench/SKILL.md)。
 
 ## Repository Layout
 
 ```text
-private-agent-skills/
-├── README.md
-└── <skill-name>/
-    ├── SKILL.md
-    ├── agents/
-    │   └── openai.yaml
-    ├── scripts/       # 可选：确定性工具
-    ├── references/    # 可选：按需读取的参考资料
-    └── assets/        # 可选：输出所需资源
+yeedy-kits/
+├── mcp/              # MCP servers and related source
+├── plugin/           # Plugins and related source
+├── skill/            # Each skill remains an independent source package
+│   ├── ai-coding-daily-coach/
+│   ├── omp-rolebench/
+│   └── optimize-agent-memory/
+└── README.md
 ```
 
 新增 skill 时使用小写连字符目录名，并让目录名与 `SKILL.md` frontmatter 中的 `name` 保持一致。只加入执行 skill 必需的文件，避免在各 skill 内重复维护 README、安装说明或变更日志。
@@ -51,13 +50,13 @@ private-agent-skills/
 修改 skill 后至少执行结构校验：
 
 ```bash
-python3 "${CODEX_HOME:-$HOME/.codex}/skills/.system/skill-creator/scripts/quick_validate.py" ./<skill-name>
+python3 "${CODEX_HOME:-$HOME/.codex}/skills/.system/skill-creator/scripts/quick_validate.py" ./skill/<skill-name>
 ```
 
 如果 skill 包含脚本，还应执行语法检查和覆盖主流程、错误边界的针对性测试。例如：
 
 ```bash
-python3 -m py_compile ./<skill-name>/scripts/*.py
+python3 -m py_compile ./skill/<skill-name>/scripts/*.py
 ```
 
 校验器需要 `PyYAML`。当前 Python 环境缺少该依赖时，应使用已安装依赖的 Python 环境，或安装 `PyYAML` 后再运行。
@@ -69,7 +68,7 @@ python3 -m py_compile ./<skill-name>/scripts/*.py
 ```bash
 mkdir -p "${CODEX_HOME:-$HOME/.codex}/skills/<skill-name>"
 rsync -a --delete --exclude='.DS_Store' \
-  ./<skill-name>/ \
+  ./skill/<skill-name>/ \
   "${CODEX_HOME:-$HOME/.codex}/skills/<skill-name>/"
 ```
 
