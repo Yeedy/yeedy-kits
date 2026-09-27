@@ -30,6 +30,12 @@
 
 详见 [skill/omp-rolebench/SKILL.md](skill/omp-rolebench/SKILL.md)。
 
+### web-ui-recreator
+
+按指定设备范围观察网页的布局、组件状态、交互和动态效果，再按要求复刻页面或将风格转译到新主题，并核对视觉与功能。共用一份 `SKILL.md`，适用于 Codex 和 OMP。
+
+详见 [skill/web-ui-recreator/SKILL.md](skill/web-ui-recreator/SKILL.md)。
+
 ## Repository Layout
 
 ```text
@@ -39,7 +45,8 @@ yeedy-kits/
 ├── skill/            # Each skill remains an independent source package
 │   ├── ai-coding-daily-coach/
 │   ├── omp-rolebench/
-│   └── optimize-agent-memory/
+│   ├── optimize-agent-memory/
+│   └── web-ui-recreator/
 └── README.md
 ```
 
@@ -73,6 +80,8 @@ rsync -a --delete --exclude='.DS_Store' \
 ```
 
 `--delete` 会删除安装目录中仓库已不存在的旧文件。执行前确认目标只指向具体 skill 目录，不要指向整个 `skills` 目录。
+
+OMP 使用同一份 skill 包，将上述目标目录改为 `~/.omp/agent/skills/<skill-name>/` 即可。安装到个人目录属于本机配置变更；本仓库保留可独立安装的源码。
 
 安装或更新 skill 不应复制 workspace 中的运行状态。以 `ai-coding-daily-coach` 为例，答题记录和画像位于使用方 workspace 的 `.ai-coding-daily-coach/`，不在本仓库或个人 skill 安装目录中。
 
